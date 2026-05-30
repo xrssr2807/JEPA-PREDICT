@@ -1,2 +1,3 @@
 Epoch   0 | Loss: 0.965441 | Time: 217.9s
 Epoch   1 | Loss: 0.839643 | Time: 217.3s
+Epoch   2 | Loss: 0.627555 | Time: 209.8s
