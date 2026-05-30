@@ -74,7 +74,7 @@ class TrainConfig:
 
     # Pre-training
     pretrain_epochs: int = 100
-    pretrain_batch_size: int = 64
+    pretrain_batch_size: int = 16
     pretrain_lr: float = 3e-4
     pretrain_warmup_epochs: int = 10
     pretrain_weight_decay: float = 0.05

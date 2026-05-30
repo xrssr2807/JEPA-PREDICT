@@ -43,10 +43,13 @@ class PretrainDataset(Dataset):
         self.channels = channels
         self.normalize = normalize
 
-        self.files = sorted([
+        raw_files = sorted([
             f for f in os.listdir(data_dir)
             if f.endswith(".pkl") and f.startswith("combined_processed_data")
         ])
+        # Skip known corrupted file
+        known_bad = {"combined_processed_data_2d_part10269_10.pkl"}
+        self.files = [f for f in raw_files if f not in known_bad]
 
         if max_files is not None:
             self.files = self.files[:max_files]
@@ -78,24 +81,29 @@ class PretrainDataset(Dataset):
             ppg: (1, 3000) tensor — target signal
         """
         filepath = os.path.join(self.data_dir, self.files[idx])
-        with open(filepath, "rb") as f:
-            sample = pickle.load(f)
+        try:
+            with open(filepath, "rb") as f:
+                sample = pickle.load(f)
 
-        data = sample["data"]  # (5, 3000)
+            data = sample["data"]  # (5, 3000)
 
-        # Extract channels
-        data = data[self.channels]  # (2, 3000): [ECG, PPG]
+            # Extract channels
+            data = data[self.channels]  # (2, 3000): [ECG, PPG]
 
-        # Per-file normalization
-        if self.normalize == "zscore":
-            data = self._zscore(data)
-        elif self.normalize == "minmax":
-            data = self._minmax(data)
+            # Per-file normalization
+            if self.normalize == "zscore":
+                data = self._zscore(data)
+            elif self.normalize == "minmax":
+                data = self._minmax(data)
 
-        ecg = data[0:1]  # (1, 3000)
-        ppg = data[1:2]  # (1, 3000)
+            ecg = data[0:1]  # (1, 3000)
+            ppg = data[1:2]  # (1, 3000)
 
-        return torch.from_numpy(ecg.copy()).float(), torch.from_numpy(ppg.copy()).float()
+            return torch.from_numpy(ecg.copy()).float(), torch.from_numpy(ppg.copy()).float()
+        except Exception:
+            # Fallback: return a random good sample
+            fallback_idx = (idx + 1) % len(self.files)
+            return self.__getitem__(fallback_idx)
 
 
 class DownstreamDataset(Dataset):

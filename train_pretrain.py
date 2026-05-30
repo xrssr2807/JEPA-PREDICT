@@ -27,7 +27,7 @@ def build_dataloader(data_config: DataConfig, train_config: TrainConfig) -> Data
         dataset,
         batch_size=train_config.pretrain_batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=0,  # Windows: 0 avoids spawn multiprocessing issues
         pin_memory=True,
         drop_last=True,
     )
