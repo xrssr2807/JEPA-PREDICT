@@ -1,0 +1,13 @@
+# JEPA ECG-PPG Pre-training & Downstream Classification
+# =====================================================
+# Core dependencies
+
+# PyTorch with CUDA 12.1 support
+# Install via: pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch>=2.5.0
+
+# Numerical computing
+numpy>=1.24.0
+
+# Optional: visualization & monitoring
+matplotlib>=3.7.0
