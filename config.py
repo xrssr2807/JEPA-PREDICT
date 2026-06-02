@@ -88,6 +88,13 @@ class ModelConfig:
     contrast_loss_weight: float = 0.1  # weight for contrastive loss
     contrast_decay: float = 0.999      # EMA decay for teacher projector
 
+    # ── CWT Frontend (optional alternative to 1D CNN) ──
+    use_cwt: bool = False              # use CWT 1D→2D frontend instead of CNN Stem
+    cwt_scales: int = 64               # number of wavelet scales
+    cwt_use_diff: bool = True          # include 1st/2nd derivative signals
+    cwt_patch_freq: int = 8            # patch size in frequency dimension
+    cwt_patch_time: int = 25           # patch size in time dimension
+
     # ── Downstream ──
     use_cot_head: bool = False         # Chain-of-Thought classification head
     cot_tokens: int = 16               # number of reasoning tokens
