@@ -10,9 +10,9 @@ class DataConfig:
     """Data paths and preprocessing parameters."""
 
     # Pre-training data (unlabeled 5-channel .pkl files)
-    pretrain_dir: str = "/root/autodl-tmp/split"
+    pretrain_dir: str = r"C:\Users\86189\Downloads\split\split"
     # Preprocessed pre-training data (.pt files, after channel extraction + Z-score)
-    pretrain_processed_dir: str = "/root/autodl-tmp/split_processed"
+    pretrain_processed_dir: str = r"C:\Users\86189\Downloads\split_processed"
 
     # Downstream data
     chd_ppg_dir: str = "/root/autodl-tmp/chd_ppg"
@@ -20,11 +20,21 @@ class DataConfig:
     arrhythmia_dir: str = "/root/autodl-tmp/processed_dataset"
 
     # Preprocessing
-    normalize: str = "zscore"  # zscore per file
+    normalize: str = "zscore"  # zscore / iqr / minmax / none
+    normalize_clip: float = 10.0  # clip value after zscore/iqr normalization
     pretrain_channels: List[int] = field(default_factory=lambda: [0, 4])  # ch0=ECG, ch4=PPG
     channel_names: List[str] = field(
         default_factory=lambda: ["ECG", "ACC_X", "ACC_Y", "ACC_Z", "PPG"]
     )
+
+    # Augmentation (PhysioAugment — applied to ECG context signal)
+    use_augment: bool = False
+    augment_jitter_std: float = 0.02
+    augment_scale_min: float = 0.85
+    augment_scale_max: float = 1.15
+    augment_max_shift: int = 50
+    augment_wander_amp: float = 0.05
+    augment_apply_prob: float = 0.8
 
     # Downstream label mapping
     num_classes: int = 2  # CHD: binary classification
@@ -70,6 +80,19 @@ class ModelConfig:
 
     # Pooling
     pool_type: str = "adaptive_avg"  # adaptive average pooling → fixed output size
+
+    # ── Auxiliary losses (from CWT-MAE v3) ──
+    use_stats_loss: bool = False       # auxiliary statistics prediction
+    stats_loss_weight: float = 0.1     # weight for stats loss
+    use_contrast_loss: bool = False    # BYOL-style contrastive learning
+    contrast_loss_weight: float = 0.1  # weight for contrastive loss
+    contrast_decay: float = 0.999      # EMA decay for teacher projector
+
+    # ── Downstream ──
+    use_cot_head: bool = False         # Chain-of-Thought classification head
+    cot_tokens: int = 16               # number of reasoning tokens
+    use_layerwise_lr: bool = False     # layer-wise learning rate decay
+    layer_decay: float = 0.75          # decay factor per layer
 
 
 @dataclass

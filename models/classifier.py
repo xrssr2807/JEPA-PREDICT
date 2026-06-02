@@ -1,12 +1,126 @@
 """
 Downstream classification head on top of pre-trained encoder.
+
+Includes:
+  - Vanilla MLP classifier (SignalClassifier, DualChannelClassifier)
+  - CoT (Chain-of-Thought) reasoning head  ← from CWT-MAE v3
 """
 from typing import Optional, List
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .encoder import SignalEncoder
+
+
+class DropPath(nn.Module):
+    """Stochastic depth dropout."""
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if not self.training or self.drop_prob == 0.0:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor = torch.floor(random_tensor + keep_prob)
+        return x / keep_prob * random_tensor
+
+
+class LatentReasoningHead(nn.Module):
+    """
+    Chain-of-Thought (CoT) classification head with learnable reasoning tokens.
+
+    Adapted from CWT-MAE v3.
+
+    Flow:
+        Encoder features → [Reasoning Tokens] ─Cross-Attn→ Self-Attn → FFN
+                                         ↓ Pool Query
+                              → Decision Token → Linear → logits
+    """
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        num_classes: int,
+        num_reasoning_tokens: int = 16,
+        dropout: float = 0.1,
+        drop_path: float = 0.0,
+    ):
+        super().__init__()
+        self.num_reasoning_tokens = num_reasoning_tokens
+
+        # Learnable reasoning tokens
+        self.reasoning_tokens = nn.Parameter(
+            torch.zeros(1, num_reasoning_tokens, embed_dim)
+        )
+        nn.init.normal_(self.reasoning_tokens, std=0.02)
+
+        # Cross-attention: reasoning tokens ← encoder features
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim, num_heads, batch_first=True, dropout=dropout
+        )
+        self.norm1 = nn.LayerNorm(embed_dim)
+
+        # Self-attention: reasoning tokens interact
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim, num_heads, batch_first=True, dropout=dropout
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+
+        # Feed-forward
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 4, embed_dim),
+        )
+        self.norm3 = nn.LayerNorm(embed_dim)
+
+        # Pooling query → decision token
+        self.pool_query = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        nn.init.normal_(self.pool_query, std=0.02)
+        self.pool_attn = nn.MultiheadAttention(
+            embed_dim, num_heads, batch_first=True, dropout=dropout
+        )
+        self.pool_norm = nn.LayerNorm(embed_dim)
+
+        # Classifier
+        self.classifier = nn.Linear(embed_dim, num_classes)
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+    def forward(self, x_encoder):
+        """
+        Args:
+            x_encoder: (B, N, D) — encoder output tokens
+        Returns:
+            logits: (B, num_classes)
+        """
+        B = x_encoder.shape[0]
+        queries = self.reasoning_tokens.expand(B, -1, -1)
+
+        # 1. Cross-attention: reasoning tokens aggregate info from encoder
+        attn_out, _ = self.cross_attn(query=queries, key=x_encoder, value=x_encoder)
+        queries = self.norm1(queries + self.drop_path(attn_out))
+
+        # 2. Self-attention: reasoning tokens reason with each other
+        attn_out2, _ = self.self_attn(query=queries, key=queries, value=queries)
+        queries = self.norm2(queries + self.drop_path(attn_out2))
+
+        # 3. FFN
+        queries = self.norm3(queries + self.drop_path(self.ffn(queries)))
+
+        # 4. Pool to decision token
+        q = self.pool_query.expand(B, -1, -1)
+        pooled, _ = self.pool_attn(q, queries, queries)
+        decision = self.pool_norm(pooled.squeeze(1))
+
+        # 5. Classify
+        return self.classifier(decision)
 
 
 class SignalClassifier(nn.Module):
@@ -76,6 +190,91 @@ class SignalClassifier(nn.Module):
         if return_embedding:
             return logits, embedding
         return logits
+
+
+class SignalClassifierCoT(nn.Module):
+    """
+    Single-channel classifier with CoT reasoning head.
+    """
+    def __init__(
+        self,
+        encoder: SignalEncoder,
+        encoder_dim: int = 512,
+        num_classes: int = 2,
+        num_heads: int = 8,
+        num_reasoning_tokens: int = 16,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.head = LatentReasoningHead(
+            embed_dim=encoder_dim,
+            num_heads=num_heads,
+            num_classes=num_classes,
+            num_reasoning_tokens=num_reasoning_tokens,
+            dropout=dropout,
+        )
+
+    def freeze_encoder(self):
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+
+    def unfreeze_encoder(self):
+        for param in self.encoder.parameters():
+            param.requires_grad = True
+
+    def forward(self, x):
+        _, tokens = self.encoder(x, return_all=True)  # need per-token features for CoT
+        tokens = F.layer_norm(tokens, tokens.shape[-1:])
+        return self.head(tokens)
+
+
+class DualChannelClassifierCoT(nn.Module):
+    """
+    Dual-channel classifier (ECG + PPG fusion) with CoT reasoning head.
+    """
+    def __init__(
+        self,
+        ecg_encoder: SignalEncoder,
+        ppg_encoder: SignalEncoder,
+        encoder_dim: int = 512,
+        num_classes: int = 2,
+        num_heads: int = 8,
+        num_reasoning_tokens: int = 16,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.ecg_encoder = ecg_encoder
+        self.ppg_encoder = ppg_encoder
+
+        # Concatenated tokens: (B, 2*N, D) → reasoning head
+        self.head = LatentReasoningHead(
+            embed_dim=encoder_dim,
+            num_heads=num_heads,
+            num_classes=num_classes,
+            num_reasoning_tokens=num_reasoning_tokens,
+            dropout=dropout,
+        )
+
+    def freeze_encoders(self):
+        for p in self.ecg_encoder.parameters():
+            p.requires_grad = False
+        for p in self.ppg_encoder.parameters():
+            p.requires_grad = False
+
+    def unfreeze_encoders(self):
+        for p in self.ecg_encoder.parameters():
+            p.requires_grad = True
+        for p in self.ppg_encoder.parameters():
+            p.requires_grad = True
+
+    def forward(self, ecg, ppg):
+        _, ecg_tokens = self.ecg_encoder(ecg, return_all=True)
+        _, ppg_tokens = self.ppg_encoder(ppg, return_all=True)
+        ecg_tokens = F.layer_norm(ecg_tokens, ecg_tokens.shape[-1:])
+        ppg_tokens = F.layer_norm(ppg_tokens, ppg_tokens.shape[-1:])
+        all_tokens = torch.cat([ecg_tokens, ppg_tokens], dim=1)
+        return self.head(all_tokens)
 
 
 class DualChannelClassifier(nn.Module):

@@ -39,10 +39,26 @@ def build_dataloader(
         num_workers = 4  # 预处理数据加载快，可以开多进程
     else:
         print(f"[DataLoader] 从原始数据加载: {data_config.pretrain_dir}")
+        augment_kwargs = {}
+        if data_config.use_augment:
+            augment_kwargs = dict(
+                augment=True,
+                augment_config=dict(
+                    jitter_std=data_config.augment_jitter_std,
+                    scale_range=(data_config.augment_scale_min, data_config.augment_scale_max),
+                    max_shift=data_config.augment_max_shift,
+                    wander_amp=data_config.augment_wander_amp,
+                    apply_prob=data_config.augment_apply_prob,
+                ),
+            )
+        return_stats = data_config.normalize != "none"  # use stats for auxiliary loss
         dataset = PretrainDataset(
             data_dir=data_config.pretrain_dir,
             channels=data_config.pretrain_channels,
             normalize=data_config.normalize,
+            normalize_clip=data_config.normalize_clip,
+            return_stats=return_stats,
+            **augment_kwargs,
         )
         num_workers = 0  # pickle 加载受限
 
@@ -74,6 +90,11 @@ def build_model(model_config: ModelConfig) -> JEPA:
         latent_dim=model_config.latent_dim,
         num_latent_samples=model_config.num_latent_samples,
         ema_momentum=model_config.ema_momentum,
+        use_stats_loss=model_config.use_stats_loss,
+        stats_loss_weight=model_config.stats_loss_weight,
+        use_contrast_loss=model_config.use_contrast_loss,
+        contrast_loss_weight=model_config.contrast_loss_weight,
+        contrast_decay=model_config.contrast_decay,
     )
 
 
@@ -125,7 +146,15 @@ def train(config: Config):
         epoch_losses = defaultdict(float)
         epoch_start = time.time()
 
-        for batch_idx, (ecg, ppg) in enumerate(dataloader):
+        for batch_idx, batch_data in enumerate(dataloader):
+            # Handle both old (ecg, ppg) and new (ecg, ppg, stats) formats
+            if len(batch_data) == 3:
+                ecg, ppg, ecg_stats = batch_data
+                ecg_stats = ecg_stats.to(device)
+            else:
+                ecg, ppg = batch_data
+                ecg_stats = None
+
             ecg = ecg.to(device)
             ppg = ppg.to(device)
 
@@ -139,9 +168,9 @@ def train(config: Config):
                 ema_progress,
             )
 
-            # Forward + loss
-            loss, info = model.compute_loss(ecg, ppg)
-            epoch_losses["loss"] += loss.item()
+            # Forward + loss (with optional stats)
+            loss, info = model.compute_loss(ecg, ppg, ecg_stats)
+            epoch_losses["loss"] += info.get("total_loss", loss.item())
 
             # Backward
             optimizer.zero_grad()

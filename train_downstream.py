@@ -126,6 +126,93 @@ def load_pretrained_encoder(
     return encoder
 
 
+def get_layerwise_param_groups(model, base_lr: float, layer_decay: float,
+                               encoder_attr: str = "encoder"):
+    """
+    Create parameter groups with layer-wise learning rate decay.
+
+    Deeper layers get smaller LR to preserve pre-trained knowledge.
+    Classification head gets full LR.
+
+    Args:
+        model: classifier model with .encoder (SignalEncoder)
+        base_lr: base learning rate for classification head
+        layer_decay: decay factor (e.g., 0.75: each layer gets 0.75× LR of layer above)
+        encoder_attr: name of encoder attribute on model ("encoder", "ecg_encoder", etc.)
+    Returns:
+        list of param_group dicts
+    """
+    encoder = getattr(model, encoder_attr, None)
+    if encoder is None:
+        return [{"params": model.parameters(), "lr": base_lr}]
+
+    # Count transformer layers
+    num_layers = len(encoder.transformer.blocks) if hasattr(encoder, 'transformer') else 0
+    if num_layers == 0:
+        return [{"params": model.parameters(), "lr": base_lr}]
+
+    param_groups = []
+    handled = set()
+
+    # Classification head: full LR
+    head_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if not name.startswith(encoder_attr + "."):
+            head_params.append(param)
+            handled.add(param)
+    if head_params:
+        param_groups.append({"params": head_params, "lr": base_lr, "name": "head"})
+
+    # Encoder layers: decayed LR
+    for layer_idx in range(num_layers):
+        lr = base_lr * (layer_decay ** (num_layers - 1 - layer_idx))
+        layer_params = []
+        layer_prefix = f"{encoder_attr}.transformer.blocks.{layer_idx}."
+        for name, param in encoder.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name.startswith(f"transformer.blocks.{layer_idx}."):
+                layer_params.append(param)
+                handled.add(param)
+        if layer_params:
+            param_groups.append({
+                "params": layer_params,
+                "lr": lr,
+                "name": f"layer_{layer_idx}",
+            })
+
+    # CNN stem + pos_encoding + proj + ln_final: bottom-most LR
+    bottom_lr = base_lr * (layer_decay ** num_layers)
+    bottom_params = []
+    for name, param in encoder.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param not in handled:
+            bottom_params.append(param)
+            handled.add(param)
+    if bottom_params:
+        param_groups.append({
+            "params": bottom_params,
+            "lr": bottom_lr,
+            "name": "cnn_stem",
+        })
+
+    # Catch any remaining
+    remaining = []
+    for name, param in model.named_parameters():
+        if param.requires_grad and param not in handled:
+            remaining.append(param)
+    if remaining:
+        param_groups.append({"params": remaining, "lr": base_lr, "name": "other"})
+
+    print(f"[Layer-wise LR] {num_layers} layers, decay={layer_decay}, base_lr={base_lr}")
+    for g in param_groups:
+        print(f"  {g['name']}: lr={g['lr']:.2e} ({len(g['params'])} params)")
+    return param_groups
+
+
 def train_epoch(
     model, dataloader, optimizer, criterion, device, is_dual: bool = False
 ):
@@ -229,11 +316,23 @@ def train_downstream(
     encoder = load_pretrained_encoder(
         checkpoint_path, config.model, "target", device
     )
-    model = SignalClassifier(
-        encoder=encoder,
-        encoder_dim=config.model.transformer_dim,
-        num_classes=num_classes,
-    ).to(device)
+
+    # Choose classifier based on config
+    if config.model.use_cot_head:
+        print("[Model] Using CoT (Chain-of-Thought) classification head")
+        model = SignalClassifierCoT(
+            encoder=encoder,
+            encoder_dim=config.model.transformer_dim,
+            num_classes=num_classes,
+            num_heads=config.model.transformer_heads,
+            num_reasoning_tokens=config.model.cot_tokens,
+        ).to(device)
+    else:
+        model = SignalClassifier(
+            encoder=encoder,
+            encoder_dim=config.model.transformer_dim,
+            num_classes=num_classes,
+        ).to(device)
 
     criterion = nn.CrossEntropyLoss()
 
@@ -265,7 +364,17 @@ def train_downstream(
     model.unfreeze_encoder()
 
     full_epochs = config.train.downstream_epochs - config.train.downstream_probe_epochs
-    optimizer = AdamW(model.parameters(), lr=config.train.downstream_lr * 0.1)
+    ft_lr = config.train.downstream_lr * 0.1
+
+    if config.model.use_layerwise_lr:
+        print(f"[Optimizer] Layer-wise LR decay (base_lr={ft_lr}, decay={config.model.layer_decay})")
+        param_groups = get_layerwise_param_groups(
+            model, ft_lr, config.model.layer_decay
+        )
+        optimizer = AdamW(param_groups)
+    else:
+        optimizer = AdamW(model.parameters(), lr=ft_lr)
+
     scheduler = CosineAnnealingLR(optimizer, T_max=full_epochs)
 
     best_acc = 0.0
