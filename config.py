@@ -10,11 +10,14 @@ class DataConfig:
     """Data paths and preprocessing parameters."""
 
     # Pre-training data (unlabeled 5-channel .pkl files)
-    pretrain_dir: str = "C:/Users/86189/Downloads/split/split"
+    pretrain_dir: str = "/root/autodl-tmp/split"
+    # Preprocessed pre-training data (.pt files, after channel extraction + Z-score)
+    pretrain_processed_dir: str = "/root/autodl-tmp/split_processed"
 
     # Downstream data
-    chd_ppg_dir: str = "C:/Users/86189/Downloads/chd_ppg"
-    chd_ecg_dir: str = "C:/Users/86189/Downloads/chd_ecg"
+    chd_ppg_dir: str = "/root/autodl-tmp/chd_ppg"
+    chd_ecg_dir: str = "/root/autodl-tmp/chd_ecg"
+    arrhythmia_dir: str = "/root/autodl-tmp/processed_dataset"
 
     # Preprocessing
     normalize: str = "zscore"  # zscore per file
@@ -24,7 +27,8 @@ class DataConfig:
     )
 
     # Downstream label mapping
-    num_classes: int = 2  # binary classification
+    num_classes: int = 2  # CHD: binary classification
+    arrhythmia_num_classes: int = 6  # Arrhythmia: 6-class classification
 
 
 @dataclass
@@ -73,10 +77,10 @@ class TrainConfig:
     """Training hyperparameters."""
 
     # Pre-training
-    pretrain_epochs: int = 100
-    pretrain_batch_size: int = 16
-    pretrain_lr: float = 3e-4
-    pretrain_warmup_epochs: int = 10
+    pretrain_epochs: int = 50
+    pretrain_batch_size: int = 310
+    pretrain_lr: float = 2.5e-3
+    pretrain_warmup_epochs: int = 5
     pretrain_weight_decay: float = 0.05
 
     # Optimizer

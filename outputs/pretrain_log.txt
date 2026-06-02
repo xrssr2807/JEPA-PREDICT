@@ -1,6 +1,0 @@
-Epoch   0 | Loss: 0.965441 | Time: 217.9s
-Epoch   1 | Loss: 0.839643 | Time: 217.3s
-Epoch   2 | Loss: 0.627555 | Time: 209.8s
-Epoch   3 | Loss: 0.546871 | Time: 209.3s
-Epoch   4 | Loss: 0.547037 | Time: 212.4s
-Epoch   5 | Loss: 0.577061 | Time: 213.4s

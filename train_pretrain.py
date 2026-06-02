@@ -12,22 +12,45 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
+import os
+
 from config import Config, DataConfig, ModelConfig, TrainConfig
-from dataset.data import PretrainDataset
+from dataset.data import PretrainDataset, PretrainDatasetPT
 from models.jepa import JEPA, cosine_schedule
 
 
-def build_dataloader(data_config: DataConfig, train_config: TrainConfig) -> DataLoader:
-    dataset = PretrainDataset(
-        data_dir=data_config.pretrain_dir,
-        channels=data_config.pretrain_channels,
-        normalize=data_config.normalize,
-    )
+def build_dataloader(
+    data_config: DataConfig,
+    train_config: TrainConfig,
+    use_processed: bool = True,
+) -> DataLoader:
+    """构建预训练 DataLoader。
+
+    Args:
+        data_config: 数据配置
+        train_config: 训练配置
+        use_processed: True=加载预处理好的 .pt 文件（更快），
+                       False=从原始 .pkl 实时处理
+    """
+    processed_dir = os.path.join(data_config.pretrain_processed_dir)
+    if use_processed and os.path.isdir(processed_dir):
+        print(f"[DataLoader] 使用预处理数据: {processed_dir}")
+        dataset = PretrainDatasetPT(data_dir=processed_dir)
+        num_workers = 4  # 预处理数据加载快，可以开多进程
+    else:
+        print(f"[DataLoader] 从原始数据加载: {data_config.pretrain_dir}")
+        dataset = PretrainDataset(
+            data_dir=data_config.pretrain_dir,
+            channels=data_config.pretrain_channels,
+            normalize=data_config.normalize,
+        )
+        num_workers = 0  # pickle 加载受限
+
     return DataLoader(
         dataset,
         batch_size=train_config.pretrain_batch_size,
         shuffle=True,
-        num_workers=0,  # Windows: 0 avoids spawn multiprocessing issues
+        num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
     )

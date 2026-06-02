@@ -1,6 +1,8 @@
 """
-Downstream fine-tuning: linear probe → full fine-tune on CHD classification.
-Supports single-channel (ECG or PPG) and dual-channel (ECG + PPG) classification.
+Downstream fine-tuning: linear probe → full fine-tune on CHD & Arrhythmia classification.
+Supports:
+  - CHD: PPG binary classification (2 classes)
+  - Arrhythmia: PPG multi-class classification (6 classes)
 """
 import os
 import time
@@ -22,30 +24,43 @@ from models.classifier import SignalClassifier, DualChannelClassifier
 def build_downstream_dataloaders(
     data_config: DataConfig,
     train_config: TrainConfig,
-    modality: str,  # "ecg", "ppg", or "dual"
+    dataset: str = "chd",
 ) -> tuple:
-    """Build train and test dataloaders for downstream fine-tuning."""
+    """Build train and test dataloaders for downstream fine-tuning.
 
-    if modality == "ecg":
-        data_dir = data_config.chd_ecg_dir + "/ecg_chd"
-        split_file = data_config.chd_ecg_dir + "/train_test_split.json"
-    elif modality == "ppg":
+    Args:
+        data_config: data configuration
+        train_config: training configuration
+        dataset: "chd" for CHD PPG, "arrhythmia" for arrhythmia PPG
+    """
+
+    if dataset == "arrhythmia":
+        data_dir = data_config.arrhythmia_dir + "/data"
+        split_file = data_config.arrhythmia_dir + "/split.json"
+        binary_abnormal = False
+    elif dataset == "arrhythmia_binary":
+        data_dir = data_config.arrhythmia_dir + "/data"
+        split_file = data_config.arrhythmia_dir + "/split.json"
+        binary_abnormal = True
+    elif dataset == "chd":
         data_dir = data_config.chd_ppg_dir + "/ppg_chd"
         split_file = data_config.chd_ppg_dir + "/train_test_split.json"
     else:
-        raise ValueError(f"Unknown modality: {modality}")
+        raise ValueError(f"Unknown dataset: {dataset}")
 
     train_dataset = DownstreamDataset(
         data_dir=data_dir,
         split_file=split_file,
         split="train",
         normalize=data_config.normalize,
+        binary_abnormal=(dataset == "arrhythmia_binary"),
     )
     test_dataset = DownstreamDataset(
         data_dir=data_dir,
         split_file=split_file,
         split="test",
         normalize=data_config.normalize,
+        binary_abnormal=(dataset == "arrhythmia_binary"),
     )
 
     train_loader = DataLoader(
@@ -58,60 +73,6 @@ def build_downstream_dataloaders(
     )
     test_loader = DataLoader(
         test_dataset,
-        batch_size=train_config.downstream_batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True,
-    )
-
-    return train_loader, test_loader
-
-
-def build_dual_dataloaders(
-    data_config: DataConfig,
-    train_config: TrainConfig,
-):
-    """Build paired ECG+PPG dataloaders for dual-channel classification."""
-    # ECG
-    ecg_dir = data_config.chd_ecg_dir + "/ecg_chd"
-    ecg_split = data_config.chd_ecg_dir + "/train_test_split.json"
-    # PPG
-    ppg_dir = data_config.chd_ppg_dir + "/ppg_chd"
-    ppg_split = data_config.chd_ppg_dir + "/train_test_split.json"
-
-    # We need a paired dataset wrapper
-    from torch.utils.data import Dataset as TorchDataset
-
-    class PairedDataset(TorchDataset):
-        def __init__(self, ecg_ds, ppg_ds):
-            self.ecg_ds = ecg_ds
-            self.ppg_ds = ppg_ds
-            assert len(ecg_ds) == len(ppg_ds), "Datasets must have same length"
-
-        def __len__(self):
-            return len(self.ecg_ds)
-
-        def __getitem__(self, idx):
-            ecg_data, ecg_label = self.ecg_ds[idx]
-            ppg_data, ppg_label = self.ppg_ds[idx]
-            # Labels should match (same patient, same segment)
-            return ecg_data, ppg_data, ecg_label
-
-    ecg_train = DownstreamDataset(ecg_dir, ecg_split, "train", data_config.normalize)
-    ppg_train = DownstreamDataset(ppg_dir, ppg_split, "train", data_config.normalize)
-    ecg_test = DownstreamDataset(ecg_dir, ecg_split, "test", data_config.normalize)
-    ppg_test = DownstreamDataset(ppg_dir, ppg_split, "test", data_config.normalize)
-
-    train_loader = DataLoader(
-        PairedDataset(ecg_train, ppg_train),
-        batch_size=train_config.downstream_batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        drop_last=True,
-    )
-    test_loader = DataLoader(
-        PairedDataset(ecg_test, ppg_test),
         batch_size=train_config.downstream_batch_size,
         shuffle=False,
         num_workers=4,
@@ -235,7 +196,7 @@ def evaluate(model, dataloader, criterion, device, is_dual: bool = False):
 def train_downstream(
     config: Config,
     checkpoint_path: str,
-    modality: str = "ppg",  # "ecg", "ppg", or "dual"
+    dataset: str = "chd",  # "chd" or "arrhythmia"
 ):
     """
     Downstream fine-tuning pipeline.
@@ -243,53 +204,42 @@ def train_downstream(
     Args:
         config: master configuration
         checkpoint_path: path to pre-trained JEPA checkpoint
-        modality: which signal to use for classification
+        dataset: which dataset to use ("chd" or "arrhythmia")
     """
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    print(f"Modality: {modality}")
+    print(f"Dataset: {dataset}")
 
-    is_dual = modality == "dual"
-
-    # Data
-    if is_dual:
-        train_loader, test_loader = build_dual_dataloaders(config.data, config.train)
-        # Dual uses both ECG (context) and PPG (target) encoders
-        ecg_encoder = load_pretrained_encoder(
-            checkpoint_path, config.model, "context", device
-        )
-        ppg_encoder = load_pretrained_encoder(
-            checkpoint_path, config.model, "target", device
-        )
-        model = DualChannelClassifier(
-            ecg_encoder=ecg_encoder,
-            ppg_encoder=ppg_encoder,
-            encoder_dim=config.model.transformer_dim,
-            num_classes=config.data.num_classes,
-        ).to(device)
+    # Select num_classes based on dataset
+    if dataset == "arrhythmia":
+        num_classes = config.data.arrhythmia_num_classes  # 6
+    elif dataset == "arrhythmia_binary":
+        num_classes = 2  # normal vs abnormal
     else:
-        train_loader, test_loader = build_downstream_dataloaders(
-            config.data, config.train, modality
-        )
-        # Single-channel: use target_encoder for PPG, context_encoder for ECG
-        encoder_type = "target" if modality == "ppg" else "context"
-        encoder = load_pretrained_encoder(
-            checkpoint_path, config.model, encoder_type, device
-        )
-        model = SignalClassifier(
-            encoder=encoder,
-            encoder_dim=config.model.transformer_dim,
-            num_classes=config.data.num_classes,
-        ).to(device)
+        num_classes = config.data.num_classes  # 2
+
+    print(f"Num classes: {num_classes}")
+
+    # Data — PPG single-channel for both datasets
+    train_loader, test_loader = build_downstream_dataloaders(
+        config.data, config.train, dataset
+    )
+
+    # Load pre-trained target encoder (PPG) for single-channel classification
+    encoder = load_pretrained_encoder(
+        checkpoint_path, config.model, "target", device
+    )
+    model = SignalClassifier(
+        encoder=encoder,
+        encoder_dim=config.model.transformer_dim,
+        num_classes=num_classes,
+    ).to(device)
 
     criterion = nn.CrossEntropyLoss()
 
     # ── Phase 1: Linear Probe ──
     print("\n=== Phase 1: Linear Probe (frozen encoder) ===")
-    if is_dual:
-        model.freeze_encoders()
-    else:
-        model.freeze_encoder()
+    model.freeze_encoder()
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(trainable_params, lr=config.train.downstream_lr)
@@ -297,10 +247,10 @@ def train_downstream(
 
     for epoch in range(config.train.downstream_probe_epochs):
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, criterion, device, is_dual
+            model, train_loader, optimizer, criterion, device, is_dual=False
         )
         test_loss, test_acc, _, _ = evaluate(
-            model, test_loader, criterion, device, is_dual
+            model, test_loader, criterion, device, is_dual=False
         )
         scheduler.step()
 
@@ -312,10 +262,7 @@ def train_downstream(
 
     # ── Phase 2: Full Fine-tune ──
     print("\n=== Phase 2: Full Fine-tune ===")
-    if is_dual:
-        model.unfreeze_encoders()
-    else:
-        model.unfreeze_encoder()
+    model.unfreeze_encoder()
 
     full_epochs = config.train.downstream_epochs - config.train.downstream_probe_epochs
     optimizer = AdamW(model.parameters(), lr=config.train.downstream_lr * 0.1)
@@ -326,10 +273,10 @@ def train_downstream(
 
     for epoch in range(full_epochs):
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, criterion, device, is_dual
+            model, train_loader, optimizer, criterion, device, is_dual=False
         )
         test_loss, test_acc, _, _ = evaluate(
-            model, test_loader, criterion, device, is_dual
+            model, test_loader, criterion, device, is_dual=False
         )
         scheduler.step()
 
@@ -348,7 +295,7 @@ def train_downstream(
             }
 
     # Save best model
-    save_path = os.path.join(config.output_dir, f"downstream_{modality}_best.pt")
+    save_path = os.path.join(config.output_dir, f"downstream_{dataset}_best.pt")
     torch.save(best_state, save_path)
     print(f"\nBest Test Acc: {best_acc:.2f}% → saved to {save_path}")
 
@@ -361,9 +308,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to pre-trained JEPA checkpoint")
-    parser.add_argument("--modality", type=str, default="ppg",
-                        choices=["ecg", "ppg", "dual"],
-                        help="Which signal to use for classification")
+    parser.add_argument("--dataset", type=str, default="chd",
+                        choices=["chd", "arrhythmia", "arrhythmia_binary"],
+                        help="Which dataset: chd (冠心病), arrhythmia (心律失常6分类), arrhythmia_binary (心律失常二分类)")
     parser.add_argument("--output_dir", type=str, default="./outputs")
     args = parser.parse_args()
 
@@ -371,4 +318,4 @@ if __name__ == "__main__":
     config.output_dir = args.output_dir
     os.makedirs(config.output_dir, exist_ok=True)
 
-    train_downstream(config, args.checkpoint, args.modality)
+    train_downstream(config, args.checkpoint, args.dataset)

@@ -123,6 +123,7 @@ class DownstreamDataset(Dataset):
         split_file: str,
         split: str = "train",
         normalize: str = "zscore",
+        binary_abnormal: bool = False,  # True: class 0→0, class 1-5→1
     ):
         """
         Args:
@@ -130,17 +131,21 @@ class DownstreamDataset(Dataset):
             split_file: path to train_test_split.json
             split: "train" or "test"
             normalize: normalization method
+            binary_abnormal: if True, remap labels: 0→0(normal), 1-5→1(abnormal)
         """
         import json
 
         self.data_dir = data_dir
         self.normalize = normalize
+        self.binary_abnormal = binary_abnormal
 
         with open(split_file, "r") as f:
             split_data = json.load(f)
 
         self.files = split_data[split]
         print(f"[DownstreamDataset] {split}: {len(self.files)} files from {data_dir}")
+        if binary_abnormal:
+            print(f"[DownstreamDataset] Binary abnormal mode: class 0=正常, 1-5=异常")
 
     def __len__(self) -> int:
         return len(self.files)
@@ -156,7 +161,11 @@ class DownstreamDataset(Dataset):
         with open(filepath, "rb") as f:
             sample = pickle.load(f)
 
-        data = sample["data"].astype(np.float32)  # (1000,)
+        data = sample["data"].astype(np.float32)  # (1000,) or (1, 1000)
+
+        # Handle both (1000,) and (1, 1000) shapes
+        if data.ndim == 2:
+            data = data.squeeze(0)  # (1, 1000) → (1000,)
 
         # Normalize
         if self.normalize == "zscore":
@@ -166,6 +175,59 @@ class DownstreamDataset(Dataset):
             denom = 1.0 if d_max - d_min == 0 else d_max - d_min
             data = (data - d_min) / denom
 
-        label = sample["label"][0]["class"]  # 0 or 1
+        label = sample["label"][0]["class"]  # int
+
+        # Binary abnormal remapping: 0→0(normal), 1-5→1(abnormal)
+        if self.binary_abnormal:
+            label = 0 if label == 0 else 1
 
         return torch.from_numpy(data).float().unsqueeze(0), label  # (1, 1000)
+
+
+class PretrainDatasetPT(Dataset):
+    """
+    加载预处理好的 .pt 文件（已完成通道提取 + Z-score 归一化）。
+
+    每个 .pt 文件包含:
+        - ecg: (1, 3000) float32 tensor
+        - ppg: (1, 3000) float32 tensor
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        max_files: Optional[int] = None,
+    ):
+        """
+        Args:
+            data_dir: 预处理后 .pt 文件所在目录
+            max_files: 限制文件数（调试用）
+        """
+        self.data_dir = data_dir
+
+        self.files = sorted([
+            f for f in os.listdir(data_dir)
+            if f.endswith(".pt")
+        ])
+
+        if max_files is not None:
+            self.files = self.files[:max_files]
+
+        print(f"[PretrainDatasetPT] 找到 {len(self.files)} 个预处理文件于 {data_dir}")
+
+    def __len__(self) -> int:
+        return len(self.files)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            ecg: (1, 3000) tensor — context signal
+            ppg: (1, 3000) tensor — target signal
+        """
+        filepath = os.path.join(self.data_dir, self.files[idx])
+        try:
+            sample = torch.load(filepath, weights_only=True)
+            return sample["ecg"], sample["ppg"]
+        except Exception:
+            fallback_idx = (idx + 1) % len(self.files)
+            return self.__getitem__(fallback_idx)

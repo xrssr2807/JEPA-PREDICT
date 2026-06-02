@@ -1,0 +1,9 @@
+# 输出权重和日志
+outputs/
+# Python 缓存
+__pycache__/
+*.pyc
+# IDE
+.idea/
+.vscode/
+.ipynb_checkpoints/
