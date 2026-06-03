@@ -129,7 +129,19 @@ class TrainConfig:
     downstream_epochs: int = 50
     downstream_batch_size: int = 128
     downstream_lr: float = 1e-3
+    downstream_min_lr: float = 1e-6
+    downstream_warmup_epochs: int = 5
     downstream_probe_epochs: int = 10  # linear probe only (frozen encoder)
+    downstream_scheduler: str = "step"  # "epoch" or "step" (step-based for warmup+cosine)
+
+    # Downstream loss
+    loss_type: str = "focal"  # "ce" | "focal" | "asl" | "bce"
+    focal_gamma: float = 2.0
+    asl_gamma_neg: int = 4
+    asl_gamma_pos: int = 1
+    asl_clip: float = 0.05
+    label_smoothing: float = 0.0
+    auto_pos_weight: bool = True  # compute pos_weight from training data
 
 
 @dataclass
