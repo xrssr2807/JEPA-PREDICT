@@ -98,7 +98,7 @@ def build_model(model_config: ModelConfig) -> JEPA:
     )
 
 
-def train(config: Config):
+def train(config: Config, resume_from: str = None, start_epoch: int = 0):
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
@@ -122,18 +122,55 @@ def train(config: Config):
         weight_decay=config.train.pretrain_weight_decay,
     )
 
-    # LR schedule: warmup + cosine
-    warmup_steps = config.train.pretrain_warmup_epochs * steps_per_epoch
-    cosine_steps = total_steps - warmup_steps
-    warmup_scheduler = LinearLR(
-        optimizer, start_factor=1e-6, end_factor=1.0, total_iters=warmup_steps
-    )
-    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=cosine_steps)
-    scheduler = SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[warmup_steps],
-    )
+    # ── Resume logic ──
+    if resume_from is not None:
+        print(f"[Resume] Loading checkpoint: {resume_from}")
+        ckpt = torch.load(resume_from, map_location=device)
+        # Load encoder weights
+        if "context_encoder" in ckpt:
+            model.context_encoder.load_state_dict(ckpt["context_encoder"])
+            print("[Resume] Loaded context_encoder weights")
+        if "target_encoder" in ckpt:
+            model.target_encoder.load_state_dict(ckpt["target_encoder"])
+            print("[Resume] Loaded target_encoder weights")
+        if "model_state_dict" in ckpt:
+            model.load_state_dict(ckpt["model_state_dict"])
+            print("[Resume] Loaded full model_state_dict")
+        # Restore optimizer if available
+        if "optimizer_state_dict" in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                print("[Resume] Loaded optimizer state")
+            except Exception as e:
+                print(f"[Resume] Optimizer state restore failed (reinit): {e}")
+        print(f"[Resume] Continuing from epoch {start_epoch}")
+
+    # LR schedule: warmup + cosine (adjusted for resume)
+    remaining_epochs = config.train.pretrain_epochs - start_epoch
+    remaining_steps = remaining_epochs * steps_per_epoch
+    # Skip warmup when resuming (already past warmup phase)
+    if start_epoch >= config.train.pretrain_warmup_epochs:
+        warmup_scheduler = LinearLR(
+            optimizer, start_factor=1.0, end_factor=1.0, total_iters=1
+        )
+        cosine_scheduler = CosineAnnealingLR(optimizer, T_max=remaining_steps)
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[1],
+        )
+    else:
+        warmup_steps = (config.train.pretrain_warmup_epochs - start_epoch) * steps_per_epoch
+        cosine_steps = remaining_steps - warmup_steps
+        warmup_scheduler = LinearLR(
+            optimizer, start_factor=1e-6, end_factor=1.0, total_iters=max(1, warmup_steps)
+        )
+        cosine_scheduler = CosineAnnealingLR(optimizer, T_max=max(1, cosine_steps))
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[max(1, warmup_steps)],
+        )
 
     # Logging
     os.makedirs(config.output_dir, exist_ok=True)
@@ -141,7 +178,7 @@ def train(config: Config):
 
     best_loss = float("inf")
 
-    for epoch in range(config.train.pretrain_epochs):
+    for epoch in range(start_epoch, config.train.pretrain_epochs):
         model.train()
         epoch_losses = defaultdict(float)
         epoch_start = time.time()
@@ -235,5 +272,13 @@ def train(config: Config):
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="JEPA Pre-training")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Resume from checkpoint path")
+    parser.add_argument("--start_epoch", type=int, default=0,
+                        help="Epoch to start/resume from")
+    args = parser.parse_args()
+
     config = Config()
-    train(config)
+    train(config, resume_from=args.resume, start_epoch=args.start_epoch)

@@ -10,9 +10,9 @@ class DataConfig:
     """Data paths and preprocessing parameters."""
 
     # Pre-training data (unlabeled 5-channel .pkl files)
-    pretrain_dir: str = r"C:\Users\86189\Downloads\split\split"
+    pretrain_dir: str = "/root/autodl-tmp/split"
     # Preprocessed pre-training data (.pt files, after channel extraction + Z-score)
-    pretrain_processed_dir: str = r"C:\Users\86189\Downloads\split_processed"
+    pretrain_processed_dir: str = "/root/autodl-tmp/split_processed"
 
     # Downstream data
     chd_ppg_dir: str = "/root/autodl-tmp/chd_ppg"
@@ -75,8 +75,9 @@ class ModelConfig:
     num_latent_samples: int = 4  # number of z samples during training
 
     # EMA for target encoder
-    ema_momentum: float = 0.996  # initial momentum
-    ema_end_momentum: float = 1.0  # final momentum (1.0 = no update)
+    # 低 → 高：LR 大时 target 快速追踪 context，LR 小时 target 稳定微调
+    ema_momentum: float = 0.9    # initial: fast tracking (10% update per step)
+    ema_end_momentum: float = 0.999  # final: slow fine-tuning (0.1% update per step)
 
     # Pooling
     pool_type: str = "adaptive_avg"  # adaptive average pooling → fixed output size
@@ -103,7 +104,7 @@ class TrainConfig:
     pretrain_epochs: int = 50
     pretrain_batch_size: int = 310
     pretrain_lr: float = 2.5e-3
-    pretrain_warmup_epochs: int = 5
+    pretrain_warmup_epochs: int = 10  # extended warmup for smoother LR ramp
     pretrain_weight_decay: float = 0.05
 
     # Optimizer
@@ -132,7 +133,7 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     device: str = "cuda"
     seed: int = 42
-    output_dir: str = "./outputs"
+    output_dir: str = "/root/autodl-tmp/JEPA-PREDICT/outputs"
 
 
 # Default config instance
