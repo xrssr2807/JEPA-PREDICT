@@ -19,7 +19,7 @@ CFG = dict(
     normalize="iqr",        # IQR robust normalization
     normalize_clip=10.0,
     use_augment=True,
-    max_files=200,          # Start with 200 files (~30 min CPU)
+    max_files=500,          # ~2.5 min/epoch on CPU
 
     # Architecture (small but real)
     cnn_channels=(64, 128, 256, 256),
@@ -46,8 +46,8 @@ CFG = dict(
     contrast_loss_weight=0.1,
 
     # Training
-    epochs=20,
-    batch_size=8,
+    epochs=30,
+    batch_size=16,
     lr=1e-3,
     warmup_epochs=2,
     weight_decay=0.05,
