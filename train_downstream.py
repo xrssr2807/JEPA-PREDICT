@@ -332,14 +332,22 @@ def evaluate(model, dataloader, criterion, device, num_classes: int,
     except Exception:
         report = "N/A"
 
-    # F1 and precision/recall
+    # Precision / Recall / F1 / F0.5 (macro)
     try:
+        precision = precision_score(all_labels_arr, all_preds_arr,
+                                     average='macro', zero_division=0)
+        recall = recall_score(all_labels_arr, all_preds_arr,
+                              average='macro', zero_division=0)
         f1 = fbeta_score(all_labels_arr, all_preds_arr, beta=1, average='macro',
                          zero_division=0)
+        f05 = fbeta_score(all_labels_arr, all_preds_arr, beta=0.5, average='macro',
+                          zero_division=0)
     except Exception:
-        f1 = 0.0
+        precision = recall = f1 = f05 = 0.0
 
-    return avg_loss, acc, macro_auc, auc_list, f1, report, all_preds_arr, all_labels_arr, all_probs
+    return (avg_loss, acc, macro_auc, auc_list,
+            precision, recall, f1, f05, report,
+            all_preds_arr, all_labels_arr, all_probs)
 
 
 # ── Main Pipeline ───────────────────────────────────────────────
@@ -428,7 +436,7 @@ def train_downstream(
             model, train_loader, optimizer, criterion, device,
             scheduler=scheduler, sched_mode=sched_mode,
         )
-        test_loss, test_acc, auc, auc_list, f1, report, _, _, _ = evaluate(
+        test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate(
             model, test_loader, criterion, device, num_classes,
         )
 
@@ -437,7 +445,8 @@ def train_downstream(
 
         print(f"Probe Epoch {epoch+1:2d} | "
               f"Train L={train_loss:.4f} Acc={train_acc:.2f}% | "
-              f"Test L={test_loss:.4f} Acc={test_acc:.2f}% AUC={auc:.4f} F1={f1:.4f}")
+              f"Test L={test_loss:.4f} Acc={test_acc:5.2f}% AUC={auc:.4f} "
+              f"P={prec:.4f} R={rec:.4f} F1={f1:.4f} F0.5={f05:.4f}")
 
     # ── Phase 2: Full Fine-tune ──
     print("\n" + "=" * 60)
@@ -466,7 +475,7 @@ def train_downstream(
             model, train_loader, optimizer, criterion, device,
             scheduler=scheduler, sched_mode=sched_mode,
         )
-        test_loss, test_acc, auc, auc_list, f1, report, _, _, _ = evaluate(
+        test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate(
             model, test_loader, criterion, device, num_classes,
         )
 
@@ -476,7 +485,8 @@ def train_downstream(
         lr = optimizer.param_groups[0]['lr']
         print(f"FT Epoch {epoch+1:2d} | "
               f"Train L={train_loss:.4f} Acc={train_acc:.2f}% | "
-              f"Test L={test_loss:.4f} Acc={test_acc:.2f}% AUC={auc:.4f} F1={f1:.4f} | lr={lr:.2e}")
+              f"Test L={test_loss:.4f} Acc={test_acc:5.2f}% AUC={auc:.4f} "
+              f"P={prec:.4f} R={rec:.4f} F1={f1:.4f} F0.5={f05:.4f} | lr={lr:.2e}")
 
         if auc > best_auc:
             best_auc = auc
@@ -493,15 +503,19 @@ def train_downstream(
     # Load best model and re-evaluate
     if best_state is not None:
         model.load_state_dict(best_state["model_state_dict"])
-    _, test_acc, auc, auc_list, f1, report, _, _, _ = evaluate(
+    (_, test_acc, auc, auc_list,
+     prec, rec, f1, f05, report, _, _, _) = evaluate(
         model, test_loader, criterion, device, num_classes,
     )
 
-    print(f"Best Test Acc: {test_acc:.2f}%")
-    print(f"Best Test AUC: {auc:.4f}")
+    print(f"Best Test Acc:       {test_acc:.2f}%")
+    print(f"Best Test AUC (macro): {auc:.4f}")
     if auc_list:
-        print(f"Per-class AUC: {[round(a, 4) for a in auc_list]}")
-    print(f"Best Test F1 (macro): {f1:.4f}")
+        print(f"Per-class AUC:        {[round(a, 4) for a in auc_list]}")
+    print(f"Precision (macro):   {prec:.4f}")
+    print(f"Recall (macro):      {rec:.4f}")
+    print(f"F1 (macro):          {f1:.4f}")
+    print(f"F0.5 (macro):        {f05:.4f}")
     print(f"\nClassification Report:\n{report}")
 
     # Save
