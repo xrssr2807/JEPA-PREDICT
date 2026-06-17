@@ -90,6 +90,9 @@ def build_model(model_config: ModelConfig) -> JEPA:
         latent_dim=model_config.latent_dim,
         num_latent_samples=model_config.num_latent_samples,
         ema_momentum=model_config.ema_momentum,
+        # ★ JETS 掩码
+        mask_ratio=model_config.jets_mask_ratio,
+        mask_patch_size=model_config.jets_mask_patch_size,
         use_stats_loss=model_config.use_stats_loss,
         stats_loss_weight=model_config.stats_loss_weight,
         use_contrast_loss=model_config.use_contrast_loss,

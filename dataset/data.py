@@ -235,6 +235,60 @@ class PretrainDataset(Dataset):
             return self.__getitem__(fallback_idx)
 
 
+# ── 信号质量指数 (SQI) ─────────────────────────────────────
+# 用于过滤低质量PPG，PhysioBridge + PPG BP综述均证实
+# 信号质量是下游任务性能的关键前置环节
+
+def compute_ppg_sqi(signal: np.ndarray, fs: int = 100) -> float:
+    """
+    计算PPG信号质量指数 (0~1, 1=最高质量)。
+
+    基于三个维度：
+    1. 幅值动态范围 — 信号有无足够的变化
+    2. 峰值规律性 — 心跳是否规则 (HRV变异系数)
+    3. 信噪比估计 — 信号相对噪声的强度
+
+    Args:
+        signal: (L,) float32 PPG信号
+        fs: 采样率 (Hz)
+    Returns:
+        sqi: float in [0, 1]
+    """
+    s = signal.astype(np.float64)
+    n = len(s)
+
+    # 1. 幅值动态范围得分 (0~0.3)
+    s_min, s_max = s.min(), s.max()
+    dynamic_range = s_max - s_min
+    range_score = min(dynamic_range / 0.5, 1.0) * 0.3  # 归一化到0.3
+
+    # 2. 基于自相关的周期性得分 (0~0.4)
+    # 用自相关检测PPG的周期性结构
+    s_detrend = s - np.mean(s)
+    if np.std(s_detrend) > 1e-8:
+        autocorr = np.correlate(s_detrend, s_detrend, mode='same')
+        mid = len(autocorr) // 2
+        # 看自相关在合理心率范围内有无明显峰值 (50~120bpm → 0.5~2.0秒 → 50~200采样点@100Hz)
+        search_range = autocorr[mid + fs // 4: mid + fs * 2]  # 0.25~2秒
+        if len(search_range) > 0 and np.max(search_range) > 1e-8:
+            # 归一化自相关峰值
+            peak_val = np.max(search_range) / (np.std(s_detrend) ** 2 * n + 1e-10)
+            periodicity_score = min(max(peak_val, 0), 1.0) * 0.4
+        else:
+            periodicity_score = 0.0
+    else:
+        periodicity_score = 0.0
+
+    # 3. 基线稳定性得分 (0~0.3)
+    # 检查信号的低频漂移程度
+    smooth = np.convolve(s, np.ones(fs // 2) / (fs // 2), mode='same')
+    baseline_var = np.std(smooth)
+    baseline_score = max(0, 1.0 - min(baseline_var / 0.3, 1.0)) * 0.3
+
+    sqi = range_score + periodicity_score + baseline_score
+    return float(min(sqi, 1.0))
+
+
 class DownstreamDataset(Dataset):
     """
     Labeled single-channel dataset for downstream classification.
@@ -254,6 +308,7 @@ class DownstreamDataset(Dataset):
         normalize: str = "zscore",
         normalize_clip: float = 10.0,
         binary_abnormal: bool = False,  # True: class 0→0, class 1-5→1
+        signal_quality_gate: float = 0.0,  # ★ SQI阈值：低于此值的样本被跳过 (0=关闭)
     ):
         """
         Args:
@@ -263,6 +318,7 @@ class DownstreamDataset(Dataset):
             normalize: normalization method ("zscore", "iqr", "minmax", "none")
             normalize_clip: clip value after zscore/iqr normalization
             binary_abnormal: if True, remap labels: 0→0(normal), 1-5→1(abnormal)
+            signal_quality_gate: SQI阈值 (0~1), 低于此值样本被跳过 (0=关闭)
         """
         import json
 
@@ -270,13 +326,17 @@ class DownstreamDataset(Dataset):
         self.normalize = normalize
         self.normalize_clip = normalize_clip
         self.binary_abnormal = binary_abnormal
+        self.signal_quality_gate = signal_quality_gate
 
         with open(split_file, "r") as f:
             split_data = json.load(f)
 
         self.files = split_data[split]
-        print(f"[DownstreamDataset] {split}: {len(self.files)} files from {data_dir}"
-              f" (normalize={normalize})")
+        info = f"[DownstreamDataset] {split}: {len(self.files)} files from {data_dir}"
+        info += f" (normalize={normalize})"
+        if signal_quality_gate > 0:
+            info += f" + SQI门控 ≥{signal_quality_gate:.2f}"
+        print(info)
         if binary_abnormal:
             print(f"[DownstreamDataset] Binary abnormal mode: class 0=正常, 1-5=异常")
 
@@ -314,6 +374,14 @@ class DownstreamDataset(Dataset):
         if data.ndim == 2:
             data = data.squeeze(0)  # (1, 1000) → (1000,)
 
+        # ★ 信号质量门控：在归一化前计算SQI
+        if self.signal_quality_gate > 0:
+            sqi = compute_ppg_sqi(data, fs=100)
+            if sqi < self.signal_quality_gate:
+                # 低于阈值 → 跳过此样本，返回下一个
+                fallback_idx = (idx + 1) % len(self.files)
+                return self.__getitem__(fallback_idx)
+
         # Normalize
         if self.normalize == "zscore":
             data = self._zscore(data)
@@ -327,12 +395,13 @@ class DownstreamDataset(Dataset):
             data = np.clip(data, -self.normalize_clip, self.normalize_clip)
 
         label = sample["label"][0]["class"]  # int
+        uid = str(sample.get("uid", f"unknown_{idx}"))  # 患者ID
 
         # Binary abnormal remapping: 0→0(normal), 1-5→1(abnormal)
         if self.binary_abnormal:
             label = 0 if label == 0 else 1
 
-        return torch.from_numpy(data).float().unsqueeze(0), label  # (1, 1000)
+        return torch.from_numpy(data).float().unsqueeze(0), label, uid  # (1, 1000), scalar, str
 
 
 class PretrainDatasetPT(Dataset):

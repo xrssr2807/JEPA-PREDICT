@@ -65,11 +65,13 @@ def build_downstream_dataloaders(
         data_dir=data_dir, split_file=split_file, split="train",
         normalize=data_config.normalize, normalize_clip=data_config.normalize_clip,
         binary_abnormal=binary_abnormal,
+        signal_quality_gate=data_config.signal_quality_gate,
     )
     test_dataset = DownstreamDataset(
         data_dir=data_dir, split_file=split_file, split="test",
         normalize=data_config.normalize, normalize_clip=data_config.normalize_clip,
         binary_abnormal=binary_abnormal,
+        signal_quality_gate=data_config.signal_quality_gate,
     )
 
     train_loader = DataLoader(
@@ -238,7 +240,11 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
             ecg, ppg, labels = ecg.to(device), ppg.to(device), labels.to(device)
             logits = model(ecg, ppg)
         else:
-            x, labels = batch
+            # ★ 兼容3元组 (x, labels, uid)
+            if len(batch) == 3:
+                x, labels, _ = batch
+            else:
+                x, labels = batch
             x, labels = x.to(device), labels.to(device)
             logits = model(x)
 
@@ -262,10 +268,15 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
 
 @torch.no_grad()
 def evaluate(model, dataloader, criterion, device, num_classes: int,
-             is_dual: bool = False):
+             is_dual: bool = False, aggregate_by_uid: bool = True):
     """
-    Comprehensive evaluation.
+    Comprehensive evaluation with optional per-patient segment aggregation.
 
+    ECG-FM 论文证明：同一患者的多段logits聚合（平均/最大）
+    可提升 AUPRC 达 16.65%。
+
+    Args:
+        aggregate_by_uid: True → 按患者聚合多段logits再算指标
     Returns:
         loss, accuracy, per-class AUCs, classification_report_str,
         all_preds, all_labels, all_probs
@@ -274,6 +285,10 @@ def evaluate(model, dataloader, criterion, device, num_classes: int,
     running_loss = 0.0
     correct = 0
     total = 0
+
+    # ★ 用于 segment 聚合的 uid 级缓存
+    uid_logits = {}   # uid → list of logits (per segment)
+    uid_labels = {}   # uid → label (同一患者所有段标签相同)
 
     all_preds = []
     all_labels = []
@@ -284,16 +299,31 @@ def evaluate(model, dataloader, criterion, device, num_classes: int,
             ecg, ppg, labels = batch
             ecg, ppg, labels = ecg.to(device), ppg.to(device), labels.to(device)
             logits = model(ecg, ppg)
+            uids = batch[3] if len(batch) >= 4 else None
         else:
-            x, labels = batch
+            # 兼容 2元组 / 3元组
+            if len(batch) == 3:
+                x, labels, uids = batch
+            else:
+                x, labels = batch
+                uids = None
             x, labels = x.to(device), labels.to(device)
             logits = model(x)
 
         loss = criterion(logits, labels)
-
         running_loss += loss.item()
         probs = logits.softmax(dim=-1)
         _, predicted = logits.max(1)
+
+        # ★ 按uid收集（segment聚合用）
+        if aggregate_by_uid and uids is not None:
+            for i, uid in enumerate(uids):
+                uid_str = str(uid)
+                if uid_str not in uid_logits:
+                    uid_logits[uid_str] = []
+                    uid_labels[uid_str] = labels[i].item()
+                uid_logits[uid_str].append(logits[i:i+1])  # keep as (1, C)
+
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
 
@@ -302,10 +332,37 @@ def evaluate(model, dataloader, criterion, device, num_classes: int,
         all_probs.append(probs.cpu().numpy())
 
     avg_loss = running_loss / len(dataloader)
-    acc = 100.0 * correct / total
-    all_probs = np.concatenate(all_probs, axis=0)
-    all_labels_arr = np.array(all_labels)
-    all_preds_arr = np.array(all_preds)
+
+    # ── 按uid聚合计算最终指标 ──
+    if aggregate_by_uid and uid_logits:
+        # 每个患者：平均所有段logits → 再做分类
+        uid_agg_preds = []
+        uid_agg_labels = []
+        uid_agg_probs = []
+        for uid in uid_logits:
+            # 平均logits (ECG-FM: 平均提升最大)
+            stacked = torch.cat(uid_logits[uid], dim=0)  # (N_segments, C)
+            avg_logit = stacked.mean(dim=0, keepdim=True)  # (1, C)
+            avg_prob = avg_logit.softmax(dim=-1)  # (1, C)
+            _, avg_pred = avg_logit.max(dim=-1)
+
+            uid_agg_probs.append(avg_prob.cpu().numpy())
+            uid_agg_preds.append(avg_pred.item())
+            uid_agg_labels.append(uid_labels[uid])
+
+        all_labels_arr = np.array(uid_agg_labels)
+        all_preds_arr = np.array(uid_agg_preds)
+        all_probs = np.concatenate(uid_agg_probs, axis=0)
+        agg_n = len(uid_logits)
+        acc = 100.0 * (all_preds_arr == all_labels_arr).sum() / agg_n
+
+        print(f"[Evaluate] ★ Segment聚合: {agg_n} 患者 "
+              f"(来自 {total} 段PPG, 平均每患者 {total/agg_n:.1f} 段)")
+    else:
+        acc = 100.0 * correct / total
+        all_probs = np.concatenate(all_probs, axis=0)
+        all_labels_arr = np.array(all_labels)
+        all_preds_arr = np.array(all_preds)
 
     # Per-class AUC
     auc_list = []

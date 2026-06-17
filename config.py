@@ -27,6 +27,9 @@ class DataConfig:
         default_factory=lambda: ["ECG", "ACC_X", "ACC_Y", "ACC_Z", "PPG"]
     )
 
+    # ★ 信号质量门控：过滤低质量PPG样本 (PPG BP综述: 使用SQA后精度提升19-24%)
+    signal_quality_gate: float = 0.3  # 0=关闭, 0.3=推荐阈值 (SQI低于此值跳过)
+
     # Augmentation (PhysioAugment — applied to ECG context signal)
     use_augment: bool = False
     augment_jitter_std: float = 0.02
@@ -81,6 +84,11 @@ class ModelConfig:
 
     # Pooling
     pool_type: str = "adaptive_avg"  # adaptive average pooling → fixed output size
+
+    # ── JETS 式掩码策略 ──
+    # 随机掩码信号patch，强制编码器从局部信息学习全局表征
+    jets_mask_ratio: float = 0.7   # 0=关闭, 0.7=保留30%patch（JETS推荐值）
+    jets_mask_patch_size: int = 50 # 每个patch的采样点数 (3000/50=60个patch, 下游1000/50=20个patch)
 
     # ── Auxiliary losses (from CWT-MAE v3) ──
     use_stats_loss: bool = False       # auxiliary statistics prediction

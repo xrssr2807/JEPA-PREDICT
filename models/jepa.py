@@ -183,6 +183,9 @@ class JEPA(nn.Module):
         latent_dim: int = 32,
         num_latent_samples: int = 4,
         ema_momentum: float = 0.996,
+        # ★ JETS 式掩码：预训练时随机丢弃信号片段
+        mask_ratio: float = 0.0,         # 0=关闭, 0.7=保留30%
+        mask_patch_size: int = 50,        # 每个patch的采样点数
         # New: auxiliary loss config
         use_stats_loss: bool = False,
         stats_loss_weight: float = 0.1,
@@ -279,6 +282,9 @@ class JEPA(nn.Module):
         self.ema_momentum = ema_momentum
         self.embedding_dim = embedding_dim
         self.transformer_dim = transformer_dim
+        # ★ JETS 掩码参数
+        self.mask_ratio = mask_ratio
+        self.mask_patch_size = mask_patch_size
 
     def update_target_encoder(self, momentum: float):
         """EMA update target encoder towards context encoder."""
@@ -407,6 +413,49 @@ class JEPA(nn.Module):
         ).mean()
         return loss, {"contrast": loss.item()}
 
+    # ═══════════════════════════════════════════════════════════
+    # ★ JETS 式掩码：随机丢弃 ~70% 信号patch，强制编码器从局部学习
+    # ═══════════════════════════════════════════════════════════
+
+    def _apply_jets_mask(self, signal: torch.Tensor) -> torch.Tensor:
+        """
+        JETS 风格随机掩码：将信号分割为patch，随机保留一部分，其余置零。
+
+        JETS 核心思想：上下文编码器只看部分patch，目标编码器看完整信号，
+        迫使编码器从局部信息中学习能预测全局的强表征。
+
+        Args:
+            signal: (B, 1, L) — 原始ECG信号
+        Returns:
+            masked_signal: (B, 1, L) — 部分patch被置零的ECG
+        """
+        if self.mask_ratio <= 0 or not self.training:
+            return signal  # 推理时不做掩码
+
+        B, C, L = signal.shape
+        patch_size = self.mask_patch_size
+        num_patches = L // patch_size
+
+        # 每个patch是否保留：随机保留 (1-mask_ratio) 的patch
+        keep_prob = 1.0 - self.mask_ratio
+        # (B, 1, num_patches): True=保留, False=掩码
+        patch_mask = torch.rand(B, 1, num_patches, device=signal.device) < keep_prob
+
+        # 将patch级别的mask展开到采样点级别 (B, 1, L)
+        mask_expanded = patch_mask.repeat_interleave(patch_size, dim=-1)
+
+        # 处理信号长度不能被patch_size整除的情况
+        if mask_expanded.shape[-1] < L:
+            pad_len = L - mask_expanded.shape[-1]
+            mask_expanded = torch.cat(
+                [mask_expanded, torch.ones(B, 1, pad_len, device=signal.device)],
+                dim=-1
+            )
+        elif mask_expanded.shape[-1] > L:
+            mask_expanded = mask_expanded[:, :, :L]
+
+        return signal * mask_expanded
+
     def compute_loss(
         self,
         ecg: torch.Tensor,
@@ -428,10 +477,13 @@ class JEPA(nn.Module):
         """
         B = ecg.size(0)
 
-        # Get context embedding once
-        context_embed = self.forward_context(ecg)  # (B, transformer_dim)
+        # ★ JETS 式掩码：随机丢弃 ~70% patch，强制编码器从局部学习全局表征
+        ecg_masked = self._apply_jets_mask(ecg)
 
-        # Get target embedding once (deterministic)
+        # Get context embedding from MASKED ecg
+        context_embed = self.forward_context(ecg_masked)  # (B, transformer_dim)
+
+        # Get target embedding from FULL ppg (不作为掩码)
         target_embed = self.forward_target(ppg)  # (B, embedding_dim)
 
         # 1. JEPA prediction loss
