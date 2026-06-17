@@ -15,9 +15,9 @@ class DataConfig:
     pretrain_processed_dir: str = "/root/autodl-tmp/split_processed"
 
     # Downstream data
-    chd_ppg_dir: str = "/root/autodl-tmp/chd_ppg"
+    chd_ppg_dir: str = "/root/chd_ppg"
     chd_ecg_dir: str = "/root/autodl-tmp/chd_ecg"
-    arrhythmia_dir: str = "/root/autodl-tmp/processed_dataset"
+    arrhythmia_dir: str = "/root/processed_dataset"
 
     # Preprocessing
     normalize: str = "zscore"  # zscore / iqr / minmax / none
@@ -76,7 +76,7 @@ class ModelConfig:
 
     # EMA for target encoder
     # 低 → 高：LR 大时 target 快速追踪 context，LR 小时 target 稳定微调
-    ema_momentum: float = 0.9    # initial: fast tracking (10% update per step)
+    ema_momentum: float = 0.996  # initial: stable tracking (0.4% update per step)
     ema_end_momentum: float = 0.999  # final: slow fine-tuning (0.1% update per step)
 
     # Pooling
@@ -97,9 +97,9 @@ class ModelConfig:
     cwt_patch_time: int = 25           # patch size in time dimension
 
     # ── Downstream ──
-    use_cot_head: bool = False         # Chain-of-Thought classification head
+    use_cot_head: bool = True          # Chain-of-Thought classification head
     cot_tokens: int = 16               # number of reasoning tokens
-    use_layerwise_lr: bool = False     # layer-wise learning rate decay
+    use_layerwise_lr: bool = True      # layer-wise learning rate decay
     layer_decay: float = 0.75          # decay factor per layer
 
 
@@ -110,8 +110,8 @@ class TrainConfig:
     # Pre-training
     pretrain_epochs: int = 50
     pretrain_batch_size: int = 310
-    pretrain_lr: float = 2.5e-3
-    pretrain_warmup_epochs: int = 10  # extended warmup for smoother LR ramp
+    pretrain_lr: float = 5e-4
+    pretrain_warmup_epochs: int = 5  # shorter warmup → earlier cosine decay
     pretrain_weight_decay: float = 0.05
 
     # Optimizer
@@ -126,7 +126,7 @@ class TrainConfig:
     ema_schedule: str = "cosine"  # cosine schedule for target encoder momentum
 
     # Downstream
-    downstream_epochs: int = 50
+    downstream_epochs: int = 100
     downstream_batch_size: int = 128
     downstream_lr: float = 1e-3
     downstream_min_lr: float = 1e-6
