@@ -97,7 +97,6 @@ def build_model(model_config: ModelConfig) -> JEPA:
         stats_loss_weight=model_config.stats_loss_weight,
         use_contrast_loss=model_config.use_contrast_loss,
         contrast_loss_weight=model_config.contrast_loss_weight,
-        contrast_decay=model_config.contrast_decay,
     )
 
 

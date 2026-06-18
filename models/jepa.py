@@ -246,7 +246,7 @@ class JEPA(nn.Module):
             latent_dim=latent_dim,
         )
 
-        # ── New: Statistics Prediction Head ──
+    # ── New: Statistics Prediction Head ──
         self.use_stats_loss = use_stats_loss
         self.stats_loss_weight = stats_loss_weight
         if use_stats_loss:
@@ -254,28 +254,19 @@ class JEPA(nn.Module):
                 in_dim=transformer_dim, hidden_dim=transformer_dim, num_stats=16
             )
 
-        # ── New: CMAE Contrastive Learning Components ──
+        # ── ★ M2AE 风格跨模态对比学习 ──
+        # 用 InfoNCE 拉近同一时刻的 ECG↔PPG 嵌入，推远不同时刻
         self.use_contrast_loss = use_contrast_loss
         self.contrast_loss_weight = contrast_loss_weight
-        self.contrast_decay = contrast_decay
+        self.contrast_temperature = 0.1  # InfoNCE温度系数
         if use_contrast_loss:
-            # Student: context encoder → projector → predictor
-            self.student_projector = ProjectionHead(
-                in_dim=transformer_dim, hidden_dim=transformer_dim, out_dim=256
+            # 共享投影头：ECG和PPG都投影到同一对比空间
+            self.contrast_projector = nn.Sequential(
+                nn.Linear(transformer_dim, transformer_dim),
+                nn.BatchNorm1d(transformer_dim),
+                nn.GELU(),
+                nn.Linear(transformer_dim, 128),
             )
-            self.student_predictor = ProjectionHead(
-                in_dim=256, hidden_dim=256, out_dim=256
-            )
-            # Teacher: target encoder → projector (EMA updated)
-            self.teacher_projector = ProjectionHead(
-                in_dim=transformer_dim, hidden_dim=transformer_dim, out_dim=256
-            )
-            # Copy and freeze teacher projector
-            self.teacher_projector.load_state_dict(
-                copy.deepcopy(self.student_projector.state_dict())
-            )
-            for param in self.teacher_projector.parameters():
-                param.requires_grad = False
 
         self.latent_dim = latent_dim
         self.num_latent_samples = num_latent_samples
@@ -290,9 +281,7 @@ class JEPA(nn.Module):
         """EMA update target encoder towards context encoder."""
         ema_update(self.context_encoder, self.target_encoder, momentum)
         ema_update(self.context_proj, self.target_proj, momentum)
-        if self.use_contrast_loss:
-            ema_update(self.student_projector, self.teacher_projector,
-                       self.contrast_decay)
+        # ★ M2AE 对比学习不需要EMA更新投影头（共享投影头无teacher）
 
     def forward_context(self, x: torch.Tensor) -> torch.Tensor:
         """Encode context signal (ECG). Returns pooled embedding."""
@@ -382,35 +371,45 @@ class JEPA(nn.Module):
         loss = F.smooth_l1_loss(pred_stats, stats_target_norm)
         return loss, {"stats": loss.item()}
 
-    def _compute_contrast_loss(self, context_embed, ecg):
-        """BYOL-style contrastive loss using teacher EMA."""
-        if not hasattr(self, 'student_projector'):
-            return torch.tensor(0.0, device=context_embed.device), {"contrast": 0.0}
+    def _compute_contrast_loss(self, ecg_embed, ppg_embed):
+        """
+        ★ M2AE 风格跨模态对比损失 (InfoNCE)。
 
-        # Pool to (B, D)
-        if context_embed.dim() == 3:
-            pooled = context_embed.mean(dim=1)
-        else:
-            pooled = context_embed
+        M2AE 论文 (PPG-ECG Biosignal Fingerprinting):
+        - 正样本对: (ECG_i, PPG_i) 同一时刻
+        - 负样本对: (ECG_i, PPG_j) 不同时刻
+        - 对称 InfoNCE 损失
 
-        # Student path
-        z_student = self.student_predictor(self.student_projector(pooled))
+        Args:
+            ecg_embed: (B, transformer_dim) — ECG的上下文嵌入
+            ppg_embed: (B, transformer_dim) — PPG的上下文嵌入
+        Returns:
+            loss: 标量
+            info: dict
+        """
+        if not hasattr(self, 'contrast_projector'):
+            return torch.tensor(0.0, device=ecg_embed.device), {"contrast": 0.0}
 
-        # Teacher path (no grad — encoder is the target_encoder, same input)
-        with torch.no_grad():
-            t_embed, _ = self.target_encoder(ecg)
-            if t_embed.dim() == 3:
-                t_pooled = t_embed.mean(dim=1)
-            else:
-                t_pooled = t_embed
-            z_teacher = self.teacher_projector(t_pooled)
+        # 投影到对比空间 (B, 128)
+        z_ecg = self.contrast_projector(ecg_embed)
+        z_ppg = self.contrast_projector(ppg_embed)
 
-        # Cosine similarity loss (2 - 2*cos = 2*(1-cos) in [0, 4])
-        loss = 2 - 2 * F.cosine_similarity(
-            F.normalize(z_student, dim=-1),
-            F.normalize(z_teacher, dim=-1),
-            dim=-1,
-        ).mean()
+        # L2归一化
+        z_ecg = F.normalize(z_ecg, dim=-1)
+        z_ppg = F.normalize(z_ppg, dim=-1)
+
+        # 对称 InfoNCE
+        # (ECG_i → PPG_j) 相似度矩阵: (B, B)
+        logits = torch.mm(z_ecg, z_ppg.t()) / self.contrast_temperature
+
+        B = ecg_embed.size(0)
+        labels = torch.arange(B, device=ecg_embed.device)
+
+        # 两个方向的交叉熵：ECG→PPG 和 PPG→ECG
+        loss_ecg2ppg = F.cross_entropy(logits, labels)
+        loss_ppg2ecg = F.cross_entropy(logits.t(), labels)
+        loss = (loss_ecg2ppg + loss_ppg2ecg) / 2.0
+
         return loss, {"contrast": loss.item()}
 
     # ═══════════════════════════════════════════════════════════
@@ -501,10 +500,12 @@ class JEPA(nn.Module):
             total_loss = total_loss + self.stats_loss_weight * stats_loss
             info.update(stats_info)
 
-        # 3. Contrastive loss (BYOL-style)
+        # 3. ★ M2AE 风格跨模态对比损失 (ECG ↔ PPG)
         if self.use_contrast_loss:
+            # 用context_encoder编码PPG得到对比嵌入
+            ppg_embed_ctx = self.forward_context(ppg)  # (B, transformer_dim)
             contrast_loss, contrast_info = self._compute_contrast_loss(
-                context_embed, ecg
+                context_embed, ppg_embed_ctx
             )
             total_loss = total_loss + self.contrast_loss_weight * contrast_loss
             info.update(contrast_info)

@@ -38,6 +38,7 @@ from models.encoder import SignalEncoder
 from models.classifier import (
     SignalClassifier, DualChannelClassifier,
     SignalClassifierCoT, DualChannelClassifierCoT,
+    MultiScaleClassifier,
 )
 from models.losses import build_criterion, compute_pos_weight
 
@@ -407,6 +408,135 @@ def evaluate(model, dataloader, criterion, device, num_classes: int,
             all_preds_arr, all_labels_arr, all_probs)
 
 
+# ── XGBoost 下游训练 ────────────────────────────────────────────
+# M2AE 论文 (PPG-ECG Biosignal Fingerprinting):
+# 冻结编码器 + XGBoost → CVD 分类 AUROC 0.974
+# 在115K小数据场景下，冻结+XGBoost 比全微调更防过拟合
+
+def extract_features(encoder, dataloader, device, desc="特征提取"):
+    """从冻结编码器提取所有样本的嵌入和标签。"""
+    encoder.eval()
+    all_embeddings, all_labels, all_uids = [], [], []
+    total = len(dataloader)
+    for batch_idx, batch in enumerate(dataloader):
+        if len(batch) == 3:
+            x, labels, uids = batch
+        else:
+            x, labels = batch
+            uids = [f"unknown_{i}" for i in range(x.size(0))]
+        x = x.to(device)
+        with torch.no_grad():
+            emb, _ = encoder(x)  # (B, D)
+        all_embeddings.append(emb.cpu().numpy())
+        all_labels.append(labels.numpy())
+        all_uids.extend(uids)
+        if batch_idx % 20 == 0:
+            print(f"  [{desc}] {batch_idx}/{total}", end="\r")
+    print(f"  [{desc}] 完成: {len(all_uids)} 样本")
+    X = np.concatenate(all_embeddings, axis=0)
+    y = np.concatenate(all_labels, axis=0)
+    return X, y, all_uids
+
+
+def train_downstream_xgboost(
+    config: Config,
+    checkpoint_path: str,
+    dataset: str = "chd",
+):
+    """
+    XGBoost 下游训练：冻结编码器 → 提取特征 → XGBoost。
+
+    Returns:
+        test_auc: float
+    """
+    print("\n" + "=" * 60)
+    print("XGBoost 下游训练 (冻结编码器 + XGBoost)")
+    print("=" * 60)
+
+    device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+
+    # Num classes
+    if dataset == "arrhythmia":
+        num_classes = config.data.arrhythmia_num_classes
+    else:
+        num_classes = config.data.num_classes
+    print(f"Device: {device} | Dataset: {dataset} | Classes: {num_classes}")
+
+    # Data
+    train_loader, test_loader, _, _ = build_downstream_dataloaders(
+        config.data, config.train, dataset
+    )
+
+    # Load encoder (冻结)
+    encoder = load_pretrained_encoder(checkpoint_path, config.model, "target", device)
+    encoder.eval()
+    for param in encoder.parameters():
+        param.requires_grad = False
+    print(f"[Encoder] 冻结完成: {sum(p.numel() for p in encoder.parameters()):,} params")
+
+    # 提取特征
+    print("\n[特征提取] 训练集...")
+    X_train, y_train, uid_train = extract_features(encoder, train_loader, device, "训练集")
+    print(f"[特征提取] 测试集...")
+    X_test, y_test, uid_test = extract_features(encoder, test_loader, device, "测试集")
+
+    print(f"\n[数据] 训练: {X_train.shape}, 测试: {X_test.shape}")
+    print(f"       类别分布: 训练={np.bincount(y_train)}, 测试={np.bincount(y_test)}")
+
+    # 类别权重
+    scale_pos_weight = np.sqrt(np.bincount(y_train)[0] / max(np.bincount(y_train)[1], 1))
+
+    # XGBoost 训练
+    print("\n[XGBoost] 训练中...")
+    import xgboost as xgb
+    model = xgb.XGBClassifier(
+        n_estimators=500,
+        max_depth=6,
+        learning_rate=0.01,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        scale_pos_weight=scale_pos_weight,
+        eval_metric='auc',
+        early_stopping_rounds=50,
+        verbosity=1,
+        random_state=42,
+    )
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_test, y_test)],
+        verbose=False,
+    )
+
+    # 评估
+    print("\n[评估] 测试集...")
+    y_prob = model.predict_proba(X_test)
+    y_pred = model.predict(X_test)
+
+    # AUC
+    if num_classes == 2:
+        auc = roc_auc_score(y_test, y_prob[:, 1])
+        print(f"CHD AUC = {auc:.4f}")
+    else:
+        auc = roc_auc_score(y_test, y_prob, multi_class='ovr')
+        print(f"Macro AUC = {auc:.4f}")
+
+    # 分类报告
+    acc = accuracy_score(y_test, y_pred)
+    report = classification_report(y_test, y_pred, digits=4)
+    print(f"Accuracy: {acc:.4f}")
+    print(f"\nClassification Report:\n{report}")
+
+    # 特征重要性
+    importance = model.feature_importances_
+    top_k = min(10, len(importance))
+    top_idx = np.argsort(importance)[-top_k:][::-1]
+    print(f"\n[特征重要性] Top {top_k} 维度:")
+    for i, idx in enumerate(top_idx):
+        print(f"  {i+1}. dim {idx}: {importance[idx]:.4f}")
+
+    return auc
+
+
 # ── Main Pipeline ───────────────────────────────────────────────
 
 def train_downstream(
@@ -422,6 +552,10 @@ def train_downstream(
         checkpoint_path: path to pre-trained JEPA checkpoint
         dataset: "chd" or "arrhythmia"
     """
+    # ★ XGBoost 路径：冻结编码器 + XGBoost (M2AE 范式)
+    if config.model.use_xgboost:
+        return train_downstream_xgboost(config, checkpoint_path, dataset)
+
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     print(f"Device: {device} | Dataset: {dataset}")
 
@@ -443,7 +577,13 @@ def train_downstream(
     encoder = load_pretrained_encoder(checkpoint_path, config.model, "target", device)
 
     # Build classifier
-    if config.model.use_cot_head:
+    if config.model.use_multiscale:
+        print("[Model] HiMAE多尺度分类头 (细+中+粗三尺度)")
+        model = MultiScaleClassifier(
+            encoder=encoder, encoder_dim=config.model.transformer_dim,
+            num_classes=num_classes,
+        ).to(device)
+    elif config.model.use_cot_head:
         print("[Model] CoT classification head")
         model = SignalClassifierCoT(
             encoder=encoder, encoder_dim=config.model.transformer_dim,

@@ -93,9 +93,8 @@ class ModelConfig:
     # ── Auxiliary losses (from CWT-MAE v3) ──
     use_stats_loss: bool = False       # auxiliary statistics prediction
     stats_loss_weight: float = 0.1     # weight for stats loss
-    use_contrast_loss: bool = False    # BYOL-style contrastive learning
+    use_contrast_loss: bool = True     # ★ M2AE风格跨模态对比 (InfoNCE, ECG↔PPG)
     contrast_loss_weight: float = 0.1  # weight for contrastive loss
-    contrast_decay: float = 0.999      # EMA decay for teacher projector
 
     # ── CWT Frontend (optional alternative to 1D CNN) ──
     use_cwt: bool = False              # use CWT 1D→2D frontend instead of CNN Stem
@@ -109,6 +108,10 @@ class ModelConfig:
     cot_tokens: int = 16               # number of reasoning tokens
     use_layerwise_lr: bool = True      # layer-wise learning rate decay
     layer_decay: float = 0.75          # decay factor per layer
+    # ★ XGBoost 替代微调 (M2AE: 冻结编码器+XGBoost → CVD AUROC 0.974)
+    use_xgboost: bool = False          # True=跳过微调, 直接用XGBoost
+    # ★ HiMAE 多尺度分类头 (不同疾病依赖不同时间尺度)
+    use_multiscale: bool = False       # True=使用MultiScaleClassifier
 
 
 @dataclass

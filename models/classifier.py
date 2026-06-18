@@ -340,3 +340,74 @@ class DualChannelClassifier(nn.Module):
         if return_embedding:
             return logits, fused
         return logits
+
+
+class MultiScaleClassifier(nn.Module):
+    """
+    ★ HiMAE 风格多尺度分类头。
+
+    HiMAE (Samsung) 论文核心发现：
+    - 不同健康结局依赖不同时间尺度的PPG结构特征
+    - PVC检测依赖粗尺度(L3), 实验室值偏好中尺度(L2)
+    - 睡眠分期受益于局部+中尺度组合(L1+L2)
+
+    三个尺度从编码器token序列中提取后拼接 → 分类。
+    """
+
+    def __init__(
+        self,
+        encoder: SignalEncoder,
+        encoder_dim: int = 512,
+        num_classes: int = 2,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.encoder = encoder
+
+        # 三尺度拼接 → MLP分类头
+        total_dim = encoder_dim * 3
+        self.classifier = nn.Sequential(
+            nn.Linear(total_dim, encoder_dim),
+            nn.BatchNorm1d(encoder_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(encoder_dim, num_classes),
+        )
+
+    def freeze_encoder(self):
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+
+    def unfreeze_encoder(self):
+        for param in self.encoder.parameters():
+            param.requires_grad = True
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, 1, L) — PPG信号
+        Returns:
+            logits: (B, num_classes)
+        """
+        _, tokens = self.encoder(x, return_all=True)  # (B, N, D)
+        B, N, D = tokens.shape
+
+        # ── 尺度1 (细粒度): 每2个token池化 → 平均 ──
+        # 捕获局部波形形态 (如PPG的切迹、上升支斜率)
+        n1 = N // 2 * 2
+        s1 = tokens[:, :n1].reshape(B, -1, 2, D).mean(dim=2).mean(dim=1)  # (B, D)
+
+        # ── 尺度2 (中粒度): 每4个token池化 → 平均 ──
+        # 捕获心跳级别的模式 (如心率变异性)
+        n2 = N // 4 * 4
+        s2 = tokens[:, :n2].reshape(B, -1, 4, D).mean(dim=2).mean(dim=1)  # (B, D)
+
+        # ── 尺度3 (粗粒度): 全局平均 ──
+        # 捕获整体趋势 (如基线漂移、长期变化)
+        s3 = tokens.mean(dim=1)  # (B, D)
+
+        # ── 拼接三个尺度 ──
+        out = torch.cat([s1, s2, s3], dim=-1)  # (B, 3*D)
+        logits = self.classifier(out)
+
+        return logits
