@@ -16,7 +16,8 @@ class DataConfig:
 
     # Downstream data
     chd_ppg_dir: str = "/root/chd_ppg"
-    chd_ecg_dir: str = "/root/autodl-tmp/chd_ecg"
+    chd_ecg_dir: str = "/root/chd_ppg"  # ECG数据跟PPG同目录下 (ecg_chd/)
+    chd_ecg_subdir: str = "ecg_chd"     # ECG数据子目录 (下含.pkl文件)
     arrhythmia_dir: str = "/root/processed_dataset"
 
     # Preprocessing
@@ -112,6 +113,8 @@ class ModelConfig:
     use_xgboost: bool = False          # True=跳过微调, 直接用XGBoost
     # ★ HiMAE 多尺度分类头 (不同疾病依赖不同时间尺度)
     use_multiscale: bool = False       # True=使用MultiScaleClassifier
+    # ★ ECG+PPG 双通道融合 (CSFM: 多模态融合持续带来稳健提升)
+    use_dual_channel: bool = True      # True=使用DualChannelClassifierCoT (需ECG+PPG数据)
 
 
 @dataclass
@@ -145,8 +148,12 @@ class TrainConfig:
     downstream_probe_epochs: int = 10  # linear probe only (frozen encoder)
     downstream_scheduler: str = "step"  # "epoch" or "step" (step-based for warmup+cosine)
 
+    # ★ MixUp 数据增强：在batch内混合CHD和正常样本，生成更多正样本变体
+    use_mixup: bool = True          # True=启用MixUp
+    mixup_alpha: float = 0.5        # Beta分布参数 (0.5=中等混合强度)
+
     # Downstream loss
-    loss_type: str = "focal"  # "ce" | "focal" | "asl" | "bce"
+    loss_type: str = "asl"  # "ce" | "focal" | "asl" | "bce"  ★ ASL: γ_neg=4压制负样本, 提升CHD召回率
     focal_gamma: float = 2.0
     asl_gamma_neg: int = 4
     asl_gamma_pos: int = 1

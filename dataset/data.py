@@ -451,3 +451,38 @@ class PretrainDatasetPT(Dataset):
         except Exception:
             fallback_idx = (idx + 1) % len(self.files)
             return self.__getitem__(fallback_idx)
+
+
+class DualDownstreamDataset(Dataset):
+    """
+    ★ 双通道下游数据集：加载配对的 ECG + PPG 用于 CHD 分类。
+
+    假设 ECG 和 PPG 目录有相同文件名列表（配对数据）。
+    复用两个 DownstreamDataset 实例，返回 (ecg, ppg, label, uid)。
+    """
+
+    def __init__(self, ppg_dataset: DownstreamDataset, ecg_dataset: DownstreamDataset):
+        """
+        Args:
+            ppg_dataset: PPG DownstreamDataset (主数据集，提供 label + uid)
+            ecg_dataset: ECG DownstreamDataset (提供 ECG 信号，与 PPG 配对)
+        """
+        assert len(ppg_dataset) == len(ecg_dataset), \
+            f"PPG({len(ppg_dataset)}) 与 ECG({len(ecg_dataset)}) 样本数不匹配"
+        self.ppg_dataset = ppg_dataset
+        self.ecg_dataset = ecg_dataset
+
+    def __len__(self) -> int:
+        return len(self.ppg_dataset)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int, str]:
+        """
+        Returns:
+            ecg: (1, 1000) tensor — ECG 信号
+            ppg: (1, 1000) tensor — PPG 信号
+            label: int — 分类标签
+            uid: str — 患者ID
+        """
+        ppg_data, label, uid = self.ppg_dataset[idx]
+        ecg_data, _, _ = self.ecg_dataset[idx]
+        return ecg_data, ppg_data, label, uid

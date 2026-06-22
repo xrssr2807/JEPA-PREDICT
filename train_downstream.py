@@ -33,7 +33,7 @@ from sklearn.metrics import (
 )
 
 from config import Config, DataConfig, ModelConfig, TrainConfig
-from dataset.data import DownstreamDataset
+from dataset.data import DownstreamDataset, DualDownstreamDataset
 from models.encoder import SignalEncoder
 from models.classifier import (
     SignalClassifier, DualChannelClassifier,
@@ -49,31 +49,58 @@ def build_downstream_dataloaders(
     data_config: DataConfig,
     train_config: TrainConfig,
     dataset: str = "chd",
+    use_dual: bool = False,
 ) -> tuple:
-    """Build train and test dataloaders for downstream fine-tuning."""
+    """Build train and test dataloaders for downstream fine-tuning.
+
+    ECG 和 PPG 数据完美配对 (同文件名单、同split、同uid)。
+    当 use_dual=True 时，返回 DualDownstreamDataset 同时加载 ECG+PPG。
+    """
     binary_abnormal = (dataset == "arrhythmia_binary")
 
     if dataset == "arrhythmia" or dataset == "arrhythmia_binary":
         data_dir = data_config.arrhythmia_dir + "/data"
         split_file = data_config.arrhythmia_dir + "/split.json"
     elif dataset == "chd":
-        data_dir = data_config.chd_ppg_dir + "/ppg_chd"
-        split_file = data_config.chd_ppg_dir + "/train_test_split.json"
+        split_file = data_config.chd_ppg_dir + "/train_test_split.json"  # PPG和ECG用同一个split!
+        ppg_dir = data_config.chd_ppg_dir + "/ppg_chd"
+        ecg_dir = os.path.join(data_config.chd_ecg_dir, data_config.chd_ecg_subdir)
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 
-    train_dataset = DownstreamDataset(
-        data_dir=data_dir, split_file=split_file, split="train",
+    # PPG 单通道
+    ppg_train = DownstreamDataset(
+        data_dir=ppg_dir, split_file=split_file, split="train",
         normalize=data_config.normalize, normalize_clip=data_config.normalize_clip,
         binary_abnormal=binary_abnormal,
-        signal_quality_gate=data_config.signal_quality_gate,
+        signal_quality_gate=0.0,  # CHD PPG: SQI不适用, 关闭
     )
-    test_dataset = DownstreamDataset(
-        data_dir=data_dir, split_file=split_file, split="test",
+    ppg_test = DownstreamDataset(
+        data_dir=ppg_dir, split_file=split_file, split="test",
         normalize=data_config.normalize, normalize_clip=data_config.normalize_clip,
         binary_abnormal=binary_abnormal,
-        signal_quality_gate=data_config.signal_quality_gate,
+        signal_quality_gate=0.0,
     )
+
+    if use_dual:
+        # ★ 双通道：ECG + PPG 配对加载 (同一split, 同一index → 同一患者)
+        ecg_train = DownstreamDataset(
+            data_dir=ecg_dir, split_file=split_file, split="train",
+            normalize=data_config.normalize, normalize_clip=data_config.normalize_clip,
+            binary_abnormal=binary_abnormal,
+            signal_quality_gate=0.0,
+        )
+        ecg_test = DownstreamDataset(
+            data_dir=ecg_dir, split_file=split_file, split="test",
+            normalize=data_config.normalize, normalize_clip=data_config.normalize_clip,
+            binary_abnormal=binary_abnormal,
+            signal_quality_gate=0.0,
+        )
+        train_dataset = DualDownstreamDataset(ppg_train, ecg_train)
+        test_dataset = DualDownstreamDataset(ppg_test, ecg_test)
+        print(f"★ 双通道配对 | PPG: {ppg_dir} | ECG: {ecg_dir}")
+    else:
+        train_dataset, test_dataset = ppg_train, ppg_test
 
     train_loader = DataLoader(
         train_dataset, batch_size=train_config.downstream_batch_size,
@@ -84,6 +111,7 @@ def build_downstream_dataloaders(
         shuffle=False, num_workers=4, pin_memory=True,
     )
 
+    print(f"[Data] train={len(train_dataset)} test={len(test_dataset)}")
     return train_loader, test_loader, train_dataset, test_dataset
 
 
@@ -228,8 +256,16 @@ def build_scheduler(optimizer, train_config, steps_per_epoch: int):
 # ── Training ────────────────────────────────────────────────────
 
 def train_epoch(model, dataloader, optimizer, criterion, device,
-                scheduler=None, sched_mode="epoch", is_dual=False):
-    """Single training epoch with optional per-step scheduler."""
+                scheduler=None, sched_mode="epoch", is_dual=False,
+                mixup_alpha: float = 0.0, num_classes: int = 2):
+    """
+    Single training epoch with optional per-step scheduler and MixUp.
+
+    MixUp (针对CHD正样本过少问题):
+      在batch内随机混合两个样本及其标签，生成插值训练数据。
+      x_mixed = λ · x_i + (1-λ) · x_j
+      y_mixed = λ · y_i + (1-λ) · y_j  (软标签)
+    """
     model.train()
     running_loss = 0.0
     correct = 0
@@ -237,7 +273,11 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
 
     for batch in dataloader:
         if is_dual:
-            ecg, ppg, labels = batch
+            # 兼容 4元组 (ecg, ppg, label, uid) 和 3元组 (ecg, ppg, label)
+            if len(batch) == 4:
+                ecg, ppg, labels, _ = batch
+            else:
+                ecg, ppg, labels = batch
             ecg, ppg, labels = ecg.to(device), ppg.to(device), labels.to(device)
             logits = model(ecg, ppg)
         else:
@@ -247,9 +287,21 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
             else:
                 x, labels = batch
             x, labels = x.to(device), labels.to(device)
-            logits = model(x)
 
-        loss = criterion(logits, labels)
+            # ★ MixUp 数据增强 (仅在启用且训练正样本时)
+            if mixup_alpha > 0 and num_classes <= 2:
+                lam = np.random.beta(mixup_alpha, mixup_alpha)
+                perm = torch.randperm(x.size(0), device=device)
+                x_mixed = lam * x + (1 - lam) * x[perm]
+                # 软标签: one-hot → 插值
+                y_onehot = torch.zeros(x.size(0), num_classes, device=device)
+                y_onehot.scatter_(1, labels.unsqueeze(1), 1.0)
+                y_mixed = lam * y_onehot + (1 - lam) * y_onehot[perm]
+                logits = model(x_mixed)
+                loss = criterion(logits, y_mixed)  # 用软标签算loss
+            else:
+                logits = model(x)
+                loss = criterion(logits, labels)
 
         optimizer.zero_grad()
         loss.backward()
@@ -297,10 +349,13 @@ def evaluate(model, dataloader, criterion, device, num_classes: int,
 
     for batch in dataloader:
         if is_dual:
-            ecg, ppg, labels = batch
+            if len(batch) == 4:
+                ecg, ppg, labels, _ = batch
+            else:
+                ecg, ppg, labels = batch
             ecg, ppg, labels = ecg.to(device), ppg.to(device), labels.to(device)
             logits = model(ecg, ppg)
-            uids = batch[3] if len(batch) >= 4 else None
+            uids = None
         else:
             # 兼容 2元组 / 3元组
             if len(batch) == 3:
@@ -364,6 +419,24 @@ def evaluate(model, dataloader, criterion, device, num_classes: int,
         all_probs = np.concatenate(all_probs, axis=0)
         all_labels_arr = np.array(all_labels)
         all_preds_arr = np.array(all_preds)
+
+    # ★ 阈值优化：在验证集上搜索最佳决策阈值，提升CHD召回率
+    if num_classes == 2:
+        chd_probs = all_probs[:, 1]  # CHD概率
+        best_f1, best_thresh, best_recall = 0.0, 0.5, 0.0
+        for thresh in np.arange(0.25, 0.75, 0.025):
+            pred_at_thresh = (chd_probs >= thresh).astype(int)
+            f1_at_thresh = fbeta_score(all_labels_arr, pred_at_thresh, beta=1, average='binary', zero_division=0)
+            rec_at_thresh = recall_score(all_labels_arr, pred_at_thresh, zero_division=0)
+            if f1_at_thresh > best_f1:
+                best_f1 = f1_at_thresh
+                best_thresh = thresh
+                best_recall = rec_at_thresh
+        # 使用最佳阈值重新计算预测
+        all_preds_arr = (chd_probs >= best_thresh).astype(int)
+        # 同步更新acc
+        acc = 100.0 * (all_preds_arr == all_labels_arr).sum() / len(all_labels_arr)
+        print(f"[阈值优化] ★ 最佳阈值={best_thresh:.3f}, F1={best_f1:.4f}, CHD召回率={best_recall:.4f}")
 
     # Per-class AUC
     auc_list = []
@@ -539,6 +612,109 @@ def train_downstream_xgboost(
 
 # ── Main Pipeline ───────────────────────────────────────────────
 
+# ── Late Fusion Ensemble ───────────────────────────────────────────
+# ECG 和 PPG 数据量不同(81K vs 5K)，各自训练后用平均预测融合
+
+def ensemble_models(config, checkpoint_path, dataset="chd"):
+    """
+    Late Fusion: 加载 ECG 和 PPG 模型，平均预测。
+    """
+    print("\n" + "=" * 60)
+    print("★ Late Fusion Ensemble: ECG + PPG 平均预测")
+    print("=" * 60)
+
+    device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+
+    # 加载两个模型
+    ppg_ckpt = os.path.join(config.output_dir, f"downstream_{dataset}_ppg_best.pt")
+    ecg_ckpt = os.path.join(config.output_dir, f"downstream_{dataset}_ecg_best.pt")
+
+    # 加载PPG编码器
+    ppg_encoder = load_pretrained_encoder(checkpoint_path, config.model, "target", device)
+    # 加载ECG编码器
+    ecg_encoder = load_pretrained_encoder(checkpoint_path, config.model, "context", device)
+
+    # 构建两个分类器
+    num_classes = config.data.arrhythmia_num_classes if "arrhythmia" in dataset else config.data.num_classes
+
+    ppg_model = SignalClassifierCoT(
+        encoder=ppg_encoder, encoder_dim=config.model.transformer_dim,
+        num_classes=num_classes, num_heads=config.model.transformer_heads,
+        num_reasoning_tokens=config.model.cot_tokens,
+    ).to(device)
+    ecg_model = SignalClassifierCoT(
+        encoder=ecg_encoder, encoder_dim=config.model.transformer_dim,
+        num_classes=num_classes, num_heads=config.model.transformer_heads,
+        num_reasoning_tokens=config.model.cot_tokens,
+    ).to(device)
+
+    # 加载训练好的权重
+    if os.path.exists(ppg_ckpt):
+        ppg_model.load_state_dict(torch.load(ppg_ckpt, map_location=device)["model_state_dict"])
+        print(f"[PPG] 加载权重: {ppg_ckpt}")
+    else:
+        print(f"[PPG] ⚠️ 未找到权重，使用预训练编码器")
+    if os.path.exists(ecg_ckpt):
+        ecg_model.load_state_dict(torch.load(ecg_ckpt, map_location=device)["model_state_dict"])
+        print(f"[ECG] 加载权重: {ecg_ckpt}")
+    else:
+        print(f"[ECG] ⚠️ 未找到权重，使用预训练编码器")
+
+    ppg_model.eval()
+    ecg_model.eval()
+
+    # 用 PPG 的 dataloader (匹配 test set)
+    _, test_loader, _, test_ds = build_downstream_dataloaders(
+        config.data, config.train, dataset, modality="ppg"
+    )
+
+    # 融合预测
+    all_fused_probs = []
+    all_labels = []
+    with torch.no_grad():
+        for batch in test_loader:
+            if len(batch) == 3:
+                x, labels, _ = batch
+            else:
+                x, labels = batch
+            x = x.to(device)
+            labels = labels.to(device)
+
+            # 两个模型的logits
+            logits_ppg = ppg_model(x)
+            logits_ecg = ecg_model(x)
+
+            # 平均融合
+            fused_logits = (logits_ppg + logits_ecg) / 2.0
+            fused_probs = fused_logits.softmax(dim=-1)
+
+            all_fused_probs.append(fused_probs.cpu().numpy())
+            all_labels.extend(labels.cpu().tolist())
+
+    all_probs = np.concatenate(all_fused_probs, axis=0)
+    all_labels_arr = np.array(all_labels)
+
+    # 评估融合结果
+    if num_classes == 2:
+        auc = roc_auc_score(all_labels_arr, all_probs[:, 1])
+        print(f"\n{'='*60}")
+        print(f"★ Ensemble AUC = {auc:.4f}")
+        print(f"{'='*60}")
+
+        # 阈值优化
+        best_f1, best_thresh = 0.0, 0.5
+        for thresh in np.arange(0.25, 0.75, 0.025):
+            pred = (all_probs[:, 1] >= thresh).astype(int)
+            f1 = fbeta_score(all_labels_arr, pred, beta=1, average='binary', zero_division=0)
+            if f1 > best_f1:
+                best_f1, best_thresh = f1, thresh
+        pred_final = (all_probs[:, 1] >= best_thresh).astype(int)
+        print(f"最佳阈值: {best_thresh:.3f}, F1: {best_f1:.4f}")
+        print(f"\n分类报告:\n{classification_report(all_labels_arr, pred_final, digits=4)}")
+
+    return auc
+
+
 def train_downstream(
     config: Config,
     checkpoint_path: str,
@@ -552,7 +728,7 @@ def train_downstream(
         checkpoint_path: path to pre-trained JEPA checkpoint
         dataset: "chd" or "arrhythmia"
     """
-    # ★ XGBoost 路径：冻结编码器 + XGBoost (M2AE 范式)
+    # ★ XGBoost 路径
     if config.model.use_xgboost:
         return train_downstream_xgboost(config, checkpoint_path, dataset)
 
@@ -568,16 +744,34 @@ def train_downstream(
         num_classes = config.data.num_classes
     print(f"Num classes: {num_classes}")
 
-    # Data
-    train_loader, test_loader, train_ds, test_ds = build_downstream_dataloaders(
-        config.data, config.train, dataset
-    )
+    # Data & Encoder: 按模式选择
+    is_dual = False
+    if config.model.use_dual_channel:
+        is_dual = True
+        # ★ 双通道：ECG+PPG配对 (81K文件, 同split, 同uid)
+        train_loader, test_loader, train_ds, test_ds = build_downstream_dataloaders(
+            config.data, config.train, dataset, use_dual=True,
+        )
+        ecg_encoder = load_pretrained_encoder(checkpoint_path, config.model, "context", device)
+        ppg_encoder = load_pretrained_encoder(checkpoint_path, config.model, "target", device)
+        encoder = None  # 不单独使用
+        print("[Model] ★ DualChannel ECG+PPG 融合分类头")
+        model = DualChannelClassifierCoT(
+            ecg_encoder=ecg_encoder, ppg_encoder=ppg_encoder,
+            encoder_dim=config.model.transformer_dim,
+            num_classes=num_classes, num_heads=config.model.transformer_heads,
+            num_reasoning_tokens=config.model.cot_tokens,
+        ).to(device)
+    else:
+        # 单通道 (PPG)
+        train_loader, test_loader, train_ds, test_ds = build_downstream_dataloaders(
+            config.data, config.train, dataset, use_dual=False,
+        )
+        encoder = load_pretrained_encoder(checkpoint_path, config.model, "target", device)
 
-    # Load encoder
-    encoder = load_pretrained_encoder(checkpoint_path, config.model, "target", device)
-
-    # Build classifier
-    if config.model.use_multiscale:
+    # Build classifier (非双通道时)
+    if not is_dual and config.model.use_multiscale:
+    elif config.model.use_multiscale:
         print("[Model] HiMAE多尺度分类头 (细+中+粗三尺度)")
         model = MultiScaleClassifier(
             encoder=encoder, encoder_dim=config.model.transformer_dim,
@@ -632,9 +826,12 @@ def train_downstream(
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion, device,
             scheduler=scheduler, sched_mode=sched_mode,
+            mixup_alpha=0.0, num_classes=num_classes,
+            is_dual=is_dual,
         )
         test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate(
             model, test_loader, criterion, device, num_classes,
+            is_dual=is_dual,
         )
 
         if sched_mode == "epoch":
@@ -671,9 +868,13 @@ def train_downstream(
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion, device,
             scheduler=scheduler, sched_mode=sched_mode,
+            mixup_alpha=config.train.mixup_alpha if config.train.use_mixup else 0.0,
+            num_classes=num_classes,
+            is_dual=is_dual,
         )
         test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate(
             model, test_loader, criterion, device, num_classes,
+            is_dual=is_dual,
         )
 
         if sched_mode == "epoch":

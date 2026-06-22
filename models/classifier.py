@@ -268,6 +268,10 @@ class DualChannelClassifierCoT(nn.Module):
         for p in self.ppg_encoder.parameters():
             p.requires_grad = True
 
+    # 别名：兼容训练代码的 model.freeze_encoder() 调用
+    freeze_encoder = freeze_encoders
+    unfreeze_encoder = unfreeze_encoders
+
     def forward(self, ecg, ppg):
         _, ecg_tokens = self.ecg_encoder(ecg, return_all=True)
         _, ppg_tokens = self.ppg_encoder(ppg, return_all=True)
