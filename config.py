@@ -28,7 +28,7 @@ class DataConfig:
     )
 
     # ★ 信号质量门控：过滤低质量PPG样本 (PPG BP综述: 使用SQA后精度提升19-24%)
-    signal_quality_gate: float = 0.3  # 0=关闭, 0.3=推荐阈值 (SQI低于此值跳过)
+    signal_quality_gate: float = 0.0  # 0=关闭 (SQI对CHD数据过滤过严)
 
     # Augmentation (PhysioAugment — applied to ECG context signal)
     use_augment: bool = False
@@ -107,7 +107,7 @@ class ModelConfig:
     use_cot_head: bool = True          # Chain-of-Thought classification head
     cot_tokens: int = 16               # number of reasoning tokens
     use_layerwise_lr: bool = True      # layer-wise learning rate decay
-    layer_decay: float = 0.75          # decay factor per layer
+    layer_decay: float = 0.85          # softened decay (was 0.75)
     # ★ XGBoost 替代微调 (M2AE: 冻结编码器+XGBoost → CVD AUROC 0.974)
     use_xgboost: bool = False          # True=跳过微调, 直接用XGBoost
     # ★ HiMAE 多尺度分类头 (不同疾病依赖不同时间尺度)
@@ -120,7 +120,7 @@ class TrainConfig:
 
     # Pre-training
     pretrain_epochs: int = 50
-    pretrain_batch_size: int = 310
+    pretrain_batch_size: int = 170
     pretrain_lr: float = 5e-4
     pretrain_warmup_epochs: int = 5  # shorter warmup → earlier cosine decay
     pretrain_weight_decay: float = 0.05
@@ -139,7 +139,7 @@ class TrainConfig:
     # Downstream
     downstream_epochs: int = 100
     downstream_batch_size: int = 128
-    downstream_lr: float = 1e-3
+    downstream_lr: float = 3e-3  # increased from 1e-3
     downstream_min_lr: float = 1e-6
     downstream_warmup_epochs: int = 5
     downstream_probe_epochs: int = 10  # linear probe only (frozen encoder)

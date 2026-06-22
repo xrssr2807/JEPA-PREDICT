@@ -204,7 +204,7 @@ def build_scheduler(optimizer, train_config, steps_per_epoch: int):
     if train_config.downstream_scheduler == "step":
         total_steps = train_config.downstream_epochs * steps_per_epoch
         warmup_steps = train_config.downstream_warmup_epochs * steps_per_epoch
-        warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+        warmup = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps)
         cosine = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps,
                                     eta_min=train_config.downstream_min_lr)
         scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine],
