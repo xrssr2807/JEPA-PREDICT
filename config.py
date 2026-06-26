@@ -88,17 +88,17 @@ class ModelConfig:
 
     # ── JETS 式掩码策略 ──
     # 随机掩码信号patch，强制编码器从局部信息学习全局表征
-    jets_mask_ratio: float = 0.7   # 0=关闭, 0.7=保留30%patch（JETS推荐值）
+    jets_mask_ratio: float = 0.6   # 0=关闭, 0.6=保留40%patch（从0.7调低）
     jets_mask_patch_size: int = 50 # 每个patch的采样点数 (3000/50=60个patch, 下游1000/50=20个patch)
 
     # ── Auxiliary losses (from CWT-MAE v3) ──
     use_stats_loss: bool = False       # auxiliary statistics prediction
     stats_loss_weight: float = 0.1     # weight for stats loss
-    use_contrast_loss: bool = True     # ★ M2AE InfoNCE: ECG↔PPG 跨模态对比
-    contrast_loss_weight: float = 0.1  # 0.1: 辅助正则, 不让对比主导学习
-    vicreg_sim_weight: float = 1.0     # 不变性: MSE(ECG, PPG)
-    vicreg_var_weight: float = 1.0     # 方差: 防止维度坍缩
-    vicreg_cov_weight: float = 0.04    # 协方差: 去冗余
+    use_contrast_loss: bool = True     # M2AE InfoNCE
+    contrast_loss_weight: float = 0.1
+    # Token级对齐
+    use_token_align: bool = False      # True=启用 (暂不启用, 待验证)
+    token_align_weight: float = 0.5
 
     # ── CWT Frontend (optional alternative to 1D CNN) ──
     use_cwt: bool = False              # use CWT 1D→2D frontend instead of CNN Stem
@@ -120,8 +120,8 @@ class ModelConfig:
     use_multiscale: bool = False       # True=使用MultiScaleClassifier
     # ★ ECG+PPG 双通道融合 (CSFM: 多模态融合持续带来稳健提升)
     use_dual_channel: bool = False     # 单通道 PPG only
-    use_ecg_distill: bool = True       # ★ ECG蒸馏: 训练时ECG辅助, 部署仅PPG
-    distill_lambda: float = 0.3        # 蒸馏对齐权重
+    use_ecg_distill: bool = True       # ECG蒸馏
+    distill_lambda: float = 0.3
 
 
 @dataclass
@@ -155,7 +155,9 @@ class TrainConfig:
     downstream_probe_epochs: int = 30  # ECGFounder-PT: 充分收敛分类头
     downstream_scheduler: str = "step"  # "epoch" or "step" (step-based for warmup+cosine)
 
-    # ★ MixUp 数据增强：在batch内混合CHD和正常样本，生成更多正样本变体
+    # ★ Token 对齐续训练 (冻结 target, 训练 context 对齐到 target)
+    token_align_epochs: int = 30       # 续训练epoch
+    token_align_lr: float = 1e-4       # 续训练学习率 (比预训练小)
     use_mixup: bool = True          # True=启用MixUp
     mixup_alpha: float = 0.5        # Beta分布参数 (0.5=中等混合强度)
 
