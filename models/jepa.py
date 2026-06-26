@@ -190,8 +190,10 @@ class JEPA(nn.Module):
         use_stats_loss: bool = False,
         stats_loss_weight: float = 0.1,
         use_contrast_loss: bool = False,
-        contrast_loss_weight: float = 0.1,
-        contrast_decay: float = 0.999,
+        contrast_loss_weight: float = 1.0,
+        vicreg_sim_weight: float = 1.0,
+        vicreg_var_weight: float = 1.0,
+        vicreg_cov_weight: float = 0.04,
     ):
         super().__init__()
 
@@ -254,17 +256,17 @@ class JEPA(nn.Module):
                 in_dim=transformer_dim, hidden_dim=transformer_dim, num_stats=16
             )
 
-        # ── ★ M2AE 风格跨模态对比学习 ──
-        # 用 InfoNCE 拉近同一时刻的 ECG↔PPG 嵌入，推远不同时刻
+        # ── ★ M2AE风格跨模态对比 (InfoNCE) ──
         self.use_contrast_loss = use_contrast_loss
         self.contrast_loss_weight = contrast_loss_weight
-        self.contrast_temperature = 0.1  # InfoNCE温度系数
+        self.contrast_temperature = 0.1
+        self.vicreg_sim_weight = vicreg_sim_weight
+        self.vicreg_var_weight = vicreg_var_weight
+        self.vicreg_cov_weight = vicreg_cov_weight
         if use_contrast_loss:
-            # 共享投影头：ECG和PPG都投影到同一对比空间
             self.contrast_projector = nn.Sequential(
                 nn.Linear(transformer_dim, transformer_dim),
-                nn.BatchNorm1d(transformer_dim),
-                nn.GELU(),
+                nn.BatchNorm1d(transformer_dim), nn.GELU(),
                 nn.Linear(transformer_dim, 128),
             )
 
@@ -372,45 +374,17 @@ class JEPA(nn.Module):
         return loss, {"stats": loss.item()}
 
     def _compute_contrast_loss(self, ecg_embed, ppg_embed):
-        """
-        ★ M2AE 风格跨模态对比损失 (InfoNCE)。
-
-        M2AE 论文 (PPG-ECG Biosignal Fingerprinting):
-        - 正样本对: (ECG_i, PPG_i) 同一时刻
-        - 负样本对: (ECG_i, PPG_j) 不同时刻
-        - 对称 InfoNCE 损失
-
-        Args:
-            ecg_embed: (B, transformer_dim) — ECG的上下文嵌入
-            ppg_embed: (B, transformer_dim) — PPG的上下文嵌入
-        Returns:
-            loss: 标量
-            info: dict
-        """
+        """M2AE InfoNCE: 对称对比ECG↔PPG"""
         if not hasattr(self, 'contrast_projector'):
             return torch.tensor(0.0, device=ecg_embed.device), {"contrast": 0.0}
-
-        # 投影到对比空间 (B, 128)
-        z_ecg = self.contrast_projector(ecg_embed)
-        z_ppg = self.contrast_projector(ppg_embed)
-
-        # L2归一化
-        z_ecg = F.normalize(z_ecg, dim=-1)
-        z_ppg = F.normalize(z_ppg, dim=-1)
-
-        # 对称 InfoNCE
-        # (ECG_i → PPG_j) 相似度矩阵: (B, B)
+        z_ecg = F.normalize(self.contrast_projector(ecg_embed), dim=-1)
+        z_ppg = F.normalize(self.contrast_projector(ppg_embed), dim=-1)
         logits = torch.mm(z_ecg, z_ppg.t()) / self.contrast_temperature
-
         B = ecg_embed.size(0)
         labels = torch.arange(B, device=ecg_embed.device)
-
-        # 两个方向的交叉熵：ECG→PPG 和 PPG→ECG
-        loss_ecg2ppg = F.cross_entropy(logits, labels)
-        loss_ppg2ecg = F.cross_entropy(logits.t(), labels)
-        loss = (loss_ecg2ppg + loss_ppg2ecg) / 2.0
-
-        return loss, {"contrast": loss.item()}
+        l1 = F.cross_entropy(logits, labels)
+        l2 = F.cross_entropy(logits.t(), labels)
+        return (l1+l2)/2, {"contrast": (l1+l2).item()/2}
 
     # ═══════════════════════════════════════════════════════════
     # ★ JETS 式掩码：随机丢弃 ~70% 信号patch，强制编码器从局部学习
@@ -485,7 +459,7 @@ class JEPA(nn.Module):
         # Get target embedding from FULL ppg (不作为掩码)
         target_embed = self.forward_target(ppg)  # (B, embedding_dim)
 
-        # 1. JEPA prediction loss
+        # 1. JEPA prediction loss (ECG → PPG)
         jepa_loss, jepa_info = self._compute_jepa_loss(
             ecg, ppg, context_embed, target_embed
         )
@@ -500,10 +474,9 @@ class JEPA(nn.Module):
             total_loss = total_loss + self.stats_loss_weight * stats_loss
             info.update(stats_info)
 
-        # 3. ★ M2AE 风格跨模态对比损失 (ECG ↔ PPG)
+        # 3. ★ M2AE 跨模态对比 (ECG↔PPG InfoNCE)
         if self.use_contrast_loss:
-            # 用context_encoder编码PPG得到对比嵌入
-            ppg_embed_ctx = self.forward_context(ppg)  # (B, transformer_dim)
+            ppg_embed_ctx = self.forward_context(ppg)  # context_enc(PPG)
             contrast_loss, contrast_info = self._compute_contrast_loss(
                 context_embed, ppg_embed_ctx
             )

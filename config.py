@@ -16,7 +16,7 @@ class DataConfig:
 
     # Downstream data
     chd_ppg_dir: str = "/root/chd_ppg"
-    chd_ecg_dir: str = "/root/chd_ppg"  # ECG数据跟PPG同目录下 (ecg_chd/)
+    chd_ecg_dir: str = "/root/chd_ecg"
     chd_ecg_subdir: str = "ecg_chd"     # ECG数据子目录 (下含.pkl文件)
     arrhythmia_dir: str = "/root/processed_dataset"
 
@@ -94,8 +94,11 @@ class ModelConfig:
     # ── Auxiliary losses (from CWT-MAE v3) ──
     use_stats_loss: bool = False       # auxiliary statistics prediction
     stats_loss_weight: float = 0.1     # weight for stats loss
-    use_contrast_loss: bool = True     # ★ M2AE风格跨模态对比 (InfoNCE, ECG↔PPG)
-    contrast_loss_weight: float = 0.1  # weight for contrastive loss
+    use_contrast_loss: bool = True     # ★ M2AE InfoNCE: ECG↔PPG 跨模态对比
+    contrast_loss_weight: float = 0.1  # 0.1: 辅助正则, 不让对比主导学习
+    vicreg_sim_weight: float = 1.0     # 不变性: MSE(ECG, PPG)
+    vicreg_var_weight: float = 1.0     # 方差: 防止维度坍缩
+    vicreg_cov_weight: float = 0.04    # 协方差: 去冗余
 
     # ── CWT Frontend (optional alternative to 1D CNN) ──
     use_cwt: bool = False              # use CWT 1D→2D frontend instead of CNN Stem
@@ -107,14 +110,18 @@ class ModelConfig:
     # ── Downstream ──
     use_cot_head: bool = True          # Chain-of-Thought classification head
     cot_tokens: int = 16               # number of reasoning tokens
-    use_layerwise_lr: bool = True      # layer-wise learning rate decay
+    use_layerwise_lr: bool = False     # uniform LR (避免CoT坍塌)
     layer_decay: float = 0.85          # softened decay (was 0.75)
     # ★ XGBoost 替代微调 (M2AE: 冻结编码器+XGBoost → CVD AUROC 0.974)
-    use_xgboost: bool = False          # True=跳过微调, 直接用XGBoost
+    use_xgboost: bool = False          # 使用神经网络微调 + LayerDrop
+    # ★ HuBERT-ECG LayerDrop (下游微调防过拟合: 随机丢20% transformer层)
+    downstream_layerdrop: float = 0.3  # ECGFounder-PT: Stochastic Depth
     # ★ HiMAE 多尺度分类头 (不同疾病依赖不同时间尺度)
     use_multiscale: bool = False       # True=使用MultiScaleClassifier
     # ★ ECG+PPG 双通道融合 (CSFM: 多模态融合持续带来稳健提升)
-    use_dual_channel: bool = True      # True=使用DualChannelClassifierCoT (需ECG+PPG数据)
+    use_dual_channel: bool = False     # 单通道 PPG only
+    use_ecg_distill: bool = True       # ★ ECG蒸馏: 训练时ECG辅助, 部署仅PPG
+    distill_lambda: float = 0.3        # 蒸馏对齐权重
 
 
 @dataclass
@@ -122,8 +129,8 @@ class TrainConfig:
     """Training hyperparameters."""
 
     # Pre-training
-    pretrain_epochs: int = 50
-    pretrain_batch_size: int = 170
+    pretrain_epochs: int = 200
+    pretrain_batch_size: int = 160
     pretrain_lr: float = 5e-4
     pretrain_warmup_epochs: int = 5  # shorter warmup → earlier cosine decay
     pretrain_weight_decay: float = 0.05
@@ -140,12 +147,12 @@ class TrainConfig:
     ema_schedule: str = "cosine"  # cosine schedule for target encoder momentum
 
     # Downstream
-    downstream_epochs: int = 100
+    downstream_epochs: int = 50
     downstream_batch_size: int = 128
     downstream_lr: float = 3e-3  # increased from 1e-3
     downstream_min_lr: float = 1e-6
     downstream_warmup_epochs: int = 5
-    downstream_probe_epochs: int = 10  # linear probe only (frozen encoder)
+    downstream_probe_epochs: int = 30  # ECGFounder-PT: 充分收敛分类头
     downstream_scheduler: str = "step"  # "epoch" or "step" (step-based for warmup+cosine)
 
     # ★ MixUp 数据增强：在batch内混合CHD和正常样本，生成更多正样本变体
@@ -153,7 +160,7 @@ class TrainConfig:
     mixup_alpha: float = 0.5        # Beta分布参数 (0.5=中等混合强度)
 
     # Downstream loss
-    loss_type: str = "asl"  # "ce" | "focal" | "asl" | "bce"  ★ ASL: γ_neg=4压制负样本, 提升CHD召回率
+    loss_type: str = "focal"  # "ce" | "focal" | "asl" | "bce"
     focal_gamma: float = 2.0
     asl_gamma_neg: int = 4
     asl_gamma_pos: int = 1

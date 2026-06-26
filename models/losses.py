@@ -178,9 +178,21 @@ def compute_pos_weight(train_dataset, num_classes: int, device: str = "cpu") -> 
     print(f"[PosWeight] Scanning {len(train_dataset)} samples for class distribution...")
     for i in range(len(train_dataset)):
         try:
-            _, label = train_dataset[i]
+            item = train_dataset[i]
+            # Handle (x, label), (x, label, uid), (ecg, ppg, label), (ecg, ppg, label, uid)
+            if isinstance(item, tuple):
+                if len(item) >= 4:  # (ecg, ppg, label, uid)
+                    label = item[2]
+                elif len(item) >= 3:  # (x, label, uid) or (ecg, ppg, label)
+                    label = item[1] if isinstance(item[1], int) else item[2]
+                else:  # (x, label)
+                    label = item[1]
+            else:
+                label = item
             if isinstance(label, int):
                 label_counts[label] += 1
+            elif isinstance(label, (np.integer,)):
+                label_counts[int(label)] += 1
             else:
                 label_counts[label] += 1  # Already one-hot or multi-label
         except Exception:

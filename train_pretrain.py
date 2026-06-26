@@ -97,6 +97,9 @@ def build_model(model_config: ModelConfig) -> JEPA:
         stats_loss_weight=model_config.stats_loss_weight,
         use_contrast_loss=model_config.use_contrast_loss,
         contrast_loss_weight=model_config.contrast_loss_weight,
+        vicreg_sim_weight=model_config.vicreg_sim_weight,
+        vicreg_var_weight=model_config.vicreg_var_weight,
+        vicreg_cov_weight=model_config.vicreg_cov_weight,
     )
 
 
@@ -211,12 +214,16 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
             loss, info = model.compute_loss(ecg, ppg, ecg_stats)
             epoch_losses["loss"] += info.get("total_loss", loss.item())
 
-            # Backward
-            optimizer.zero_grad()
+            # ★ 梯度累积: effective batch = 180×2 = 360
+            accum_steps = 2
+            loss = loss / accum_steps
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
+
+            if (batch_idx + 1) % accum_steps == 0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
 
             # EMA update target encoder
             model.update_target_encoder(ema_momentum)

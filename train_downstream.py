@@ -23,6 +23,7 @@ from typing import Optional, Tuple, List
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
@@ -38,6 +39,7 @@ from models.encoder import SignalEncoder
 from models.classifier import (
     SignalClassifier, DualChannelClassifier,
     SignalClassifierCoT, DualChannelClassifierCoT,
+    DualChannelSimpleFusion,
     MultiScaleClassifier,
 )
 from models.losses import build_criterion, compute_pos_weight
@@ -130,6 +132,7 @@ def build_encoder(model_config: ModelConfig) -> SignalEncoder:
         transformer_dropout=model_config.transformer_dropout,
         max_seq_len=model_config.max_seq_len,
         pool_type=model_config.pool_type,
+        layerdrop=model_config.downstream_layerdrop,
     )
 
 
@@ -222,7 +225,7 @@ def get_layerwise_param_groups(model, base_lr: float, layer_decay: float,
 
 # ── Scheduler ───────────────────────────────────────────────────
 
-def build_scheduler(optimizer, train_config, steps_per_epoch: int):
+def build_scheduler(optimizer, train_config, steps_per_epoch: int, distill_mode: bool = False):
     """
     Build LR scheduler: warmup + cosine annealing.
 
@@ -232,7 +235,8 @@ def build_scheduler(optimizer, train_config, steps_per_epoch: int):
     if train_config.downstream_scheduler == "step":
         total_steps = train_config.downstream_epochs * steps_per_epoch
         warmup_steps = train_config.downstream_warmup_epochs * steps_per_epoch
-        warmup = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps)
+        warmup_start = 1.0  # 跳过warmup, 防CoT坍塌
+        warmup = LinearLR(optimizer, start_factor=warmup_start, total_iters=warmup_steps)
         cosine = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps,
                                     eta_min=train_config.downstream_min_lr)
         scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine],
@@ -277,15 +281,16 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
             if len(batch) == 4:
                 ecg, ppg, labels, _ = batch
             else:
-                ecg, ppg, labels = batch
+                ecg, ppg, labels, *_ = batch
             ecg, ppg, labels = ecg.to(device), ppg.to(device), labels.to(device)
             logits = model(ecg, ppg)
+            loss = criterion(logits, labels)
         else:
             # ★ 兼容3元组 (x, labels, uid)
             if len(batch) == 3:
                 x, labels, _ = batch
             else:
-                x, labels = batch
+                x, labels, *_ = batch
             x, labels = x.to(device), labels.to(device)
 
             # ★ MixUp 数据增强 (仅在启用且训练正样本时)
@@ -352,16 +357,17 @@ def evaluate(model, dataloader, criterion, device, num_classes: int,
             if len(batch) == 4:
                 ecg, ppg, labels, _ = batch
             else:
-                ecg, ppg, labels = batch
+                ecg, ppg, labels, *_ = batch
             ecg, ppg, labels = ecg.to(device), ppg.to(device), labels.to(device)
             logits = model(ecg, ppg)
+            loss = criterion(logits, labels)
             uids = None
         else:
             # 兼容 2元组 / 3元组
             if len(batch) == 3:
                 x, labels, uids = batch
             else:
-                x, labels = batch
+                x, labels, *_ = batch
                 uids = None
             x, labels = x.to(device), labels.to(device)
             logits = model(x)
@@ -481,6 +487,30 @@ def evaluate(model, dataloader, criterion, device, num_classes: int,
             all_preds_arr, all_labels_arr, all_probs)
 
 
+def extract_dual_features(ecg_encoder, ppg_encoder, dataloader, device, desc="双通道特征提取"):
+    """从冻结的双编码器提取 ECG+PPG 拼接特征和标签。"""
+    ecg_encoder.eval()
+    ppg_encoder.eval()
+    all_embeddings, all_labels, all_uids = [], [], []
+    total = len(dataloader)
+    for batch_idx, batch in enumerate(dataloader):
+        ecg, ppg, labels, uids = batch
+        ecg, ppg = ecg.to(device), ppg.to(device)
+        with torch.no_grad():
+            e, _ = ecg_encoder(ecg)   # (B, 512)
+            p, _ = ppg_encoder(ppg)   # (B, 512)
+            emb = torch.cat([e, p], dim=-1)  # (B, 1024)
+        all_embeddings.append(emb.cpu().numpy())
+        all_labels.append(labels.numpy())
+        all_uids.extend(uids)
+        if batch_idx % 20 == 0:
+            print(f"  [{desc}] {batch_idx}/{total}", end="\r")
+    print(f"  [{desc}] 完成: {len(all_uids)} 样本, 特征维度={all_embeddings[0].shape[1]}")
+    X = np.concatenate(all_embeddings, axis=0)
+    y = np.concatenate(all_labels, axis=0)
+    return X, y, all_uids
+
+
 # ── XGBoost 下游训练 ────────────────────────────────────────────
 # M2AE 论文 (PPG-ECG Biosignal Fingerprinting):
 # 冻结编码器 + XGBoost → CVD 分类 AUROC 0.974
@@ -495,7 +525,7 @@ def extract_features(encoder, dataloader, device, desc="特征提取"):
         if len(batch) == 3:
             x, labels, uids = batch
         else:
-            x, labels = batch
+            x, labels, *_ = batch
             uids = [f"unknown_{i}" for i in range(x.size(0))]
         x = x.to(device)
         with torch.no_grad():
@@ -536,41 +566,83 @@ def train_downstream_xgboost(
     print(f"Device: {device} | Dataset: {dataset} | Classes: {num_classes}")
 
     # Data
-    train_loader, test_loader, _, _ = build_downstream_dataloaders(
-        config.data, config.train, dataset
-    )
+    if config.model.use_dual_channel:
+        train_loader, test_loader, _, _ = build_downstream_dataloaders(
+            config.data, config.train, dataset, use_dual=True,
+        )
+    else:
+        train_loader, test_loader, _, _ = build_downstream_dataloaders(
+            config.data, config.train, dataset,
+        )
 
-    # Load encoder (冻结)
-    encoder = load_pretrained_encoder(checkpoint_path, config.model, "target", device)
-    encoder.eval()
-    for param in encoder.parameters():
-        param.requires_grad = False
-    print(f"[Encoder] 冻结完成: {sum(p.numel() for p in encoder.parameters()):,} params")
+    # Load encoder(s) — dual-channel: 两个编码器都冻结
+    if config.model.use_dual_channel:
+        ecg_encoder = load_pretrained_encoder(checkpoint_path, config.model, "context", device)
+        ppg_encoder = load_pretrained_encoder(checkpoint_path, config.model, "target", device)
+        ecg_encoder.eval()
+        ppg_encoder.eval()
+        for param in ecg_encoder.parameters():
+            param.requires_grad = False
+        for param in ppg_encoder.parameters():
+            param.requires_grad = False
+        print(f"[Encoder] 双通道冻结: ECG={sum(p.numel() for p in ecg_encoder.parameters()):,} + PPG={sum(p.numel() for p in ppg_encoder.parameters()):,}")
+        encoder = None
+    else:
+        encoder = load_pretrained_encoder(checkpoint_path, config.model, "target", device)
+        encoder.eval()
+        for param in encoder.parameters():
+            param.requires_grad = False
+        print(f"[Encoder] 单通道冻结: {sum(p.numel() for p in encoder.parameters()):,} params")
+        ecg_encoder = None
+        ppg_encoder = None
 
     # 提取特征
-    print("\n[特征提取] 训练集...")
-    X_train, y_train, uid_train = extract_features(encoder, train_loader, device, "训练集")
-    print(f"[特征提取] 测试集...")
-    X_test, y_test, uid_test = extract_features(encoder, test_loader, device, "测试集")
+    if config.model.use_dual_channel:
+        print("\n[特征提取] 训练集 (双通道)...")
+        X_train, y_train, uid_train = extract_dual_features(
+            ecg_encoder, ppg_encoder, train_loader, device, "训练集")
+        print(f"[特征提取] 测试集 (双通道)...")
+        X_test, y_test, uid_test = extract_dual_features(
+            ecg_encoder, ppg_encoder, test_loader, device, "测试集")
+    else:
+        print("\n[特征提取] 训练集...")
+        X_train, y_train, uid_train = extract_features(encoder, train_loader, device, "训练集")
+        print(f"[特征提取] 测试集...")
+        X_test, y_test, uid_test = extract_features(encoder, test_loader, device, "测试集")
 
     print(f"\n[数据] 训练: {X_train.shape}, 测试: {X_test.shape}")
     print(f"       类别分布: 训练={np.bincount(y_train)}, 测试={np.bincount(y_test)}")
 
+    # PCA 降维：1024 → 256 (去除冗余维度，加速XGBoost)
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+    print("\n[PCA] 降维中...")
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    pca = PCA(n_components=256)
+    X_train = pca.fit_transform(X_train_scaled)
+    X_test = pca.transform(X_test_scaled)
+    print(f"[PCA] 1024 → 256, 保留方差: {pca.explained_variance_ratio_.sum():.2%}")
+
     # 类别权重
     scale_pos_weight = np.sqrt(np.bincount(y_train)[0] / max(np.bincount(y_train)[1], 1))
+    print(f"[XGBoost] scale_pos_weight={scale_pos_weight:.3f}")
 
-    # XGBoost 训练
+    # XGBoost 训练 (优化超参)
     print("\n[XGBoost] 训练中...")
     import xgboost as xgb
     model = xgb.XGBClassifier(
-        n_estimators=500,
-        max_depth=6,
-        learning_rate=0.01,
-        subsample=0.8,
-        colsample_bytree=0.8,
+        n_estimators=2000,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.7,
+        colsample_bytree=0.7,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
         scale_pos_weight=scale_pos_weight,
         eval_metric='auc',
-        early_stopping_rounds=50,
+        early_stopping_rounds=100,
         verbosity=1,
         random_state=42,
     )
@@ -676,7 +748,7 @@ def ensemble_models(config, checkpoint_path, dataset="chd"):
             if len(batch) == 3:
                 x, labels, _ = batch
             else:
-                x, labels = batch
+                x, labels, *_ = batch
             x = x.to(device)
             labels = labels.to(device)
 
@@ -755,12 +827,11 @@ def train_downstream(
         ecg_encoder = load_pretrained_encoder(checkpoint_path, config.model, "context", device)
         ppg_encoder = load_pretrained_encoder(checkpoint_path, config.model, "target", device)
         encoder = None  # 不单独使用
-        print("[Model] ★ DualChannel ECG+PPG 融合分类头")
-        model = DualChannelClassifierCoT(
+        print("[Model] ★ DualChannel SimpleFusion (ECG+PPG 向量级融合)")
+        model = DualChannelSimpleFusion(
             ecg_encoder=ecg_encoder, ppg_encoder=ppg_encoder,
             encoder_dim=config.model.transformer_dim,
-            num_classes=num_classes, num_heads=config.model.transformer_heads,
-            num_reasoning_tokens=config.model.cot_tokens,
+            num_classes=num_classes,
         ).to(device)
     else:
         # 单通道 (PPG)
@@ -769,8 +840,24 @@ def train_downstream(
         )
         encoder = load_pretrained_encoder(checkpoint_path, config.model, "target", device)
 
-    # Build classifier (非双通道时)
-    if not is_dual and config.model.use_multiscale:
+        # ★ ECG蒸馏: 加载冻结ECG编码器 + 投影头
+        ecg_encoder_distill = None; proj_ppg = None; proj_ecg = None; ecg_train_loader = None
+        if config.model.use_ecg_distill:
+            print("[Distill] 加载ECG教师编码器 (冻结)...")
+            ecg_encoder_distill = load_pretrained_encoder(checkpoint_path, config.model, "context", device)
+            ecg_encoder_distill.eval()
+            for p in ecg_encoder_distill.parameters(): p.requires_grad = False
+            proj_ppg = nn.Sequential(nn.Linear(config.model.transformer_dim, 256), nn.GELU(), nn.Linear(256, 256)).to(device)
+            proj_ecg = nn.Sequential(nn.Linear(config.model.transformer_dim, 256), nn.GELU(), nn.Linear(256, 256)).to(device)
+            proj_ecg.load_state_dict(proj_ppg.state_dict())
+            for p in proj_ecg.parameters(): p.requires_grad = False
+            ecg_train_ds = DownstreamDataset(config.data.chd_ecg_dir+"/ecg_chd", config.data.chd_ppg_dir+"/train_test_split.json", "train", normalize=config.data.normalize)
+            ecg_train_loader = DataLoader(ecg_train_ds, batch_size=config.train.downstream_batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
+            print(f"[Distill] ECG教师就绪, lambda={config.model.distill_lambda}")
+
+    # Build classifier (skip if dual-channel already created)
+    if is_dual:
+        pass  # DualChannelClassifierCoT already created above
     elif config.model.use_multiscale:
         print("[Model] HiMAE多尺度分类头 (细+中+粗三尺度)")
         model = MultiScaleClassifier(
@@ -817,9 +904,11 @@ def train_downstream(
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     probe_steps = len(train_loader)
-    optimizer = AdamW(trainable, lr=config.train.downstream_lr)
+    probe_lr = config.train.downstream_lr * 5 if ecg_encoder_distill is not None else config.train.downstream_lr
+    optimizer = AdamW(trainable, lr=probe_lr)
     scheduler, sched_mode = build_scheduler(
-        optimizer, config.train, probe_steps
+        optimizer, config.train, probe_steps,
+        distill_mode=(ecg_encoder_distill is not None),
     )
 
     for epoch in range(config.train.downstream_probe_epochs):
@@ -844,34 +933,73 @@ def train_downstream(
 
     # ── Phase 2: Full Fine-tune ──
     print("\n" + "=" * 60)
-    print("Phase 2: Full Fine-tune")
+    if is_dual:
+        print("Phase 2: Full Fine-tune (ECG frozen, PPG unfrozen)")
+        model.unfreeze_ppg_only()
+    else:
+        print("Phase 2: Full Fine-tune")
+        model.unfreeze_encoder()
     print("=" * 60)
-    model.unfreeze_encoder()
 
     ft_epochs = config.train.downstream_epochs - config.train.downstream_probe_epochs
     ft_lr = config.train.downstream_lr * 0.1
     ft_steps = len(train_loader)
 
-    if config.model.use_layerwise_lr:
+    if ecg_encoder_distill is not None:
+        # 蒸馏模式: uniform LR + 跳过warmup (避免CoT坍塌)
+        print(f"[Optimizer] 蒸馏模式: uniform LR={ft_lr:.2e}")
+        optimizer = AdamW(list(model.parameters()) + (list(proj_ppg.parameters()) if proj_ppg else []), lr=ft_lr)
+    elif config.model.use_layerwise_lr:
         print(f"[Optimizer] Layer-wise LR (base={ft_lr}, decay={config.model.layer_decay})")
         param_groups = get_layerwise_param_groups(model, ft_lr, config.model.layer_decay)
+        if proj_ppg is not None:
+            param_groups.append({"params": proj_ppg.parameters(), "lr": ft_lr, "name": "proj_ppg"})
         optimizer = AdamW(param_groups)
     else:
         optimizer = AdamW(model.parameters(), lr=ft_lr)
 
-    scheduler, sched_mode = build_scheduler(optimizer, config.train, ft_steps)
+    scheduler, sched_mode = build_scheduler(
+        optimizer, config.train, ft_steps,
+        distill_mode=(ecg_encoder_distill is not None),
+    )
 
     best_auc = 0.0
     best_state = None
+    patience = 15  # early stopping: stop if no AUC improvement for N epochs
+    no_improve = 0
 
     for epoch in range(ft_epochs):
-        train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, criterion, device,
-            scheduler=scheduler, sched_mode=sched_mode,
-            mixup_alpha=config.train.mixup_alpha if config.train.use_mixup else 0.0,
-            num_classes=num_classes,
-            is_dual=is_dual,
-        )
+        if ecg_encoder_distill is not None:
+            # ★ ECG蒸馏模式: PPG+ECG配对训练
+            model.train(); running_loss = 0.0; correct = total = 0
+            for (ppg_b, ecg_b) in zip(train_loader, ecg_train_loader):
+                x, labels, *_ = ppg_b; ex, *_ = ecg_b
+                x, labels, ex = x.to(device), labels.to(device), ex.to(device)
+                logits = model(x)
+                cls_loss = criterion(logits, labels)
+                # 投影对齐 loss
+                with torch.no_grad():
+                    ecg_pooled, _ = ecg_encoder_distill(ex)
+                ppg_pooled, _ = model.encoder(x)
+                align_loss = (1 - F.cosine_similarity(
+                    proj_ppg(ppg_pooled), proj_ecg(ecg_pooled), dim=-1)).mean()
+                loss = cls_loss + config.model.distill_lambda * align_loss
+                optimizer.zero_grad(); loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                if scheduler is not None and sched_mode == "batch": scheduler.step()
+                running_loss += loss.item()
+                _, pred = logits.max(1); correct += pred.eq(labels).sum().item(); total += labels.size(0)
+            train_loss = running_loss / len(train_loader)
+            train_acc = 100.0 * correct / total
+        else:
+            train_loss, train_acc = train_epoch(
+                model, train_loader, optimizer, criterion, device,
+                scheduler=scheduler, sched_mode=sched_mode,
+                mixup_alpha=config.train.mixup_alpha if config.train.use_mixup else 0.0,
+                num_classes=num_classes,
+                is_dual=is_dual,
+            )
         test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate(
             model, test_loader, criterion, device, num_classes,
             is_dual=is_dual,
@@ -888,10 +1016,16 @@ def train_downstream(
 
         if auc > best_auc:
             best_auc = auc
+            no_improve = 0
             best_state = {
                 "epoch": epoch, "model_state_dict": model.state_dict(),
                 "test_acc": test_acc, "test_auc": auc, "test_f1": f1,
             }
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print(f"\n[EarlyStop] AUC未提升 {patience} 个epoch, 终止训练 (best AUC={best_auc:.4f})")
+                break
 
     # ── Final Report ──
     print("\n" + "=" * 60)
@@ -904,6 +1038,7 @@ def train_downstream(
     (_, test_acc, auc, auc_list,
      prec, rec, f1, f05, report, _, _, _) = evaluate(
         model, test_loader, criterion, device, num_classes,
+        is_dual=is_dual,
     )
 
     print(f"Best Test Acc:       {test_acc:.2f}%")

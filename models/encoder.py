@@ -140,7 +140,7 @@ class TransformerEncoderBlock(nn.Module):
 
 
 class TransformerStack(nn.Module):
-    """Stack of Transformer encoder blocks."""
+    """Stack of Transformer encoder blocks with Stochastic Depth."""
 
     def __init__(
         self,
@@ -149,15 +149,20 @@ class TransformerStack(nn.Module):
         nhead: int = 8,
         dim_feedforward: int = 1024,
         dropout: float = 0.1,
+        layerdrop: float = 0.0,
     ):
         super().__init__()
         self.blocks = nn.ModuleList([
             TransformerEncoderBlock(d_model, nhead, dim_feedforward, dropout)
             for _ in range(num_layers)
         ])
+        self.layerdrop = layerdrop
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for block in self.blocks:
+            if self.training and self.layerdrop > 0:
+                if torch.rand(1).item() < self.layerdrop:
+                    continue  # ★ Stochastic Depth: 随机跳过
             x = block(x)
         return x
 
@@ -184,6 +189,7 @@ class SignalEncoder(nn.Module):
         transformer_dropout: float = 0.1,
         max_seq_len: int = 200,
         pool_type: str = "adaptive_avg",
+        layerdrop: float = 0.0,
     ):
         super().__init__()
 
@@ -214,6 +220,7 @@ class SignalEncoder(nn.Module):
             nhead=transformer_heads,
             dim_feedforward=transformer_ff_dim,
             dropout=transformer_dropout,
+            layerdrop=layerdrop,
         )
 
         self.ln_final = nn.LayerNorm(transformer_dim)

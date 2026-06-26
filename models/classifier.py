@@ -229,6 +229,139 @@ class SignalClassifierCoT(nn.Module):
         return self.head(tokens)
 
 
+class DualChannelSimpleFusion(nn.Module):
+    """
+    ★ SimpleFusion: ECG+PPG 向量级融合 (Biosignal Fingerprinting 风格)
+
+    ECG → Encoder → avg_pool → (B, 512)
+    PPG → Encoder → avg_pool → (B, 512)
+    concat → Linear(512)→GELU→Linear(256)→GELU→Linear(2)
+
+    优势: 避免CoT的124-token注意力稀释, 参数少收敛快
+    """
+    def __init__(
+        self,
+        ecg_encoder: SignalEncoder,
+        ppg_encoder: SignalEncoder,
+        encoder_dim: int = 512,
+        num_classes: int = 2,
+        hidden_dims: list = None,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [512, 256]
+
+        self.ecg_encoder = ecg_encoder
+        self.ppg_encoder = ppg_encoder
+
+        # Fusion MLP
+        layers = []
+        in_dim = encoder_dim * 2  # 512 + 512 = 1024
+        for h_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(in_dim, h_dim),
+                nn.BatchNorm1d(h_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ])
+            in_dim = h_dim
+        layers.append(nn.Linear(in_dim, num_classes))
+        self.fusion = nn.Sequential(*layers)
+
+    def freeze_encoders(self):
+        for p in self.ecg_encoder.parameters():
+            p.requires_grad = False
+        for p in self.ppg_encoder.parameters():
+            p.requires_grad = False
+
+    def unfreeze_encoders(self):
+        for p in self.ecg_encoder.parameters():
+            p.requires_grad = True
+        for p in self.ppg_encoder.parameters():
+            p.requires_grad = True
+
+    freeze_encoder = freeze_encoders
+    unfreeze_encoder = unfreeze_encoders
+
+    def unfreeze_ppg_only(self):
+        """★ CardioPPG风格: 只解冻PPG编码器, ECG保持冻结 (防止过拟合)"""
+        for p in self.ppg_encoder.parameters():
+            p.requires_grad = True
+        # ECG encoder stays frozen
+
+    def forward(self, ecg, ppg):
+        e, _ = self.ecg_encoder(ecg)  # (B, 512)
+        p, _ = self.ppg_encoder(ppg)  # (B, 512)
+        fused = torch.cat([e, p], dim=-1)  # (B, 1024)
+        return self.fusion(fused)
+
+
+class AsymmetricFusion(nn.Module):
+    """
+    ★ 不对称双通道融合: ECG冻结(辅助) + PPG LoRA微调(主力)。
+
+    ECG → context_encoder(frozen) → (B, 512) ─┐
+                                                 ├─ concat → MLP → 2
+    PPG → target_encoder(LoRA)    → (B, 512) ─┘
+
+    仅 ~1M 可训参数, 防过拟合, ECG仅作为辅助信号。
+    """
+    def __init__(
+        self,
+        ecg_encoder, ppg_encoder,
+        encoder_dim: int = 512,
+        num_classes: int = 2,
+        hidden_dims: list = None,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [256, 128]
+
+        self.ecg_encoder = ecg_encoder
+        self.ppg_encoder = ppg_encoder
+
+        # ECG encoder 始终冻结
+        for p in self.ecg_encoder.parameters():
+            p.requires_grad = False
+
+        # Fusion MLP
+        layers = []
+        in_dim = encoder_dim * 2  # 512 + 512 = 1024
+        for h_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(in_dim, h_dim),
+                nn.BatchNorm1d(h_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ])
+            in_dim = h_dim
+        layers.append(nn.Linear(in_dim, num_classes))
+        self.fusion = nn.Sequential(*layers)
+
+    def forward(self, ecg, ppg):
+        with torch.no_grad():
+            e, _ = self.ecg_encoder(ecg)  # (B, 512), ECG冻结
+        p, _ = self.ppg_encoder(ppg)       # (B, 512), PPG LoRA微调
+        fused = torch.cat([e, p], dim=-1)
+        return self.fusion(fused)
+
+    def freeze_encoder(self):
+        """冻结PPG encoder的非LoRA参数 (Probe阶段用)"""
+        for p in self.ppg_encoder.parameters():
+            p.requires_grad = False
+
+    def unfreeze_ppg_lora(self):
+        """只解冻PPG encoder的LoRA参数"""
+        for n, p in self.ppg_encoder.named_parameters():
+            if 'lora' in n:
+                p.requires_grad = True
+
+    freeze_encoder_alias = freeze_encoder
+    unfreeze_encoder = freeze_encoder  # 默认不解冻
+
+
 class DualChannelClassifierCoT(nn.Module):
     """
     Dual-channel classifier (ECG + PPG fusion) with CoT reasoning head.
