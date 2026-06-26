@@ -254,19 +254,15 @@ class JEPA(nn.Module):
                 in_dim=transformer_dim, hidden_dim=transformer_dim, num_stats=16
             )
 
-        # ── ★ M2AE 风格跨模态对比学习 ──
-        # 用 InfoNCE 拉近同一时刻的 ECG↔PPG 嵌入，推远不同时刻
+        # ── ★ M2AE 风格跨模态对比学习 (已废弃, 被 Token Align 替代) ──
         self.use_contrast_loss = use_contrast_loss
         self.contrast_loss_weight = contrast_loss_weight
-        self.contrast_temperature = 0.1  # InfoNCE温度系数
-        if use_contrast_loss:
-            # 共享投影头：ECG和PPG都投影到同一对比空间
-            self.contrast_projector = nn.Sequential(
-                nn.Linear(transformer_dim, transformer_dim),
-                nn.BatchNorm1d(transformer_dim),
-                nn.GELU(),
-                nn.Linear(transformer_dim, 128),
-            )
+        # ── ★ Token 级跨模态对齐 (NeurIPS 2025 KD 论文) ──
+        # 逐 token 余弦对齐: ECG_token_i ↔ PPG_token_i, 无需负样本
+        self.use_token_align = False  # 在 token_align 模式下由外部设置
+        self.token_align_weight = 0.5
+
+        # ── [已移除] WavesFM 频域掩码 (当前实现编码器不参与计算图)
 
         self.latent_dim = latent_dim
         self.num_latent_samples = num_latent_samples
@@ -412,11 +408,65 @@ class JEPA(nn.Module):
 
         return loss, {"contrast": loss.item()}
 
+    def _compute_token_align_loss(self, ecg, ppg, token_mask=None):
+        """
+        ★ Token 级跨模态对齐 (替代 InfoNCE).
+
+        论文: Cross-Modal Representational KD (NeurIPS 2025)
+        关键修复: 只在 JETS 可见 token 上计算对齐损失。
+        被掩码的 token 接近零向量，强行对齐反而有害。
+
+        Args:
+            token_mask: (B, 1, N) bool, True=可见位置 (来自 JETS 掩码)
+        """
+        if not self.training:
+            return torch.tensor(0.0, device=ecg.device), {"token_align": 0.0}
+
+        # 获取 token 序列 (不用 pooled)
+        _, ecg_tokens = self.context_encoder(ecg, return_all=True)   # (B, N, D)
+        _, ppg_tokens = self.target_encoder(ppg, return_all=True)    # (B, N, D)
+
+        # target_encoder 作为 teacher → 停止梯度 (论文核心)
+        ppg_tokens = ppg_tokens.detach()
+
+        # 确保 token 数一致
+        min_n = min(ecg_tokens.size(1), ppg_tokens.size(1))
+        ecg_tokens = ecg_tokens[:, :min_n, :]
+        ppg_tokens = ppg_tokens[:, :min_n, :]
+
+        # 逐 token 余弦相似度: (B, N)
+        cos_sim = F.cosine_similarity(ecg_tokens, ppg_tokens, dim=-1)  # (B, N)
+
+        # ★ 只保留可见 token 的损失
+        if token_mask is not None:
+            mask = token_mask[:, 0, :min_n]  # (B, N)
+            loss = ((1.0 - cos_sim) * mask).sum() / mask.sum().clamp(min=1)
+            visible_ratio = mask.float().mean().item()
+        else:
+            loss = (1.0 - cos_sim).mean()
+            visible_ratio = 1.0
+
+        token_std = cos_sim.detach().std(dim=-1).mean().item()
+        info = {"token_align": loss.item(), "token_std": token_std,
+                "visible": visible_ratio}
+
+        return loss, info
+
+    def freeze_target_encoder(self):
+        """冻结 target_encoder (Token 对齐模式: 当做 teacher)."""
+        for param in self.target_encoder.parameters():
+            param.requires_grad = False
+        for param in self.target_proj.parameters():
+            param.requires_grad = False
+        self.target_encoder.eval()
+        self.target_proj.eval()
+        print("[JEPA] Target encoder frozen (teacher mode)")
+
     # ═══════════════════════════════════════════════════════════
     # ★ JETS 式掩码：随机丢弃 ~70% 信号patch，强制编码器从局部学习
     # ═══════════════════════════════════════════════════════════
 
-    def _apply_jets_mask(self, signal: torch.Tensor) -> torch.Tensor:
+    def _apply_jets_mask(self, signal: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         JETS 风格随机掩码：将信号分割为patch，随机保留一部分，其余置零。
 
@@ -427,9 +477,13 @@ class JEPA(nn.Module):
             signal: (B, 1, L) — 原始ECG信号
         Returns:
             masked_signal: (B, 1, L) — 部分patch被置零的ECG
+            token_mask: (B, 1, N_tokens) — True=可见token位置 (用于Token对齐)
         """
         if self.mask_ratio <= 0 or not self.training:
-            return signal  # 推理时不做掩码
+            # 推理时不做掩码 → 所有token可见
+            dummy_mask = torch.ones(signal.size(0), 1, signal.size(-1)//16,
+                                     device=signal.device, dtype=torch.bool)
+            return signal, dummy_mask
 
         B, C, L = signal.shape
         patch_size = self.mask_patch_size
@@ -437,13 +491,11 @@ class JEPA(nn.Module):
 
         # 每个patch是否保留：随机保留 (1-mask_ratio) 的patch
         keep_prob = 1.0 - self.mask_ratio
-        # (B, 1, num_patches): True=保留, False=掩码
         patch_mask = torch.rand(B, 1, num_patches, device=signal.device) < keep_prob
 
         # 将patch级别的mask展开到采样点级别 (B, 1, L)
         mask_expanded = patch_mask.repeat_interleave(patch_size, dim=-1)
 
-        # 处理信号长度不能被patch_size整除的情况
         if mask_expanded.shape[-1] < L:
             pad_len = L - mask_expanded.shape[-1]
             mask_expanded = torch.cat(
@@ -453,7 +505,16 @@ class JEPA(nn.Module):
         elif mask_expanded.shape[-1] > L:
             mask_expanded = mask_expanded[:, :, :L]
 
-        return signal * mask_expanded
+        # ★ 将patch_mask映射到CNN输出token级别
+        # CNN stride=16: 3000采样点→188token,  1000采样点→63token
+        stride = 16
+        n_tokens = L // stride
+        # 用插值把 (B,1,num_patches) 缩放到 (B,1,n_tokens)
+        token_mask = F.interpolate(
+            patch_mask.float(), size=n_tokens, mode='nearest'
+        ).bool()  # (B, 1, n_tokens)  True=可见
+
+        return signal * mask_expanded, token_mask
 
     def compute_loss(
         self,
@@ -477,7 +538,7 @@ class JEPA(nn.Module):
         B = ecg.size(0)
 
         # ★ JETS 式掩码：随机丢弃 ~70% patch，强制编码器从局部学习全局表征
-        ecg_masked = self._apply_jets_mask(ecg)
+        ecg_masked, token_mask = self._apply_jets_mask(ecg)
 
         # Get context embedding from MASKED ecg
         context_embed = self.forward_context(ecg_masked)  # (B, transformer_dim)
@@ -500,15 +561,13 @@ class JEPA(nn.Module):
             total_loss = total_loss + self.stats_loss_weight * stats_loss
             info.update(stats_info)
 
-        # 3. ★ M2AE 风格跨模态对比损失 (ECG ↔ PPG)
-        if self.use_contrast_loss:
-            # 用context_encoder编码PPG得到对比嵌入
-            ppg_embed_ctx = self.forward_context(ppg)  # (B, transformer_dim)
-            contrast_loss, contrast_info = self._compute_contrast_loss(
-                context_embed, ppg_embed_ctx
+        # 3. ★ Token 级对齐 — 只在 JETS 可见 token 上计算
+        if self.use_token_align:
+            token_loss, token_info = self._compute_token_align_loss(
+                ecg_masked, ppg, token_mask=token_mask
             )
-            total_loss = total_loss + self.contrast_loss_weight * contrast_loss
-            info.update(contrast_info)
+            total_loss = total_loss + self.token_align_weight * token_loss
+            info.update(token_info)
 
         info["total_loss"] = total_loss.item()
         return total_loss, info

@@ -38,7 +38,7 @@ from models.encoder import SignalEncoder
 from models.classifier import (
     SignalClassifier, DualChannelClassifier,
     SignalClassifierCoT, DualChannelClassifierCoT,
-    MultiScaleClassifier,
+    MultiScaleClassifier, SimpleFusion,
 )
 from models.losses import build_criterion, compute_pos_weight
 
@@ -756,11 +756,11 @@ def train_downstream(
         ppg_encoder = load_pretrained_encoder(checkpoint_path, config.model, "target", device)
         encoder = None  # 不单独使用
         print("[Model] ★ DualChannel ECG+PPG 融合分类头")
-        model = DualChannelClassifierCoT(
+        # M2AE 风格: 共享瓶颈融合 (非 token 拼接)
+        model = SimpleFusion(
             ecg_encoder=ecg_encoder, ppg_encoder=ppg_encoder,
             encoder_dim=config.model.transformer_dim,
-            num_classes=num_classes, num_heads=config.model.transformer_heads,
-            num_reasoning_tokens=config.model.cot_tokens,
+            num_classes=num_classes,
         ).to(device)
     else:
         # 单通道 (PPG)
@@ -770,25 +770,25 @@ def train_downstream(
         encoder = load_pretrained_encoder(checkpoint_path, config.model, "target", device)
 
     # Build classifier (非双通道时)
-    if not is_dual and config.model.use_multiscale:
-    elif config.model.use_multiscale:
-        print("[Model] HiMAE多尺度分类头 (细+中+粗三尺度)")
-        model = MultiScaleClassifier(
-            encoder=encoder, encoder_dim=config.model.transformer_dim,
-            num_classes=num_classes,
-        ).to(device)
-    elif config.model.use_cot_head:
-        print("[Model] CoT classification head")
-        model = SignalClassifierCoT(
-            encoder=encoder, encoder_dim=config.model.transformer_dim,
-            num_classes=num_classes, num_heads=config.model.transformer_heads,
-            num_reasoning_tokens=config.model.cot_tokens,
-        ).to(device)
-    else:
-        model = SignalClassifier(
-            encoder=encoder, encoder_dim=config.model.transformer_dim,
-            num_classes=num_classes,
-        ).to(device)
+    if not is_dual:
+        if config.model.use_multiscale:
+            print("[Model] HiMAE多尺度分类头 (细+中+粗三尺度)")
+            model = MultiScaleClassifier(
+                encoder=encoder, encoder_dim=config.model.transformer_dim,
+                num_classes=num_classes,
+            ).to(device)
+        elif config.model.use_cot_head:
+            print("[Model] CoT classification head")
+            model = SignalClassifierCoT(
+                encoder=encoder, encoder_dim=config.model.transformer_dim,
+                num_classes=num_classes, num_heads=config.model.transformer_heads,
+                num_reasoning_tokens=config.model.cot_tokens,
+            ).to(device)
+        else:
+            model = SignalClassifier(
+                encoder=encoder, encoder_dim=config.model.transformer_dim,
+                num_classes=num_classes,
+            ).to(device)
 
     # ── Auto pos_weight ──
     pos_weight = None
@@ -813,7 +813,7 @@ def train_downstream(
     print("\n" + "=" * 60)
     print("Phase 1: Linear Probe (frozen encoder)")
     print("=" * 60)
-    model.freeze_encoder()
+    model.freeze_encoders() if is_dual else model.freeze_encoder()
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     probe_steps = len(train_loader)
@@ -846,7 +846,7 @@ def train_downstream(
     print("\n" + "=" * 60)
     print("Phase 2: Full Fine-tune")
     print("=" * 60)
-    model.unfreeze_encoder()
+    model.unfreeze_encoders() if is_dual else model.unfreeze_encoder()
 
     ft_epochs = config.train.downstream_epochs - config.train.downstream_probe_epochs
     ft_lr = config.train.downstream_lr * 0.1

@@ -15,9 +15,9 @@ class DataConfig:
     pretrain_processed_dir: str = "/root/autodl-tmp/split_processed"
 
     # Downstream data
-    chd_ppg_dir: str = "/root/chd_ppg"
-    chd_ecg_dir: str = "/root/chd_ppg"  # ECG数据跟PPG同目录下 (ecg_chd/)
-    chd_ecg_subdir: str = "ecg_chd"     # ECG数据子目录 (下含.pkl文件)
+    chd_ppg_dir: str = "C:/Users/86189/Downloads/chd_ppg"
+    chd_ecg_dir: str = "C:/Users/86189/Downloads/chd_ppg"  # ECG跟PPG同目录
+    chd_ecg_subdir: str = "ecg_chd"     # ECG数据子目录
     arrhythmia_dir: str = "/root/processed_dataset"
 
     # Preprocessing
@@ -88,14 +88,18 @@ class ModelConfig:
 
     # ── JETS 式掩码策略 ──
     # 随机掩码信号patch，强制编码器从局部信息学习全局表征
-    jets_mask_ratio: float = 0.7   # 0=关闭, 0.7=保留30%patch（JETS推荐值）
+    jets_mask_ratio: float = 0.6   # 0=关闭, 0.6=保留40%patch（从0.7调低）
     jets_mask_patch_size: int = 50 # 每个patch的采样点数 (3000/50=60个patch, 下游1000/50=20个patch)
 
     # ── Auxiliary losses (from CWT-MAE v3) ──
     use_stats_loss: bool = False       # auxiliary statistics prediction
     stats_loss_weight: float = 0.1     # weight for stats loss
-    use_contrast_loss: bool = True     # ★ M2AE风格跨模态对比 (InfoNCE, ECG↔PPG)
-    contrast_loss_weight: float = 0.1  # weight for contrastive loss
+    use_contrast_loss: bool = False    # 已被 TokenAlign 替代
+    contrast_loss_weight: float = 0.1
+    # ★ Token 级跨模态对齐 (替代 InfoNCE)
+    use_token_align: bool = True       # True=启用 (冻结 target encoder)
+    token_align_weight: float = 0.5    # 对齐损失权重
+    # ★ [已移除] WavesFM 频域掩码 (当前实现编码器不参与计算图, 无训练效果)
 
     # ── CWT Frontend (optional alternative to 1D CNN) ──
     use_cwt: bool = False              # use CWT 1D→2D frontend instead of CNN Stem
@@ -114,7 +118,7 @@ class ModelConfig:
     # ★ HiMAE 多尺度分类头 (不同疾病依赖不同时间尺度)
     use_multiscale: bool = False       # True=使用MultiScaleClassifier
     # ★ ECG+PPG 双通道融合 (CSFM: 多模态融合持续带来稳健提升)
-    use_dual_channel: bool = True      # True=使用DualChannelClassifierCoT (需ECG+PPG数据)
+    use_dual_channel: bool = True      # M2AE SimpleFusion: (B,512)+(B,512)→MLP(1024→512→256→2)
 
 
 @dataclass
@@ -148,7 +152,9 @@ class TrainConfig:
     downstream_probe_epochs: int = 10  # linear probe only (frozen encoder)
     downstream_scheduler: str = "step"  # "epoch" or "step" (step-based for warmup+cosine)
 
-    # ★ MixUp 数据增强：在batch内混合CHD和正常样本，生成更多正样本变体
+    # ★ Token 对齐续训练 (冻结 target, 训练 context 对齐到 target)
+    token_align_epochs: int = 30       # 续训练epoch
+    token_align_lr: float = 1e-4       # 续训练学习率 (比预训练小)
     use_mixup: bool = True          # True=启用MixUp
     mixup_alpha: float = 0.5        # Beta分布参数 (0.5=中等混合强度)
 
