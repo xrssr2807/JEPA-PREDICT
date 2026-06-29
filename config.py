@@ -125,7 +125,7 @@ class ModelConfig:
     use_multiscale: bool = False       # True=使用MultiScaleClassifier
     # ★ ECG+PPG 双通道融合 (CSFM: 多模态融合持续带来稳健提升)
     use_dual_channel: bool = False     # 单通道 PPG only
-    use_ecg_distill: bool = False      # ECG蒸馏 (无ECG数据，关闭)
+    use_ecg_distill: bool = False      # ECG蒸馏 (关闭, 先测纯PPG)
     distill_lambda: float = 0.3
 
 
@@ -157,7 +157,7 @@ class TrainConfig:
     downstream_lr: float = 5e-4  # FT base=5e-5 (anti-overfit)
     downstream_min_lr: float = 1e-6
     downstream_warmup_epochs: int = 5
-    downstream_probe_epochs: int = 5   # 双通道: 快速初始化后进入FT
+    downstream_probe_epochs: int = 30  # MLP probe: 充分训练分类头
     downstream_scheduler: str = "step"  # "epoch" or "step" (step-based for warmup+cosine)
 
     # ★ Token 对齐续训练 (冻结 target, 训练 context 对齐到 target)

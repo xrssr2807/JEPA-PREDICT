@@ -302,7 +302,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        all_params = list(model.parameters()) + (list(proj_ppg.parameters()) if distill_mode else [])
+        torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
         optimizer.step()
 
         if scheduler is not None and sched_mode == "batch":
@@ -494,8 +495,8 @@ def train_downstream(
 
     # ── Check for ECG蒸馏 ──
     ecg_data_dir = os.path.join(config.data.chd_ecg_dir, config.data.chd_ecg_subdir)
-    use_distill = os.path.isdir(ecg_data_dir)
-    distill_lambda = 0.3  # reduced: anti-overfit
+    use_distill = os.path.isdir(ecg_data_dir) and config.model.use_ecg_distill
+    distill_lambda = 0.1  # minimal: just prevent drift, avoid dominating
     if use_distill:
         print(f"[Distill] ★ ECG data at {ecg_data_dir} → ECG蒸馏模式 (部署仅需PPG)")
     else:
@@ -584,16 +585,18 @@ def train_downstream(
     print("=" * 60)
     model.freeze_encoder()
 
-    trainable = list(model.parameters())  # only classifier head has grad
+    trainable = list(model.parameters())
     if use_distill:
         trainable += list(proj_ppg.parameters())
     trainable = [p for p in trainable if p.requires_grad]
     probe_steps = len(train_loader)
-    probe_lr = config.train.downstream_lr * 2 if use_distill else config.train.downstream_lr
+    # 蒸馏模式: 只需1 epoch初始化投影头, 避免冻结编码器下的坍塌
+    n_probe = 1 if use_distill else config.train.downstream_probe_epochs
+    probe_lr = config.train.downstream_lr * 4 if use_distill else config.train.downstream_lr
     optimizer = AdamW(trainable, lr=probe_lr, weight_decay=1e-4)
     scheduler, sched_mode = build_scheduler(optimizer, config.train, probe_steps)
 
-    for epoch in range(config.train.downstream_probe_epochs):
+    for epoch in range(n_probe):
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion, device,
             scheduler=scheduler, sched_mode=sched_mode, is_dual=False,
@@ -621,7 +624,7 @@ def train_downstream(
     print("=" * 60)
     model.unfreeze_encoder()
 
-    ft_epochs = config.train.downstream_epochs - config.train.downstream_probe_epochs
+    ft_epochs = config.train.downstream_epochs - n_probe
     ft_lr = config.train.downstream_lr * 0.1
     ft_steps = len(train_loader)
 
