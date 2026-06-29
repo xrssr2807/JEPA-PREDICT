@@ -191,6 +191,8 @@ class JEPA(nn.Module):
         stats_loss_weight: float = 0.1,
         use_contrast_loss: bool = False,
         contrast_loss_weight: float = 1.0,
+        use_token_align: bool = False,
+        token_align_weight: float = 0.5,
         vicreg_sim_weight: float = 1.0,
         vicreg_var_weight: float = 1.0,
         vicreg_cov_weight: float = 0.04,
@@ -251,6 +253,10 @@ class JEPA(nn.Module):
     # ── New: Statistics Prediction Head ──
         self.use_stats_loss = use_stats_loss
         self.stats_loss_weight = stats_loss_weight
+        self.use_contrast_loss = use_contrast_loss
+        self.contrast_loss_weight = contrast_loss_weight
+        self.use_token_align = use_token_align
+        self.token_align_weight = token_align_weight
         if use_stats_loss:
             self.stats_pred_head = StatsPredHead(
                 in_dim=transformer_dim, hidden_dim=transformer_dim, num_stats=16
@@ -385,9 +391,6 @@ class JEPA(nn.Module):
         Args:
             token_mask: (B, 1, N) bool, True=可见位置 (来自 JETS 掩码)
         """
-        if not self.training:
-            return torch.tensor(0.0, device=ecg.device), {"token_align": 0.0}
-
         # 获取 token 序列 (不用 pooled)
         _, ecg_tokens = self.context_encoder(ecg, return_all=True)   # (B, N, D)
         _, ppg_tokens = self.target_encoder(ppg, return_all=True)    # (B, N, D)
@@ -395,8 +398,10 @@ class JEPA(nn.Module):
         # target_encoder 作为 teacher → 停止梯度 (论文核心)
         ppg_tokens = ppg_tokens.detach()
 
-        # 确保 token 数一致
+        # 确保 token 数一致 (ecg, ppg, mask可能因padding略有不同)
         min_n = min(ecg_tokens.size(1), ppg_tokens.size(1))
+        if token_mask is not None:
+            min_n = min(min_n, token_mask.size(-1))
         ecg_tokens = ecg_tokens[:, :min_n, :]
         ppg_tokens = ppg_tokens[:, :min_n, :]
 
@@ -471,15 +476,13 @@ class JEPA(nn.Module):
         elif mask_expanded.shape[-1] > L:
             mask_expanded = mask_expanded[:, :, :L]
 
-        # ★ 将patch_mask映射到CNN输出token级别
-        # CNN stride=16: 3000采样点→188token,  1000采样点→63token
-        stride = 16
-        n_tokens = L // stride
-        # 用插值把 (B,1,num_patches) 缩放到 (B,1,n_tokens)
+        # ★ Token mask: 在CNN输出维度上对应JETS掩码
+        # CNN输出维度: 3000→188, 1000→63 (verified)
+        n_tokens = ((L + 14) // 16)  # 近似公式, 覆盖padding
+        # 用插值映射patch_mask到token级别
         token_mask = F.interpolate(
             patch_mask.float(), size=n_tokens, mode='nearest'
-        ).bool()  # (B, 1, n_tokens)  True=可见
-
+        ).bool()
         return signal * mask_expanded, token_mask
 
     def compute_loss(
@@ -527,7 +530,10 @@ class JEPA(nn.Module):
             total_loss = total_loss + self.stats_loss_weight * stats_loss
             info.update(stats_info)
 
-
+        # 3. ★ Token 级跨模态对齐 (替代 InfoNCE)
+        if self.use_token_align:
+            token_loss, token_info = self._compute_token_align_loss(
+                ecg, ppg, token_mask=token_mask
             )
             total_loss = total_loss + self.token_align_weight * token_loss
             info.update(token_info)

@@ -97,6 +97,8 @@ def build_model(model_config: ModelConfig) -> JEPA:
         stats_loss_weight=model_config.stats_loss_weight,
         use_contrast_loss=model_config.use_contrast_loss,
         contrast_loss_weight=model_config.contrast_loss_weight,
+        use_token_align=model_config.use_token_align,
+        token_align_weight=model_config.token_align_weight,
         vicreg_sim_weight=model_config.vicreg_sim_weight,
         vicreg_var_weight=model_config.vicreg_var_weight,
         vicreg_cov_weight=model_config.vicreg_cov_weight,
@@ -381,6 +383,8 @@ def train_token_align(config: Config, checkpoint_path: str):
             loss = jepa_loss + model.token_align_weight * token_loss
             epoch_losses["jepa"] += jepa_loss.item()
             epoch_losses["token_align"] += token_loss.item()
+            epoch_losses["token_std"] += token_info.get("token_std", 0.0)
+            epoch_losses["visible"] += token_info.get("visible", 0.0)
             epoch_losses["total"] += loss.item()
 
             # 反向
@@ -400,11 +404,13 @@ def train_token_align(config: Config, checkpoint_path: str):
         avg_jepa = epoch_losses["jepa"] / steps_per_epoch
         avg_token = epoch_losses["token_align"] / steps_per_epoch
         avg_freq = epoch_losses.get("freq", 0) / steps_per_epoch
+        avg_std = epoch_losses.get("token_std", 0) / steps_per_epoch
+        avg_vis = epoch_losses.get("visible", 0) / steps_per_epoch
         epoch_time = time.time() - epoch_start
 
-        summary = (f"E{epoch:2d} | JEPA={avg_jepa:.4f} "
-                   f"Token={avg_token:.4f} Freq={avg_freq:.4f} "
-                   f"Total={avg_total:.4f} | Time={epoch_time:.1f}s")
+        summary = (f"E{epoch:2d} | JEPA={avg_jepa:.4f} Token={avg_token:.6f} "
+                   f"std={avg_std:.4f} vis={avg_vis:.2f} "
+                   f"Freq={avg_freq:.4f} Total={avg_total:.4f} | {epoch_time:.0f}s")
         print(summary)
         print("-" * 60)
         with open(log_file, "a") as f:
