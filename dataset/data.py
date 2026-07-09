@@ -13,6 +13,51 @@ import torch
 from torch.utils.data import Dataset
 
 
+def compute_hrv_freq_features(signal: np.ndarray, fs: int = 100) -> np.ndarray:
+    """
+    计算 HRV 频域特征 (无需 scipy, 用 numpy FFT)。
+
+    频带定义:
+      LF (低频): 0.04-0.15 Hz → 交感神经活动
+      HF (高频): 0.15-0.40 Hz → 副交感神经活动
+      LF/HF 比 → ⭐ CHD 强预警信号 (自主神经失衡)
+
+    Args:
+        signal: (L,) float32 信号
+        fs: 采样率 (Hz)
+    Returns:
+        (5,) [LF_power, HF_power, LF_HF_ratio, total_power, peak_freq]
+    """
+    s = signal.astype(np.float64)
+    n = len(s)
+
+    # FFT 功率谱密度
+    fft_vals = np.fft.rfft(s)
+    power = np.abs(fft_vals) ** 2 / n
+    freqs = np.fft.rfftfreq(n, d=1.0/fs)
+
+    # 频带功率
+    lf_mask = (freqs >= 0.04) & (freqs < 0.15)
+    hf_mask = (freqs >= 0.15) & (freqs < 0.40)
+
+    lf_power = np.sum(power[lf_mask]) if np.any(lf_mask) else 0.0
+    hf_power = np.sum(power[hf_mask]) if np.any(hf_mask) else 0.0
+    total_power = lf_power + hf_power
+    lf_hf_ratio = lf_power / max(hf_power, 1e-12)
+
+    # 峰值频率 (功率最大的频点)
+    valid_range = (freqs >= 0.04) & (freqs <= 0.4)
+    if np.any(valid_range):
+        peak_idx = np.argmax(power[valid_range])
+        peak_freq = freqs[valid_range][peak_idx]
+    else:
+        peak_freq = 0.0
+
+    stats = np.array([lf_power, hf_power, lf_hf_ratio, total_power, peak_freq], dtype=np.float32)
+    stats = np.nan_to_num(stats, nan=0.0, posinf=0.0, neginf=0.0)
+    return stats
+
+
 def compute_signal_stats(signal: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     """
     Compute 16 physiological-statistics from a 1D signal (no scipy needed).
@@ -307,16 +352,11 @@ class DownstreamDataset(Dataset):
         split: str = "train",
         normalize: str = "zscore",
         normalize_clip: float = 10.0,
-        binary_abnormal: bool = False,  # True: class 0→0, class 1-5→1
-        signal_quality_gate: float = 0.0,  # ★ SQI阈值：低于此值样本被跳过 (0=关闭)
-        target_length: int = None,          # 信号对齐：插值到目标长度 (如1000→3000)
+        binary_abnormal: bool = False,
+        signal_quality_gate: float = 0.0,
+        target_length: int = None,
+        return_hrv: bool = False,  # ★ 返回 HRV 频域特征用于下游分类
     ):
-        """
-        Args:
-            ...
-            signal_quality_gate: SQI阈值 (0~1), 低于此值样本被跳过 (0=关闭)
-            target_length: 如果设置，线性插值到目标长度，匹配预训练输入尺度
-        """
         import json
 
         self.data_dir = data_dir
@@ -325,6 +365,7 @@ class DownstreamDataset(Dataset):
         self.binary_abnormal = binary_abnormal
         self.target_length = target_length
         self.signal_quality_gate = signal_quality_gate
+        self.return_hrv = return_hrv
 
         with open(split_file, "r") as f:
             split_data = json.load(f)
@@ -400,10 +441,18 @@ class DownstreamDataset(Dataset):
         label = sample["label"][0]["class"]  # int
         uid = str(sample.get("uid", f"unknown_{idx}"))  # 患者ID
 
+        # ★ HRV 频域特征 (在归一化后的信号上计算)
+        hrv_feats = None
+        if self.return_hrv:
+            hrv_feats = compute_hrv_freq_features(data, fs=100)
+            hrv_feats = torch.from_numpy(hrv_feats).float()  # (5,)
+
         # Binary abnormal remapping: 0→0(normal), 1-5→1(abnormal)
         if self.binary_abnormal:
             label = 0 if label == 0 else 1
 
+        if self.return_hrv:
+            return torch.from_numpy(data).float().unsqueeze(0), label, uid, hrv_feats  # (1,1000), scalar, str, (5,)
         return torch.from_numpy(data).float().unsqueeze(0), label, uid  # (1, 1000), scalar, str
 
 

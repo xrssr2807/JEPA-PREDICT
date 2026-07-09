@@ -130,6 +130,8 @@ class ModelConfig:
     use_multiscale: bool = False       # True=使用MultiScaleClassifier
     # ★ ECG+PPG 双通道融合 (CSFM: 多模态融合持续带来稳健提升)
     use_dual_channel: bool = False     # 单通道 PPG only
+    # ★ HRV 频域特征增强 (验证 LF/HF 对 CHD 分类的贡献)
+    use_hrv: bool = True               # True=编码器嵌入+HRV频域特征→MLP
     use_ecg_distill: bool = False      # ECG蒸馏 (关闭, 先测纯PPG)
     use_cotrain: bool = True           # ★ ECG+PPG协同训练 (共享分类头, 部署仅需PPG)
     use_dual_channel: bool = True      # ★ ECG+PPG concat融合 (AUC 0.79)

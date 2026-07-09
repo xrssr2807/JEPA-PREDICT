@@ -613,3 +613,58 @@ class SimpleFusion(nn.Module):
         # 拼接 + 分类
         fused = torch.cat([e, p], dim=-1)  # (B, 1024)
         return self.fusion(fused)
+
+
+class HRVClassifier(nn.Module):
+    """
+    编码器嵌入 + HRV 频域特征融合分类器。
+
+    验证 HRV 频域特征 (LF/HF/LF_HF_ratio) 对 CHD 分类是否有帮助。
+    嵌入来自预训练编码器, HRV 特征从原始信号 FFT 计算——两者互补。
+
+    encoder_embedding (B, 512) ─┐
+                                 ├→ concat → MLP(517→256→128→2)
+    HRV_freq_features (B, 5) ───┘
+    """
+
+    def __init__(self, encoder, encoder_dim=512, hrv_dim=5, num_classes=2):
+        super().__init__()
+        self.encoder = encoder
+        total_dim = encoder_dim + hrv_dim  # 512 + 5 = 517
+
+        self.classifier = nn.Sequential(
+            nn.Linear(total_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes),
+        )
+
+    def freeze_encoder(self):
+        for p in self.encoder.parameters():
+            p.requires_grad = False
+
+    def unfreeze_encoder(self):
+        for p in self.encoder.parameters():
+            p.requires_grad = True
+
+    def forward(self, x, hrv_feats=None):
+        """
+        Args:
+            x: (B, 1, L) PPG 信号
+            hrv_feats: (B, 5) HRV 频域特征 或 None (evaluate 时可能无)
+        """
+        embed, _ = self.encoder(x)  # (B, 512)
+        if hrv_feats is not None:
+            embed = torch.cat([embed, hrv_feats.to(embed.device)], dim=-1)  # (B, 517)
+        return self.classifier(embed)
+
+    # 兼容 evaluate: 支持 return_embedding 参数
+    def forward_eval(self, x):
+        """仅用编码器嵌入分类 (无 HRV 特征时的评估模式)."""
+        embed, _ = self.encoder(x)
+        return self.classifier(embed)

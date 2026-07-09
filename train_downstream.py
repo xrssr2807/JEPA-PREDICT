@@ -39,6 +39,7 @@ from models.encoder import SignalEncoder
 from models.classifier import (
     SignalClassifier, DualChannelClassifier,
     SignalClassifierCoT, DualChannelClassifierCoT,
+    HRVClassifier,
 )
 from models.losses import build_criterion, compute_pos_weight
 
@@ -50,6 +51,7 @@ def build_downstream_dataloaders(
     train_config: TrainConfig,
     dataset: str = "chd",
     use_dual: bool = False,
+    return_hrv: bool = False,
 ) -> tuple:
     """Build train and test dataloaders for downstream fine-tuning."""
     binary_abnormal = (dataset == "arrhythmia_binary")
@@ -73,6 +75,7 @@ def build_downstream_dataloaders(
         binary_abnormal=binary_abnormal,
         signal_quality_gate=data_config.signal_quality_gate,
         target_length=target_len,
+        return_hrv=return_hrv,
     )
     ppg_test = DownstreamDataset(
         data_dir=ppg_dir, split_file=split_file, split="test",
@@ -80,6 +83,7 @@ def build_downstream_dataloaders(
         binary_abnormal=binary_abnormal,
         signal_quality_gate=data_config.signal_quality_gate,
         target_length=target_len,
+        return_hrv=return_hrv,
     )
 
     if use_dual and ecg_dir is not None:
@@ -261,7 +265,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                 distill_mode=False, ecg_encoder=None,
                 proj_ppg=None, proj_ecg=None,
                 ecg_loader=None, distill_lambda=0.5,
-                cotrain_mode=False, ecg_model=None, classifier=None):
+                cotrain_mode=False, ecg_model=None, classifier=None,
+                use_hrv=False):
     """Single training epoch with optional ECG distillation."""
     model.train()
     if distill_mode:
@@ -279,13 +284,17 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
             logits = model(ecg, ppg)
             loss = criterion(logits, labels)
         else:
-            if len(batch) >= 3:
-                x, labels, *_ = batch
+            hrv_feats = None
+            if len(batch) >= 4:
+                x, labels, _, hrv_feats = batch
+            elif len(batch) == 3:
+                x, labels, _ = batch
             else:
                 x, labels = batch
             x, labels = x.to(device), labels.to(device)
-
-            if distill_mode:
+            if use_hrv and hrv_feats is not None:
+                logits = model(x, hrv_feats.to(device))
+            elif distill_mode:
                 # PPG forward with embedding for alignment
                 logits, ppg_pooled = model(x, return_embedding=True)
                 cls_loss = criterion(logits, labels)
@@ -376,14 +385,19 @@ def evaluate(model, dataloader, criterion, device, num_classes: int,
             logits = model(ecg, ppg)
             uids = batch[3] if len(batch) >= 4 else None
         else:
-            if len(batch) >= 3:
-                x, labels, *rest = batch
-                uids = rest[0] if rest else None
+            hrv_feats = None
+            if len(batch) >= 4:
+                x, labels, uids, hrv_feats = batch
+            elif len(batch) == 3:
+                x, labels, uids = batch
             else:
                 x, labels = batch
                 uids = None
             x, labels = x.to(device), labels.to(device)
-            logits = model(x)
+            if hrv_feats is not None:
+                logits = model(x, hrv_feats.to(device))
+            else:
+                logits = model(x)
 
         loss = criterion(logits, labels)
         running_loss += loss.item()
@@ -534,8 +548,10 @@ def train_downstream(
         print(f"[SingleChannel] No ECG data at {ecg_data_dir} → PPG only")
 
     # Data
+    return_hrv = config.model.use_hrv
     train_loader, test_loader, train_ds, test_ds = build_downstream_dataloaders(
         config.data, config.train, dataset, use_dual=use_dual,
+        return_hrv=return_hrv,
     )
 
     # ── ECG mode setup ──
@@ -613,7 +629,13 @@ def train_downstream(
     # Build classifier (skip if dual-channel already created above)
     if not use_dual and not use_distill and not use_cotrain:
         # Pure PPG single-channel
-        if config.model.use_cot_head:
+        if config.model.use_hrv:
+            print("[Model] ★ HRV 频域特征增强分类头 (编码器嵌入+LF/HF)")
+            model = HRVClassifier(
+                encoder=encoder, encoder_dim=config.model.transformer_dim,
+                hrv_dim=5, num_classes=num_classes,
+            ).to(device)
+        elif config.model.use_cot_head:
             print("[Model] CoT classification head")
             model = SignalClassifierCoT(
                 encoder=encoder, encoder_dim=config.model.transformer_dim,
@@ -695,7 +717,7 @@ def train_downstream(
                 ecg_loader=ecg_train_loader, distill_lambda=distill_lambda,
                 cotrain_mode=use_cotrain, ecg_model=ecg_encoder,
                 classifier=model.classifier if use_cotrain else None,
-            )
+                use_hrv=return_hrv,
             test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate(
                 model, test_loader, criterion, device, num_classes, is_dual=use_dual,
             )
