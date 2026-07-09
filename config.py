@@ -30,6 +30,7 @@ class DataConfig:
 
     # ★ 信号质量门控：过滤低质量PPG样本 (PPG BP综述: 使用SQA后精度提升19-24%)
     signal_quality_gate: float = 0.0  # 0=关闭 (SQI对CHD数据过滤过严)
+    signal_align_to: int = 0  # 下游信号对齐到预训练长度 (0=不对齐)
 
     # Augmentation (PhysioAugment — applied to ECG context signal)
     use_augment: bool = False
@@ -88,17 +89,26 @@ class ModelConfig:
 
     # ── JETS 式掩码策略 ──
     # 随机掩码信号patch，强制编码器从局部信息学习全局表征
-    jets_mask_ratio: float = 0.7   # 0=关闭, 0.7=保留30%patch（JETS推荐值）
+    jets_mask_ratio: float = 0.6   # 0=关闭, 0.6=保留40%patch（从0.7调低）
     jets_mask_patch_size: int = 50 # 每个patch的采样点数 (3000/50=60个patch, 下游1000/50=20个patch)
 
     # ── Auxiliary losses (from CWT-MAE v3) ──
-    use_stats_loss: bool = False       # auxiliary statistics prediction
+    use_stats_loss: bool = True        # auxiliary statistics prediction (Apple-style)
     stats_loss_weight: float = 0.1     # weight for stats loss
-    use_contrast_loss: bool = True     # ★ M2AE InfoNCE: ECG↔PPG 跨模态对比
-    contrast_loss_weight: float = 0.1  # 0.1: 辅助正则, 不让对比主导学习
-    vicreg_sim_weight: float = 1.0     # 不变性: MSE(ECG, PPG)
-    vicreg_var_weight: float = 1.0     # 方差: 防止维度坍缩
-    vicreg_cov_weight: float = 0.04    # 协方差: 去冗余
+    use_contrast_loss: bool = False    # M2AE 已移除, 用 Token Align 替代
+    contrast_loss_weight: float = 0.1
+    # Token级对齐
+    use_token_align: bool = False      # 额外前传吃显存，关闭
+    token_align_weight: float = 0.5
+    use_freq_loss: bool = False        # 频谱损失 (Token Align可选)
+    freq_loss_weight: float = 0.1      # 频谱损失权重
+    vicreg_sim_weight: float = 1.0     # (保留, 未使用)
+    vicreg_var_weight: float = 1.0
+    vicreg_cov_weight: float = 0.04
+
+    # ── CNN 增强 ──
+    cnn_use_se: bool = True            # SE Block 通道注意力
+    cnn_use_inception: bool = True     # Inception 残差多尺度 (alpha=0.2)
 
     # ── CWT Frontend (optional alternative to 1D CNN) ──
     use_cwt: bool = False              # use CWT 1D→2D frontend instead of CNN Stem
@@ -108,7 +118,7 @@ class ModelConfig:
     cwt_patch_time: int = 25           # patch size in time dimension
 
     # ── Downstream ──
-    use_cot_head: bool = True          # Chain-of-Thought classification head
+    use_cot_head: bool = False         # CoT collapses with frozen encoder
     cot_tokens: int = 16               # number of reasoning tokens
     use_layerwise_lr: bool = False     # uniform LR (避免CoT坍塌)
     layer_decay: float = 0.85          # softened decay (was 0.75)
@@ -120,8 +130,10 @@ class ModelConfig:
     use_multiscale: bool = False       # True=使用MultiScaleClassifier
     # ★ ECG+PPG 双通道融合 (CSFM: 多模态融合持续带来稳健提升)
     use_dual_channel: bool = False     # 单通道 PPG only
-    use_ecg_distill: bool = True       # ★ ECG蒸馏: 训练时ECG辅助, 部署仅PPG
-    distill_lambda: float = 0.3        # 蒸馏对齐权重
+    use_ecg_distill: bool = False      # ECG蒸馏 (关闭, 先测纯PPG)
+    use_cotrain: bool = True           # ★ ECG+PPG协同训练 (共享分类头, 部署仅需PPG)
+    use_dual_channel: bool = True      # ★ ECG+PPG concat融合 (AUC 0.79)
+    distill_lambda: float = 0.3
 
 
 @dataclass
@@ -129,8 +141,8 @@ class TrainConfig:
     """Training hyperparameters."""
 
     # Pre-training
-    pretrain_epochs: int = 200
-    pretrain_batch_size: int = 160
+    pretrain_epochs: int = 150
+    pretrain_batch_size: int = 240
     pretrain_lr: float = 5e-4
     pretrain_warmup_epochs: int = 5  # shorter warmup → earlier cosine decay
     pretrain_weight_decay: float = 0.05
@@ -147,15 +159,17 @@ class TrainConfig:
     ema_schedule: str = "cosine"  # cosine schedule for target encoder momentum
 
     # Downstream
-    downstream_epochs: int = 50
+    downstream_epochs: int = 100
     downstream_batch_size: int = 128
-    downstream_lr: float = 3e-3  # increased from 1e-3
+    downstream_lr: float = 5e-4  # FT base=5e-5 (anti-overfit)
     downstream_min_lr: float = 1e-6
     downstream_warmup_epochs: int = 5
-    downstream_probe_epochs: int = 30  # ECGFounder-PT: 充分收敛分类头
+    downstream_probe_epochs: int = 30   # 信号对齐后跳过probe, 直接FT
     downstream_scheduler: str = "step"  # "epoch" or "step" (step-based for warmup+cosine)
 
-    # ★ MixUp 数据增强：在batch内混合CHD和正常样本，生成更多正样本变体
+    # ★ Token 对齐续训练 (冻结 target, 训练 context 对齐到 target)
+    token_align_epochs: int = 50       # 续训练epoch
+    token_align_lr: float = 1e-4       # 续训练学习率 (比预训练小)
     use_mixup: bool = True          # True=启用MixUp
     mixup_alpha: float = 0.5        # Beta分布参数 (0.5=中等混合强度)
 

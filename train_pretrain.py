@@ -4,6 +4,7 @@ JEPA Pre-training: ECG → PPG cross-channel predictive learning.
 import os
 import math
 import time
+import numpy as np
 from collections import defaultdict
 
 import torch
@@ -97,6 +98,10 @@ def build_model(model_config: ModelConfig) -> JEPA:
         stats_loss_weight=model_config.stats_loss_weight,
         use_contrast_loss=model_config.use_contrast_loss,
         contrast_loss_weight=model_config.contrast_loss_weight,
+        use_se=model_config.cnn_use_se,
+        use_inception=model_config.cnn_use_inception,
+        use_token_align=model_config.use_token_align,
+        token_align_weight=model_config.token_align_weight,
         vicreg_sim_weight=model_config.vicreg_sim_weight,
         vicreg_var_weight=model_config.vicreg_var_weight,
         vicreg_cov_weight=model_config.vicreg_cov_weight,
@@ -200,6 +205,13 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
             ecg = ecg.to(device)
             ppg = ppg.to(device)
 
+            # ★ MixUp: 随机混合batch内样本 → 正则化
+            if config.train.use_mixup and config.train.mixup_alpha > 0:
+                lam = np.random.beta(config.train.mixup_alpha, config.train.mixup_alpha)
+                idx = torch.randperm(ecg.size(0), device=device)
+                ecg = lam * ecg + (1 - lam) * ecg[idx]
+                ppg = lam * ppg + (1 - lam) * ppg[idx]
+
             global_step = epoch * steps_per_epoch + batch_idx
 
             # EMA momentum schedule (cosine towards 1.0)
@@ -280,6 +292,158 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
     return model
 
 
+def train_token_align(config: Config, checkpoint_path: str):
+    """
+    Token 对齐续训练 (方案A).
+    加载已预训练的 checkpoint → 冻结 target_encoder → 只训练 context_encoder
+    逐 token 对齐: ECG_token_i ↔ PPG_token_i
+
+    论文: Cross-Modal Representational KD (NeurIPS 2025)
+    替代: M2AE InfoNCE 对比损失
+    """
+    device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+    print(f"\n{'='*60}")
+    print("★ Token 级跨模态对齐续训练 (方案A)")
+    print(f"{'='*60}")
+    print(f"Device: {device}")
+
+    # Data
+    dataloader = build_dataloader(config.data, config.train, config.model)
+    steps_per_epoch = len(dataloader)
+    total_steps = steps_per_epoch * config.train.token_align_epochs
+    print(f"Data: {len(dataloader.dataset)} samples, {steps_per_epoch} steps/epoch")
+
+    # Model
+    model = build_model(config.model).to(device)
+
+    # 加载完整 checkpoint
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    if "model_state_dict" in ckpt:
+        model.load_state_dict(ckpt["model_state_dict"])
+        print(f"[Load] Full model state from {checkpoint_path}")
+    else:
+        model.context_encoder.load_state_dict(ckpt["context_encoder"])
+        model.target_encoder.load_state_dict(ckpt["target_encoder"])
+        model.context_proj.load_state_dict(ckpt["context_proj"])
+        model.target_proj.load_state_dict(ckpt["target_proj"])
+        print(f"[Load] Encoder weights from {checkpoint_path}")
+
+    # ★ 冻结 target_encoder (做 teacher, 不更新)
+    model.freeze_target_encoder()
+
+    # ★ 开启 Token 对齐模式 (替代 InfoNCE)
+    model.use_token_align = True
+    model.token_align_weight = config.model.token_align_weight
+    print(f"[TokenAlign] weight={model.token_align_weight}")
+    # ★ 开启频域掩码 (WavesFM)
+    model.use_freq_loss = config.model.use_freq_loss
+    model.freq_loss_weight = config.model.freq_loss_weight
+    if model.use_freq_loss:
+        print(f"[FreqMask] weight={model.freq_loss_weight}")
+
+    # 只优化 context_encoder + predictor (target 冻结)
+    trainable_params = list(model.context_encoder.parameters()) + \
+                       list(model.context_proj.parameters()) + \
+                       list(model.predictor.parameters())
+    optimizer = AdamW(
+        trainable_params,
+        lr=config.train.token_align_lr,
+        betas=(config.train.beta1, config.train.beta2),
+        weight_decay=config.train.pretrain_weight_decay,
+    )
+    print(f"Trainable params: {sum(p.numel() for p in trainable_params):,}")
+
+    # LR schedule: warmup + cosine
+    warmup_steps = min(200, total_steps // 20)
+    cosine_steps = total_steps - warmup_steps
+    warmup = LinearLR(optimizer, start_factor=0.01, total_iters=max(1, warmup_steps))
+    cosine = CosineAnnealingLR(optimizer, T_max=max(1, cosine_steps))
+    scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[max(1, warmup_steps)])
+
+    # Logging
+    os.makedirs(config.output_dir, exist_ok=True)
+    log_file = os.path.join(config.output_dir, "token_align_log.txt")
+    best_loss = float("inf")
+
+    for epoch in range(config.train.token_align_epochs):
+        model.train()
+        epoch_losses = defaultdict(float)
+        epoch_start = time.time()
+
+        for batch_idx, batch_data in enumerate(dataloader):
+            if len(batch_data) == 3:
+                ecg, ppg, ecg_stats = batch_data
+            else:
+                ecg, ppg = batch_data
+                ecg_stats = None
+            ecg, ppg = ecg.to(device), ppg.to(device)
+
+            # 前向: JETS 掩码 → 获取可见 token 位置
+            ecg_masked, token_mask = model._apply_jets_mask(ecg)
+            token_loss, token_info = model._compute_token_align_loss(
+                ecg_masked, ppg, token_mask=token_mask
+            )
+
+            # JEPA 预测损失 (保持)
+            context_embed = model.forward_context(ecg_masked)
+            target_embed = model.forward_target(ppg)
+            jepa_loss, jepa_info = model._compute_jepa_loss(ecg, ppg, context_embed, target_embed)
+
+            # 总损失 (DWT 频域已移除: 编码器不参与计算图, 无训练效果)
+            loss = jepa_loss + model.token_align_weight * token_loss
+            epoch_losses["jepa"] += jepa_loss.item()
+            epoch_losses["token_align"] += token_loss.item()
+            epoch_losses["token_std"] += token_info.get("token_std", 0.0)
+            epoch_losses["visible"] += token_info.get("visible", 0.0)
+            epoch_losses["total"] += loss.item()
+
+            # 反向
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+
+            if batch_idx % 50 == 0:
+                print(f"E{epoch:3d} B{batch_idx:4d}/{steps_per_epoch} | "
+                      f"JEPA={jepa_loss.item():.4f} Token={token_loss.item():.4f} "
+                      f"Total={loss.item():.4f} | LR={scheduler.get_last_lr()[0]:.2e}")
+
+        # Epoch summary
+        avg_total = epoch_losses["total"] / steps_per_epoch
+        avg_jepa = epoch_losses["jepa"] / steps_per_epoch
+        avg_token = epoch_losses["token_align"] / steps_per_epoch
+        avg_freq = epoch_losses.get("freq", 0) / steps_per_epoch
+        avg_std = epoch_losses.get("token_std", 0) / steps_per_epoch
+        avg_vis = epoch_losses.get("visible", 0) / steps_per_epoch
+        epoch_time = time.time() - epoch_start
+
+        summary = (f"E{epoch:2d} | JEPA={avg_jepa:.4f} Token={avg_token:.6f} "
+                   f"std={avg_std:.4f} vis={avg_vis:.2f} "
+                   f"Freq={avg_freq:.4f} Total={avg_total:.4f} | {epoch_time:.0f}s")
+        print(summary)
+        print("-" * 60)
+        with open(log_file, "a") as f:
+            f.write(summary + "\n")
+
+        # Save best
+        if avg_total < best_loss:
+            best_loss = avg_total
+            ckpt_path = os.path.join(config.output_dir, "jepa_token_align_best.pt")
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "context_encoder": model.context_encoder.state_dict(),
+                "target_encoder": model.target_encoder.state_dict(),
+                "loss": avg_total,
+            }, ckpt_path)
+            print(f"Saved best → {ckpt_path}")
+
+    print(f"\nToken 对齐续训练完成! 最佳 loss = {best_loss:.4f}")
+    print(f"输出: {os.path.join(config.output_dir, 'jepa_token_align_best.pt')}")
+    return model
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="JEPA Pre-training")
@@ -287,7 +451,15 @@ if __name__ == "__main__":
                         help="Resume from checkpoint path")
     parser.add_argument("--start_epoch", type=int, default=0,
                         help="Epoch to start/resume from")
+    parser.add_argument("--token_align", type=str, default=None,
+                        help="Token 对齐续训练: --token_align outputs/jepa_best.pt")
     args = parser.parse_args()
 
     config = Config()
-    train(config, resume_from=args.resume, start_epoch=args.start_epoch)
+
+    if args.token_align is not None:
+        # ★ Token 对齐续训练模式
+        train_token_align(config, args.token_align)
+    else:
+        # 正常预训练
+        train(config, resume_from=args.resume, start_epoch=args.start_epoch)

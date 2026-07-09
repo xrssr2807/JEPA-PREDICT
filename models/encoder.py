@@ -45,14 +45,51 @@ class SinusoidalPositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+# ─── SE Block (通道注意力) ──────────────────────────────────────
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation: 自适应通道加权 (SENet CVPR 2018)."""
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Conv1d(channels, channels // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(channels // reduction, channels, 1),
+            nn.Sigmoid(),
+        )
+    def forward(self, x):
+        return x * self.gate(x)
+
+# ─── Inception Block (残差多尺度) ──────────────────────────────────
+class InceptionResidual(nn.Module):
+    """多尺度并行Conv → 求和融合 → 残差叠加. alpha控制增量强度."""
+    def __init__(self, channels: int, stride: int, alpha: float = 0.3):
+        super().__init__()
+        self.alpha = alpha
+        self.branch_k3 = nn.Sequential(
+            nn.Conv1d(channels, channels, 3, stride=stride, padding=1, groups=channels),
+            nn.Conv1d(channels, channels, 1),
+            nn.BatchNorm1d(channels), nn.ReLU(inplace=True))
+        self.branch_k7 = nn.Sequential(
+            nn.Conv1d(channels, channels, 7, stride=stride, padding=3, groups=channels),
+            nn.Conv1d(channels, channels, 1),
+            nn.BatchNorm1d(channels), nn.ReLU(inplace=True))
+        self.branch_k15 = nn.Sequential(
+            nn.Conv1d(channels, channels, 15, stride=stride, padding=7, groups=channels),
+            nn.Conv1d(channels, channels, 1),
+            nn.BatchNorm1d(channels), nn.ReLU(inplace=True))
+
+    def forward(self, x):
+        f = self.branch_k3(x) + self.branch_k7(x) + self.branch_k15(x)
+        return self.alpha * f
+
 # ─── CNN Stem ──────────────────────────────────────────────────────
 class CNNStem(nn.Module):
     """
-    1D CNN backbone for physiological signal feature extraction.
+    1D CNN backbone + 可选 Inception残差 + SE注意力.
 
     Default config (4 blocks, stride=2 each):
         (B, 1, 3000) → (B, 64, 1500) → (B, 128, 750) → (B, 256, 375) → (B, 256, 188)
-        (B, 1, 1000) → (B, 64, 500)  → (B, 128, 250) → (B, 256, 125) → (B, 256, 63)
     """
 
     def __init__(
@@ -61,6 +98,8 @@ class CNNStem(nn.Module):
         channels: Tuple[int, ...] = (64, 128, 256, 256),
         kernel_sizes: Tuple[int, ...] = (7, 5, 5, 3),
         strides: Tuple[int, ...] = (2, 2, 2, 2),
+        use_se: bool = True,
+        use_inception: bool = True,
     ):
         super().__init__()
 
@@ -69,29 +108,36 @@ class CNNStem(nn.Module):
             f"kernels={len(kernel_sizes)}, strides={len(strides)}"
         )
 
-        layers = []
+        self.conv_blocks = nn.ModuleList()
+        self.se_blocks = nn.ModuleList()
+        self.inception_blocks = nn.ModuleList()
         in_ch = in_channels
 
         for i, (out_ch, k, s) in enumerate(zip(channels, kernel_sizes, strides)):
             padding = k // 2
-            layers.extend([
+            self.conv_blocks.append(nn.Sequential(
                 nn.Conv1d(in_ch, out_ch, kernel_size=k, stride=s, padding=padding),
                 nn.BatchNorm1d(out_ch),
                 nn.ReLU(inplace=True),
-            ])
+            ))
+            # 残差Inception: 叠加在Conv输出上
+            if use_inception and out_ch >= 128:
+                self.inception_blocks.append(InceptionResidual(out_ch, stride=1, alpha=0.2))
+            else:
+                self.inception_blocks.append(None)
+            # SE 通道注意力
+            self.se_blocks.append(SEBlock(out_ch) if use_se else nn.Identity())
             in_ch = out_ch
 
-        self.conv = nn.Sequential(*layers)
         self.out_channels = channels[-1]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, in_channels, L)
-        Returns:
-            (B, out_channels, L_out)
-        """
-        return self.conv(x)
+        for conv, inc, se in zip(self.conv_blocks, self.inception_blocks, self.se_blocks):
+            x = conv(x)
+            if inc is not None:
+                x = x + inc(x)  # ★ 残差: Conv主路径 + Inception增量
+            x = se(x)
+        return x
 
 
 # ─── Transformer Encoder ───────────────────────────────────────────
@@ -190,6 +236,8 @@ class SignalEncoder(nn.Module):
         max_seq_len: int = 200,
         pool_type: str = "adaptive_avg",
         layerdrop: float = 0.0,
+        use_se: bool = False,
+        use_inception: bool = False,
     ):
         super().__init__()
 
@@ -198,6 +246,8 @@ class SignalEncoder(nn.Module):
             channels=cnn_channels,
             kernel_sizes=cnn_kernel_sizes,
             strides=cnn_strides,
+            use_se=use_se,
+            use_inception=use_inception,
         )
 
         self.pos_encoding = SinusoidalPositionalEncoding(

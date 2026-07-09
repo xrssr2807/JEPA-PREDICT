@@ -548,3 +548,68 @@ class MultiScaleClassifier(nn.Module):
         logits = self.classifier(out)
 
         return logits
+
+
+class SimpleFusion(nn.Module):
+    """
+    ★ M2AE 风格简单融合分类头 (替代 DualChannelClassifierCoT)。
+
+    论文 "Biosignal Fingerprinting" (Oxford, 2026) 的核心设计:
+    - 不用 token 拼接 (防止注意力稀释)
+    - 每个编码器输出 pooled (B, 512) → concat → MLP
+
+    ECG → Encoder → AvgPool → (B, 512) ─┐
+                                          ├→ concat(1024) → BN → GELU → 256 → 分类
+    PPG → Encoder → AvgPool → (B, 512) ─┘
+    """
+
+    def __init__(
+        self,
+        ecg_encoder: SignalEncoder,
+        ppg_encoder: SignalEncoder,
+        encoder_dim: int = 512,
+        num_classes: int = 2,
+    ):
+        super().__init__()
+        self.ecg_encoder = ecg_encoder
+        self.ppg_encoder = ppg_encoder
+
+        self.fusion = nn.Sequential(
+            nn.Linear(encoder_dim * 2, encoder_dim),  # 1024→512
+            nn.BatchNorm1d(encoder_dim),
+            nn.GELU(),
+            nn.Linear(encoder_dim, encoder_dim // 2),  # 512→256
+            nn.BatchNorm1d(encoder_dim // 2),
+            nn.GELU(),
+            nn.Linear(encoder_dim // 2, num_classes),
+        )
+
+    def freeze_encoder(self):
+        """冻结两个编码器 (线性探测模式)."""
+        for p in self.ecg_encoder.parameters():
+            p.requires_grad = False
+        for p in self.ppg_encoder.parameters():
+            p.requires_grad = False
+
+    def unfreeze_encoder(self):
+        """解冻两个编码器 (全微调模式)."""
+        for p in self.ecg_encoder.parameters():
+            p.requires_grad = True
+        for p in self.ppg_encoder.parameters():
+            p.requires_grad = True
+
+    def forward(self, ecg: torch.Tensor, ppg: torch.Tensor):
+        """
+        Args:
+            ecg: (B, 1, L) — ECG 信号
+            ppg: (B, 1, L) — PPG 信号
+        Returns:
+            logits: (B, num_classes)
+        """
+        # 两个编码器各自输出 pooled embedding
+        e, _ = self.ecg_encoder(ecg)  # (B, 512)
+        p, _ = self.ppg_encoder(ppg)  # (B, 512)
+
+        # 拼接 + 分类
+        fused = torch.cat([e, p], dim=-1)  # (B, 1024)
+        return self.fusion(fused)
