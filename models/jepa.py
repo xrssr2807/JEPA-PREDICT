@@ -284,16 +284,23 @@ class JEPA(nn.Module):
         ema_update(self.context_proj, self.target_proj, momentum)
         # ★ M2AE 对比学习不需要EMA更新投影头（共享投影头无teacher）
 
-    def forward_context(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode context signal (ECG). Returns pooled embedding."""
-        embed, _ = self.context_encoder(x)
+    def forward_context(self, x: torch.Tensor, return_tokens: bool = False):
+        """Encode context signal (ECG).
+        Args:
+            return_tokens: True 时返回 (pooled, tokens)，减少二次前向
+        """
+        embed, tokens = self.context_encoder(x, return_all=return_tokens)
+        if return_tokens:
+            return embed, tokens
         return embed  # (B, transformer_dim)
 
-    def forward_target(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_target(self, x: torch.Tensor, return_tokens: bool = False):
         """Encode target signal (PPG). Returns projected embedding (no grad)."""
         with torch.no_grad():
-            embed, _ = self.target_encoder(x)
+            embed, tokens = self.target_encoder(x, return_all=return_tokens)
             embed = self.target_proj(embed)
+        if return_tokens:
+            return embed, tokens
         return embed  # (B, embedding_dim)
 
     def forward(
@@ -385,28 +392,31 @@ class JEPA(nn.Module):
         l2 = F.cross_entropy(logits.t(), labels)
         return (l1+l2)/2, {"contrast": (l1+l2).item()/2}
 
-    def _compute_token_align_loss(self, ecg, ppg, token_mask=None,
-                                   align_window=3, soft_temperature=0.1):
+    def _compute_token_align_loss(self, ecg=None, ppg=None, token_mask=None,
+                                   align_window=3, soft_temperature=0.1,
+                                   cached_ctx_tokens=None, cached_tgt_tokens=None):
         """
-        ★ Soft-DTW 风格弹性 Token 对齐 (替代原先的硬对齐).
+        ★ Soft-DTW 风格弹性 Token 对齐.
 
-        文档明确指出:
-          "Soft-DTW 允许模型在一定的时间窗口内拉伸或压缩序列,
-           寻找形态最相似的波峰进行匹配,完美吸收 PTT 波动"
+        文档指出: Soft-DTW 允许弹性匹配, 完美吸收 PTT 生理波动。
+        ECG_token_i → PPG_window[i-3..i+3] → softmax 加权 (非硬对齐).
 
-        ECG 的 R 波和 PPG 的收缩峰之间有 ~200ms 生理延迟 (PTT),
-        对应约 2 个 token (stride=16, 100Hz)。
-        align_window=3 覆盖 ±300ms,足够容纳 PTT 变化。
+        关键优化: 使用 cached_tokens, 避免二次前向导致 OOM。
 
         Args:
+            cached_ctx_tokens: (B, N, D) 缓存的 context encoder token 序列
+            cached_tgt_tokens: (B, N, D) 缓存的 target encoder token 序列
             token_mask: (B, 1, N) bool, True=可见位置
-            align_window: 单侧搜索窗口 (±N token, 覆盖 PTT 生理范围)
-            soft_temperature: softmax 温度, 越低对齐越"硬"
+            align_window: 单侧搜索窗口 (±3 ≈ ±300ms, 覆盖 PTT)
         """
-        _, ecg_tokens = self.context_encoder(ecg, return_all=True)   # (B, N, D)
-        _, ppg_tokens = self.target_encoder(ppg, return_all=True)    # (B, N, D)
-
-        ppg_tokens = ppg_tokens.detach()  # teacher 停止梯度
+        if cached_ctx_tokens is not None and cached_tgt_tokens is not None:
+            ecg_tokens = cached_ctx_tokens
+            ppg_tokens = cached_tgt_tokens.detach()
+        else:
+            # 兜底: 无缓存时跑前向 (不常用)
+            _, ecg_tokens = self.context_encoder(ecg, return_all=True)
+            _, ppg_tokens = self.target_encoder(ppg, return_all=True)
+            ppg_tokens = ppg_tokens.detach()
 
         min_n = min(ecg_tokens.size(1), ppg_tokens.size(1))
         if token_mask is not None:
@@ -537,11 +547,15 @@ class JEPA(nn.Module):
         # ★ JETS 式掩码：随机丢弃 ~70% patch，强制编码器从局部学习全局表征
         ecg_masked, token_mask = self._apply_jets_mask(ecg)
 
-        # Get context embedding from MASKED ecg
-        context_embed = self.forward_context(ecg_masked)  # (B, transformer_dim)
-
-        # Get target embedding from FULL ppg (不作为掩码)
-        target_embed = self.forward_target(ppg)  # (B, embedding_dim)
+        # ★ 一次前向同时拿 pooled embedding + token 序列 (避免二次前向导致 OOM)
+        need_tokens = self.use_token_align
+        context_embed, ctx_tokens = self.forward_context(ecg_masked, return_tokens=need_tokens)
+        target_out = self.forward_target(ppg, return_tokens=need_tokens)
+        if need_tokens:
+            target_embed, tgt_tokens = target_out
+        else:
+            target_embed = target_out
+            tgt_tokens = None
 
         # 1. JEPA prediction loss (ECG → PPG)
         jepa_loss, jepa_info = self._compute_jepa_loss(
@@ -558,12 +572,14 @@ class JEPA(nn.Module):
             total_loss = total_loss + self.stats_loss_weight * stats_loss
             info.update(stats_info)
 
-        # 3. ★ Soft-DTW 弹性 Token 对齐 (允许 ±3 token 的 PTT 生理延迟)
-        if self.use_token_align:
+        # 3. ★ Soft-DTW 弹性 Token 对齐 (用缓存的 token, 无需二次前向)
+        if self.use_token_align and ctx_tokens is not None and tgt_tokens is not None:
             token_loss, token_info = self._compute_token_align_loss(
                 ecg, ppg, token_mask=token_mask,
                 align_window=self.align_window,
                 soft_temperature=0.1,
+                cached_ctx_tokens=ctx_tokens,
+                cached_tgt_tokens=tgt_tokens,
             )
             total_loss = total_loss + self.token_align_weight * token_loss
             info.update(token_info)
