@@ -98,8 +98,9 @@ class ModelConfig:
     use_contrast_loss: bool = False    # M2AE 已移除, 用 Token Align 替代
     contrast_loss_weight: float = 0.1
     # Token级对齐
-    use_token_align: bool = False      # 额外前传吃显存，关闭
+    use_token_align: bool = True       # ★ Soft-DTW 弹性对齐 (替代硬对齐)
     token_align_weight: float = 0.5
+    token_align_window: int = 3        # Soft-DTW 搜索窗口 (±3 token ≈ ±300ms)
     use_freq_loss: bool = False        # 频谱损失 (Token Align可选)
     freq_loss_weight: float = 0.1      # 频谱损失权重
     vicreg_sim_weight: float = 1.0     # (保留, 未使用)

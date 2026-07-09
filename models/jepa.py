@@ -261,6 +261,7 @@ class JEPA(nn.Module):
         self.contrast_loss_weight = contrast_loss_weight
         self.use_token_align = use_token_align
         self.token_align_weight = token_align_weight
+        self.align_window = 3  # Soft-DTW 搜索窗口 (±3 token)
         if use_stats_loss:
             self.stats_pred_head = StatsPredHead(
                 in_dim=transformer_dim, hidden_dim=transformer_dim, num_stats=16
@@ -384,48 +385,71 @@ class JEPA(nn.Module):
         l2 = F.cross_entropy(logits.t(), labels)
         return (l1+l2)/2, {"contrast": (l1+l2).item()/2}
 
-    def _compute_token_align_loss(self, ecg, ppg, token_mask=None):
+    def _compute_token_align_loss(self, ecg, ppg, token_mask=None,
+                                   align_window=3, soft_temperature=0.1):
         """
-        ★ Token 级跨模态对齐 (替代 InfoNCE).
+        ★ Soft-DTW 风格弹性 Token 对齐 (替代原先的硬对齐).
 
-        论文: Cross-Modal Representational KD (NeurIPS 2025)
-        关键修复: 只在 JETS 可见 token 上计算对齐损失。
-        被掩码的 token 接近零向量，强行对齐反而有害。
+        文档明确指出:
+          "Soft-DTW 允许模型在一定的时间窗口内拉伸或压缩序列,
+           寻找形态最相似的波峰进行匹配,完美吸收 PTT 波动"
+
+        ECG 的 R 波和 PPG 的收缩峰之间有 ~200ms 生理延迟 (PTT),
+        对应约 2 个 token (stride=16, 100Hz)。
+        align_window=3 覆盖 ±300ms,足够容纳 PTT 变化。
 
         Args:
-            token_mask: (B, 1, N) bool, True=可见位置 (来自 JETS 掩码)
+            token_mask: (B, 1, N) bool, True=可见位置
+            align_window: 单侧搜索窗口 (±N token, 覆盖 PTT 生理范围)
+            soft_temperature: softmax 温度, 越低对齐越"硬"
         """
-        # 获取 token 序列 (不用 pooled)
         _, ecg_tokens = self.context_encoder(ecg, return_all=True)   # (B, N, D)
         _, ppg_tokens = self.target_encoder(ppg, return_all=True)    # (B, N, D)
 
-        # target_encoder 作为 teacher → 停止梯度 (论文核心)
-        ppg_tokens = ppg_tokens.detach()
+        ppg_tokens = ppg_tokens.detach()  # teacher 停止梯度
 
-        # 确保 token 数一致 (ecg, ppg, mask可能因padding略有不同)
         min_n = min(ecg_tokens.size(1), ppg_tokens.size(1))
         if token_mask is not None:
             min_n = min(min_n, token_mask.size(-1))
         ecg_tokens = ecg_tokens[:, :min_n, :]
         ppg_tokens = ppg_tokens[:, :min_n, :]
+        N = min_n
 
-        # 逐 token 余弦相似度: (B, N)
-        cos_sim = F.cosine_similarity(ecg_tokens, ppg_tokens, dim=-1)  # (B, N)
+        # Soft-DTW 式弹性对齐
+        total_loss = 0.0
+        valid_count = 0
 
-        # ★ 只保留可见 token 的损失
-        if token_mask is not None:
-            mask = token_mask[:, 0, :min_n]  # (B, N)
-            loss = ((1.0 - cos_sim) * mask).sum() / mask.sum().clamp(min=1)
-            visible_ratio = mask.float().mean().item()
-        else:
-            loss = (1.0 - cos_sim).mean()
-            visible_ratio = 1.0
+        for i in range(N):
+            # 只在可见 token 上计算
+            if token_mask is not None and not token_mask[0, 0, i]:
+                continue
 
-        token_std = cos_sim.detach().std(dim=-1).mean().item()
-        info = {"token_align": loss.item(), "token_std": token_std,
-                "visible": visible_ratio}
+            # 局部搜索窗口: [i-window, i+window]
+            start = max(0, i - align_window)
+            end = min(N, i + align_window + 1)
 
-        return loss, info
+            # ECG token_i vs PPG_tokens[start:end] 的余弦相似度
+            ecg_tok = ecg_tokens[:, i:i+1, :]  # (B, 1, D)
+            ppg_window = ppg_tokens[:, start:end, :]  # (B, W, D)
+
+            sim = F.cosine_similarity(
+                ecg_tok.expand(-1, end - start, -1),
+                ppg_window, dim=-1
+            )  # (B, W)
+
+            # softmax 加权: 自动选择最匹配的 PPG token
+            weights = F.softmax(sim / soft_temperature, dim=-1)  # (B, W)
+
+            # 加权后的 PPG 嵌入 (软对齐)
+            aligned_ppg = (weights.unsqueeze(-1) * ppg_window).sum(dim=1)  # (B, D)
+
+            # 对齐损失
+            align_cos = F.cosine_similarity(ecg_tok.squeeze(1), aligned_ppg, dim=-1)
+            total_loss += (1.0 - align_cos).sum()
+            valid_count += 1
+
+        loss = total_loss / max(valid_count * ecg_tokens.size(0), 1)
+        return loss, {"token_align": loss.item(), "window": align_window}
 
     def freeze_target_encoder(self):
         """冻结 target_encoder (Token 对齐模式: 当做 teacher)."""
@@ -534,10 +558,12 @@ class JEPA(nn.Module):
             total_loss = total_loss + self.stats_loss_weight * stats_loss
             info.update(stats_info)
 
-        # 3. ★ Token 级跨模态对齐 (替代 InfoNCE)
+        # 3. ★ Soft-DTW 弹性 Token 对齐 (允许 ±3 token 的 PTT 生理延迟)
         if self.use_token_align:
             token_loss, token_info = self._compute_token_align_loss(
-                ecg, ppg, token_mask=token_mask
+                ecg, ppg, token_mask=token_mask,
+                align_window=self.align_window,
+                soft_temperature=0.1,
             )
             total_loss = total_loss + self.token_align_weight * token_loss
             info.update(token_info)
