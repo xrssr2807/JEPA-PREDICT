@@ -62,6 +62,11 @@ def build_downstream_dataloaders(
         split_file = data_config.chd_ppg_dir + "/train_test_split.json"
         ppg_dir = data_config.chd_ppg_dir + "/ppg_chd"
         ecg_dir = os.path.join(data_config.chd_ecg_dir, data_config.chd_ecg_subdir)
+    elif dataset == "multilabel":
+        # ★ 新数据: PPG+ECG 同步, 9疾病多标签
+        ppg_dir = "/root/ppgchd/ppgchd/data_updated"
+        ecg_dir = None
+        split_file = "/root/ppgchd/ppgchd/train_test_split.json"
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 
@@ -509,7 +514,12 @@ def train_downstream(
     log_fh.write(f"{'='*60}\n")
 
     # Num classes
-    if dataset == "arrhythmia":
+    multilabel = (dataset == "multilabel")
+    multilabel_diseases = ['高血压', '高血糖', '高血脂', '冠心病', '心律失常（房颤、频发早搏等）', '糖尿病', '颈动脉斑块']
+    if multilabel:
+        num_classes = len(multilabel_diseases)
+        print(f"★ 多标签7分类: {multilabel_diseases}")
+    elif dataset == "arrhythmia":
         num_classes = config.data.arrhythmia_num_classes
     elif dataset == "arrhythmia_binary":
         num_classes = 2
@@ -647,18 +657,22 @@ def train_downstream(
         pos_weight = compute_pos_weight(train_ds, num_classes, device)
 
     # ── Criterion ──
-    criterion = build_criterion(
-        loss_type=config.train.loss_type,
-        num_classes=num_classes,
-        pos_weight=pos_weight,
-        gamma=config.train.focal_gamma,
-        gamma_neg=config.train.asl_gamma_neg,
-        gamma_pos=config.train.asl_gamma_pos,
-        clip=config.train.asl_clip,
-        label_smoothing=config.train.label_smoothing,
-    )
-    print(f"[Loss] {type(criterion).__name__}"
-          f"{' pos_weight=' + str([round(w,2) for w in pos_weight.tolist()]) if pos_weight is not None else ''}")
+    if multilabel:
+        criterion = nn.BCEWithLogitsLoss()
+        print(f"[Loss] BCEWithLogitsLoss (multi-label)")
+    else:
+        criterion = build_criterion(
+            loss_type=config.train.loss_type,
+            num_classes=num_classes,
+            pos_weight=pos_weight,
+            gamma=config.train.focal_gamma,
+            gamma_neg=config.train.asl_gamma_neg,
+            gamma_pos=config.train.asl_gamma_pos,
+            clip=config.train.asl_clip,
+            label_smoothing=config.train.label_smoothing,
+        )
+        print(f"[Loss] {type(criterion).__name__}"
+              f"{' pos_weight=' + str([round(w,2) for w in pos_weight.tolist()]) if pos_weight is not None else ''}")
 
     # ── Phase 1: Linear Probe ──
     n_probe = config.train.downstream_probe_epochs

@@ -30,6 +30,7 @@ class DataConfig:
 
     # ★ 信号质量门控：过滤低质量PPG样本 (PPG BP综述: 使用SQA后精度提升19-24%)
     signal_quality_gate: float = 0.0  # 0=关闭 (SQI对CHD数据过滤过严)
+    signal_align_to: int = 0  # 下游信号对齐到预训练长度 (0=不对齐)
 
     # Augmentation (PhysioAugment — applied to ECG context signal)
     use_augment: bool = False
@@ -97,13 +98,17 @@ class ModelConfig:
     use_contrast_loss: bool = False    # M2AE 已移除, 用 Token Align 替代
     contrast_loss_weight: float = 0.1
     # Token级对齐
-    use_token_align: bool = True       # ★ Token级ECG-PPG对齐 (替换InfoNCE)
+    use_token_align: bool = False      # 额外前传吃显存，关闭
     token_align_weight: float = 0.5
     use_freq_loss: bool = False        # 频谱损失 (Token Align可选)
     freq_loss_weight: float = 0.1      # 频谱损失权重
     vicreg_sim_weight: float = 1.0     # (保留, 未使用)
     vicreg_var_weight: float = 1.0
     vicreg_cov_weight: float = 0.04
+
+    # ── CNN 增强 ──
+    cnn_use_se: bool = True            # SE Block 通道注意力
+    cnn_use_inception: bool = True     # Inception 残差多尺度 (alpha=0.2)
 
     # ── CWT Frontend (optional alternative to 1D CNN) ──
     use_cwt: bool = False              # use CWT 1D→2D frontend instead of CNN Stem
@@ -126,6 +131,8 @@ class ModelConfig:
     # ★ ECG+PPG 双通道融合 (CSFM: 多模态融合持续带来稳健提升)
     use_dual_channel: bool = False     # 单通道 PPG only
     use_ecg_distill: bool = False      # ECG蒸馏 (关闭, 先测纯PPG)
+    use_cotrain: bool = True           # ★ ECG+PPG协同训练 (共享分类头, 部署仅需PPG)
+    use_dual_channel: bool = True      # ★ ECG+PPG concat融合 (AUC 0.79)
     distill_lambda: float = 0.3
 
 
@@ -135,7 +142,7 @@ class TrainConfig:
 
     # Pre-training
     pretrain_epochs: int = 150
-    pretrain_batch_size: int = 170
+    pretrain_batch_size: int = 240
     pretrain_lr: float = 5e-4
     pretrain_warmup_epochs: int = 5  # shorter warmup → earlier cosine decay
     pretrain_weight_decay: float = 0.05
@@ -157,7 +164,7 @@ class TrainConfig:
     downstream_lr: float = 5e-4  # FT base=5e-5 (anti-overfit)
     downstream_min_lr: float = 1e-6
     downstream_warmup_epochs: int = 5
-    downstream_probe_epochs: int = 30  # MLP probe: 充分训练分类头
+    downstream_probe_epochs: int = 30   # 信号对齐后跳过probe, 直接FT
     downstream_scheduler: str = "step"  # "epoch" or "step" (step-based for warmup+cosine)
 
     # ★ Token 对齐续训练 (冻结 target, 训练 context 对齐到 target)

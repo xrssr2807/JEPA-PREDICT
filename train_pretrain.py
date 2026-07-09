@@ -4,6 +4,7 @@ JEPA Pre-training: ECG → PPG cross-channel predictive learning.
 import os
 import math
 import time
+import numpy as np
 from collections import defaultdict
 
 import torch
@@ -97,6 +98,8 @@ def build_model(model_config: ModelConfig) -> JEPA:
         stats_loss_weight=model_config.stats_loss_weight,
         use_contrast_loss=model_config.use_contrast_loss,
         contrast_loss_weight=model_config.contrast_loss_weight,
+        use_se=model_config.cnn_use_se,
+        use_inception=model_config.cnn_use_inception,
         use_token_align=model_config.use_token_align,
         token_align_weight=model_config.token_align_weight,
         vicreg_sim_weight=model_config.vicreg_sim_weight,
@@ -201,6 +204,13 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
 
             ecg = ecg.to(device)
             ppg = ppg.to(device)
+
+            # ★ MixUp: 随机混合batch内样本 → 正则化
+            if config.train.use_mixup and config.train.mixup_alpha > 0:
+                lam = np.random.beta(config.train.mixup_alpha, config.train.mixup_alpha)
+                idx = torch.randperm(ecg.size(0), device=device)
+                ecg = lam * ecg + (1 - lam) * ecg[idx]
+                ppg = lam * ppg + (1 - lam) * ppg[idx]
 
             global_step = epoch * steps_per_epoch + batch_idx
 

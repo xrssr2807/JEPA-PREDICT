@@ -308,17 +308,14 @@ class DownstreamDataset(Dataset):
         normalize: str = "zscore",
         normalize_clip: float = 10.0,
         binary_abnormal: bool = False,  # True: class 0→0, class 1-5→1
-        signal_quality_gate: float = 0.0,  # ★ SQI阈值：低于此值的样本被跳过 (0=关闭)
+        signal_quality_gate: float = 0.0,  # ★ SQI阈值：低于此值样本被跳过 (0=关闭)
+        target_length: int = None,          # 信号对齐：插值到目标长度 (如1000→3000)
     ):
         """
         Args:
-            data_dir: path to directory containing .pkl files
-            split_file: path to train_test_split.json
-            split: "train" or "test"
-            normalize: normalization method ("zscore", "iqr", "minmax", "none")
-            normalize_clip: clip value after zscore/iqr normalization
-            binary_abnormal: if True, remap labels: 0→0(normal), 1-5→1(abnormal)
+            ...
             signal_quality_gate: SQI阈值 (0~1), 低于此值样本被跳过 (0=关闭)
+            target_length: 如果设置，线性插值到目标长度，匹配预训练输入尺度
         """
         import json
 
@@ -326,6 +323,7 @@ class DownstreamDataset(Dataset):
         self.normalize = normalize
         self.normalize_clip = normalize_clip
         self.binary_abnormal = binary_abnormal
+        self.target_length = target_length
         self.signal_quality_gate = signal_quality_gate
 
         with open(split_file, "r") as f:
@@ -383,6 +381,11 @@ class DownstreamDataset(Dataset):
                 return self.__getitem__(fallback_idx)
 
         # Normalize
+        # ★ 信号对齐：先重采样，再归一化（保持预处理一致性）
+        if self.target_length is not None and len(data) != self.target_length:
+            from scipy.signal import resample
+            data = resample(data, self.target_length).astype(np.float32)
+
         if self.normalize == "zscore":
             data = self._zscore(data)
         elif self.normalize == "iqr":

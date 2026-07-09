@@ -193,6 +193,8 @@ class JEPA(nn.Module):
         contrast_loss_weight: float = 1.0,
         use_token_align: bool = False,
         token_align_weight: float = 0.5,
+        use_se: bool = False,
+        use_inception: bool = False,
         vicreg_sim_weight: float = 1.0,
         vicreg_var_weight: float = 1.0,
         vicreg_cov_weight: float = 0.04,
@@ -212,6 +214,8 @@ class JEPA(nn.Module):
             transformer_dropout=transformer_dropout,
             max_seq_len=max_seq_len,
             pool_type=pool_type,
+            use_se=use_se,
+            use_inception=use_inception,
         )
 
         self.context_encoder = SignalEncoder(**encoder_kwargs)
