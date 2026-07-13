@@ -19,7 +19,7 @@ class DataConfig:
     chd_ecg_dir: str = "/root/chd_ecg"
     chd_ecg_subdir: str = "ecg_chd"     # ECG数据子目录 (下含.pkl文件)
     arrhythmia_dir: str = "/root/processed_dataset"
-    multidisease_dir: str = "/root/ppgchd/ppgchd/ppgchd/data_updated"
+    multidisease_dir: str = "/root/ppgchd/ppgchd/data_updated"
 
     # Preprocessing
     normalize: str = "zscore"  # zscore / iqr / minmax / none

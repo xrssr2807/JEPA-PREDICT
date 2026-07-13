@@ -755,7 +755,7 @@ def train_downstream(
 
     # ── Check for ECG modes ──
     ecg_data_dir = os.path.join(config.data.chd_ecg_dir, config.data.chd_ecg_subdir)
-    has_ecg = os.path.isdir(ecg_data_dir)
+    has_ecg = os.path.isdir(ecg_data_dir) and not multilabel
     use_dual = has_ecg and config.model.use_dual_channel
     use_distill = has_ecg and config.model.use_ecg_distill and not use_dual
     use_cotrain = has_ecg and config.model.use_cotrain and not use_dual and not use_distill
