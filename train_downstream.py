@@ -401,6 +401,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
     running_loss = 0.0
     correct = 0
     total = 0
+    valid_steps = 0
 
     ecg_iter = iter(ecg_loader) if (distill_mode or cotrain_mode) else None
 
@@ -416,6 +417,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
             else:
                 x, labels = batch
             x, labels = x.to(device), labels.to(device)
+            x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
 
             if distill_mode:
                 # PPG forward with embedding for alignment
@@ -457,6 +459,9 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                 loss = criterion(logits, labels)
 
         optimizer.zero_grad()
+        if not torch.isfinite(loss):
+            print("[Warn] non-finite loss detected; skipping this batch")
+            continue
         loss.backward()
         all_params = list(model.parameters()) + (list(proj_ppg.parameters()) if distill_mode else [])
         torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
@@ -466,6 +471,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
             scheduler.step()
 
         running_loss += loss.item()
+        valid_steps += 1
         total += labels.size(0)
         if multilabel:
             predicted = (torch.sigmoid(logits) >= 0.5).to(labels.dtype)
@@ -474,7 +480,9 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
             _, predicted = logits.max(1)
             correct += predicted.eq(labels).sum().item()
 
-    return running_loss / len(dataloader), 100.0 * correct / total
+    if valid_steps == 0 or total == 0:
+        return float("nan"), 0.0
+    return running_loss / valid_steps, 100.0 * correct / total
 
 
 @torch.no_grad()
@@ -633,6 +641,7 @@ def evaluate_multilabel(model, dataloader, criterion, device,
         x, labels, *rest = batch
         uids = rest[0] if rest else None
         x, labels = x.to(device), labels.to(device)
+        x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
         logits = model(x)
         loss = criterion(logits, labels)
         running_loss += loss.item()
@@ -663,6 +672,8 @@ def evaluate_multilabel(model, dataloader, criterion, device,
         logits_arr = torch.cat(all_logits, dim=0).numpy()
         labels_arr = torch.cat(all_labels, dim=0).numpy()
 
+    logits_arr = np.nan_to_num(logits_arr, nan=0.0, posinf=60.0, neginf=-60.0)
+    logits_arr = np.clip(logits_arr, -60.0, 60.0)
     probs = 1.0 / (1.0 + np.exp(-logits_arr))
     preds = (probs >= 0.5).astype(np.float32)
 

@@ -541,7 +541,7 @@ class MultiDiseaseDataset(Dataset):
     def _zscore(self, x: np.ndarray) -> np.ndarray:
         mean = x.mean(axis=-1, keepdims=True)
         std = x.std(axis=-1, keepdims=True)
-        std = np.where(std == 0, 1.0, std)
+        std = np.where(np.isfinite(std) & (std >= 1e-6), std, 1.0)
         return (x - mean) / std
 
     def _iqr(self, x: np.ndarray) -> np.ndarray:
@@ -549,13 +549,14 @@ class MultiDiseaseDataset(Dataset):
         q25 = np.percentile(x, 25, axis=-1, keepdims=True)
         q75 = np.percentile(x, 75, axis=-1, keepdims=True)
         iqr_val = q75 - q25
-        iqr_val = np.where(iqr_val < 1e-6, 1.0, iqr_val)
+        iqr_val = np.where(np.isfinite(iqr_val) & (iqr_val >= 1e-6), iqr_val, 1.0)
         return (x - median) / iqr_val
 
     def _minmax(self, x: np.ndarray) -> np.ndarray:
         x_min = x.min(axis=-1, keepdims=True)
         x_max = x.max(axis=-1, keepdims=True)
-        denom = np.where(x_max - x_min == 0, 1.0, x_max - x_min)
+        denom = x_max - x_min
+        denom = np.where(np.isfinite(denom) & (denom >= 1e-6), denom, 1.0)
         return (x - x_min) / denom
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
@@ -564,6 +565,7 @@ class MultiDiseaseDataset(Dataset):
             sample = pickle.load(f)
 
         data = sample["data"].astype(np.float32)
+        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
         if data.ndim == 1:
             data = data[None, :]
         elif self.channel is not None:
@@ -582,6 +584,7 @@ class MultiDiseaseDataset(Dataset):
 
         if self.normalize in ("zscore", "iqr"):
             data = np.clip(data, -self.normalize_clip, self.normalize_clip)
+        data = np.nan_to_num(data, nan=0.0, posinf=self.normalize_clip, neginf=-self.normalize_clip)
 
         label_dict = sample["label"]
         labels = np.array(
