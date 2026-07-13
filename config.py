@@ -19,6 +19,7 @@ class DataConfig:
     chd_ecg_dir: str = "/root/chd_ecg"
     chd_ecg_subdir: str = "ecg_chd"     # ECG数据子目录 (下含.pkl文件)
     arrhythmia_dir: str = "/root/processed_dataset"
+    multidisease_dir: str = "/root/ppgchd/ppgchd/ppgchd/data_updated"
 
     # Preprocessing
     normalize: str = "zscore"  # zscore / iqr / minmax / none
@@ -45,6 +46,10 @@ class DataConfig:
     # Downstream label mapping
     num_classes: int = 2  # CHD: binary classification
     arrhythmia_num_classes: int = 6  # Arrhythmia: 6-class classification
+    multidisease_labels: List[str] = field(default_factory=lambda: [
+        "高血压", "高血糖", "高血脂", "下肢动脉硬化闭塞症", "冠心病",
+        "心律失常（房颤、频发早搏等）", "糖尿病", "脑卒中（中风）", "颈动脉斑块",
+    ])
 
 
 @dataclass

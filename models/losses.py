@@ -245,7 +245,7 @@ def build_criterion(loss_type: str, num_classes: int, pos_weight=None,
         )
     elif loss_type == "focal":
         return FocalLoss(
-            gamma=gamma, alpha=None, reduction='mean',
+            gamma=gamma, alpha=pos_weight, reduction='mean',
             label_smoothing=label_smoothing,
         )
     elif loss_type == "bce":

@@ -17,6 +17,8 @@ import sys
 import time
 import math
 import json
+import copy
+import pickle
 from collections import defaultdict
 from typing import Optional, Tuple, List
 
@@ -34,13 +36,45 @@ from sklearn.metrics import (
 )
 
 from config import Config, DataConfig, ModelConfig, TrainConfig
-from dataset.data import DownstreamDataset, DualDownstreamDataset
+from dataset.data import DownstreamDataset, DualDownstreamDataset, MultiDiseaseDataset
 from models.encoder import SignalEncoder
 from models.classifier import (
     SignalClassifier, DualChannelClassifier,
     SignalClassifierCoT, DualChannelClassifierCoT,
+    MultiScaleClassifier,
 )
 from models.losses import build_criterion, compute_pos_weight
+
+
+def uid_from_filename(fname: str) -> str:
+    """Extract patient id from train/test_<uid>_<segment>.pkl style names."""
+    parts = fname.split("_")
+    if parts[0] in {"train", "test", "val"} and len(parts) >= 3:
+        return parts[1]
+    return parts[0]
+
+
+def split_files_by_uid(files: List[str], labels: List[int], val_split: float):
+    """Group split by patient id to avoid segment leakage across train/val."""
+    if val_split <= 0:
+        return files, []
+
+    from sklearn.model_selection import GroupShuffleSplit, train_test_split
+
+    groups = [uid_from_filename(f) for f in files]
+    if len(set(groups)) >= 2:
+        splitter = GroupShuffleSplit(
+            n_splits=1, test_size=val_split, random_state=42
+        )
+        train_idx, val_idx = next(splitter.split(files, labels, groups))
+    else:
+        stratify = labels if len(set(labels)) > 1 else None
+        train_idx, val_idx = train_test_split(
+            range(len(files)), test_size=val_split,
+            stratify=stratify, random_state=42,
+        )
+
+    return [files[i] for i in train_idx], [files[i] for i in val_idx]
 
 
 # ── Data ────────────────────────────────────────────────────────
@@ -55,13 +89,65 @@ def build_downstream_dataloaders(
     binary_abnormal = (dataset == "arrhythmia_binary")
 
     if dataset == "arrhythmia" or dataset == "arrhythmia_binary":
-        data_dir = data_config.arrhythmia_dir + "/data"
+        ppg_dir = data_config.arrhythmia_dir + "/data"
         split_file = data_config.arrhythmia_dir + "/split.json"
         ecg_dir = None
     elif dataset == "chd":
         split_file = data_config.chd_ppg_dir + "/train_test_split.json"
         ppg_dir = data_config.chd_ppg_dir + "/ppg_chd"
         ecg_dir = os.path.join(data_config.chd_ecg_dir, data_config.chd_ecg_subdir)
+    elif dataset in ("multidisease", "multilabel"):
+        target_len = data_config.signal_align_to if data_config.signal_align_to > 0 else None
+        train_dataset = MultiDiseaseDataset(
+            data_dir=data_config.multidisease_dir,
+            split="train",
+            disease_labels=data_config.multidisease_labels,
+            normalize=data_config.normalize,
+            normalize_clip=data_config.normalize_clip,
+            channel=0,
+            target_length=target_len,
+        )
+        test_dataset = MultiDiseaseDataset(
+            data_dir=data_config.multidisease_dir,
+            split="test",
+            disease_labels=data_config.multidisease_labels,
+            normalize=data_config.normalize,
+            normalize_clip=data_config.normalize_clip,
+            channel=0,
+            target_length=target_len,
+        )
+        val_dataset = None
+        if data_config.val_split > 0:
+            labels_for_split = []
+            for fname in train_dataset.files:
+                with open(os.path.join(data_config.multidisease_dir, fname), "rb") as f:
+                    item = pickle.load(f)
+                labels_for_split.append(int(item["label"].get("冠心病", 0)))
+            train_files, val_files = split_files_by_uid(
+                train_dataset.files, labels_for_split, data_config.val_split
+            )
+            val_dataset = copy.deepcopy(train_dataset)
+            train_dataset.files = train_files
+            val_dataset.files = val_files
+            print(f"[Data] UID-group train/val split: {len(train_files)} train + {len(val_files)} val")
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=train_config.downstream_batch_size,
+            shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
+        )
+        val_loader = None
+        if val_dataset is not None:
+            val_loader = DataLoader(
+                val_dataset, batch_size=train_config.downstream_batch_size,
+                shuffle=False, num_workers=4, pin_memory=True,
+            )
+        test_loader = DataLoader(
+            test_dataset, batch_size=train_config.downstream_batch_size,
+            shuffle=False, num_workers=4, pin_memory=True,
+        )
+        vlen = len(val_dataset) if val_dataset is not None else 0
+        print(f"[Data] train={len(train_dataset)} val={vlen} test={len(test_dataset)}")
+        return train_loader, val_loader, test_loader, train_dataset, test_dataset
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 
@@ -104,40 +190,35 @@ def build_downstream_dataloaders(
 
     # ★ 从训练集划分验证集 (按 UID, 防数据泄露)
     val_loader = None
+    val_dataset = None
     if data_config.val_split > 0:
-        from sklearn.model_selection import train_test_split
         # 收集训练集UID和标签
         train_uids, train_labels = [], []
         for fname in ppg_train.files:
-            uid = fname.split('_')[0]  # 从文件名提取UID (去除片段后缀)
+            uid = uid_from_filename(fname)
             train_uids.append(uid)
         # 简化: 直接用文件索引做分层抽样
         train_files = ppg_train.files
         train_file_labels = []
         for fname in train_files:
             # 读取标签 (临时)
-            import pickle
             with open(os.path.join(ppg_dir, fname), 'rb') as f:
                 d = pickle.load(f)
             train_file_labels.append(d['label'][0]['class'])
         # 分层拆分: 85% train, 15% val
-        train_idx, val_idx = train_test_split(
-            range(len(train_files)), test_size=data_config.val_split,
-            stratify=train_file_labels, random_state=42,
+        train_files, val_files = split_files_by_uid(
+            train_files, train_file_labels, data_config.val_split
         )
-        val_files = [train_files[i] for i in val_idx]
-        train_files = [train_files[i] for i in train_idx]
         print(f"[Data] Train→Val split: {len(train_files)} train + {len(val_files)} val")
 
         # 重建数据集
-        from copy import deepcopy
-        ppg_val = deepcopy(ppg_train)
+        ppg_val = copy.deepcopy(ppg_train)
         ppg_val.files = val_files
         ppg_train.files = train_files
 
         val_dataset = ppg_val
         if use_dual and ecg_dir is not None:
-            ecg_val = deepcopy(ecg_train)
+            ecg_val = copy.deepcopy(ecg_train)
             ecg_val.files = val_files
             ecg_train.files = train_files
             val_dataset = DualDownstreamDataset(ppg_val, ecg_val)
@@ -311,7 +392,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                 distill_mode=False, ecg_encoder=None,
                 proj_ppg=None, proj_ecg=None,
                 ecg_loader=None, distill_lambda=0.5,
-                cotrain_mode=False, ecg_model=None, classifier=None):
+                cotrain_mode=False, ecg_model=None, classifier=None,
+                multilabel=False):
     """Single training epoch with optional ECG distillation."""
     model.train()
     if distill_mode:
@@ -384,9 +466,13 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
             scheduler.step()
 
         running_loss += loss.item()
-        _, predicted = logits.max(1)
         total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        if multilabel:
+            predicted = (torch.sigmoid(logits) >= 0.5).to(labels.dtype)
+            correct += predicted.eq(labels).float().mean(dim=1).sum().item()
+        else:
+            _, predicted = logits.max(1)
+            correct += predicted.eq(labels).sum().item()
 
     return running_loss / len(dataloader), 100.0 * correct / total
 
@@ -532,7 +618,104 @@ def evaluate(model, dataloader, criterion, device, num_classes: int,
             all_preds_arr, all_labels_arr, all_probs)
 
 
+@torch.no_grad()
+def evaluate_multilabel(model, dataloader, criterion, device,
+                        label_names: List[str], aggregate_by_uid: bool = True):
+    """Evaluate multi-label disease prediction with sigmoid probabilities."""
+    model.eval()
+    running_loss = 0.0
+    uid_logits = {}
+    uid_labels = {}
+    all_logits = []
+    all_labels = []
+
+    for batch in dataloader:
+        x, labels, *rest = batch
+        uids = rest[0] if rest else None
+        x, labels = x.to(device), labels.to(device)
+        logits = model(x)
+        loss = criterion(logits, labels)
+        running_loss += loss.item()
+
+        if aggregate_by_uid and uids is not None:
+            for i, uid in enumerate(uids):
+                uid_str = str(uid)
+                if uid_str not in uid_logits:
+                    uid_logits[uid_str] = []
+                    uid_labels[uid_str] = labels[i:i + 1]
+                uid_logits[uid_str].append(logits[i:i + 1])
+        else:
+            all_logits.append(logits.cpu())
+            all_labels.append(labels.cpu())
+
+    avg_loss = running_loss / max(len(dataloader), 1)
+
+    if aggregate_by_uid and uid_logits:
+        logits_arr = []
+        labels_arr = []
+        for uid in uid_logits:
+            logits_arr.append(torch.cat(uid_logits[uid], dim=0).mean(dim=0, keepdim=True).cpu())
+            labels_arr.append(uid_labels[uid].cpu())
+        logits_arr = torch.cat(logits_arr, dim=0).numpy()
+        labels_arr = torch.cat(labels_arr, dim=0).numpy()
+        print(f"[Evaluate] UID aggregation: {len(uid_logits)} patients")
+    else:
+        logits_arr = torch.cat(all_logits, dim=0).numpy()
+        labels_arr = torch.cat(all_labels, dim=0).numpy()
+
+    probs = 1.0 / (1.0 + np.exp(-logits_arr))
+    preds = (probs >= 0.5).astype(np.float32)
+
+    auc_list = []
+    for c in range(labels_arr.shape[1]):
+        try:
+            if len(np.unique(labels_arr[:, c])) > 1:
+                auc_list.append(float(roc_auc_score(labels_arr[:, c], probs[:, c])))
+            else:
+                auc_list.append(0.5)
+        except Exception:
+            auc_list.append(0.5)
+    macro_auc = float(np.mean(auc_list)) if auc_list else 0.5
+
+    precision = precision_score(labels_arr, preds, average="macro", zero_division=0)
+    recall = recall_score(labels_arr, preds, average="macro", zero_division=0)
+    f1 = fbeta_score(labels_arr, preds, beta=1, average="macro", zero_division=0)
+    f05 = fbeta_score(labels_arr, preds, beta=0.5, average="macro", zero_division=0)
+    acc = 100.0 * (preds == labels_arr).mean()
+    report = classification_report(
+        labels_arr, preds, target_names=label_names, digits=4, zero_division=0
+    )
+
+    return (avg_loss, acc, macro_auc, auc_list,
+            precision, recall, f1, f05, report,
+            preds, labels_arr, probs)
+
+
 # ── Main Pipeline ───────────────────────────────────────────────
+
+def compute_multilabel_pos_weight(dataset, device, max_weight: float = 20.0):
+    """Compute BCE pos_weight from multi-label train files."""
+    if not all(hasattr(dataset, attr) for attr in ("files", "data_dir", "disease_labels")):
+        return None
+
+    pos = np.zeros(len(dataset.disease_labels), dtype=np.float64)
+    for fname in dataset.files:
+        with open(os.path.join(dataset.data_dir, fname), "rb") as f:
+            item = pickle.load(f)
+        label_dict = item.get("label", {})
+        pos += np.array(
+            [float(label_dict.get(name, 0)) for name in dataset.disease_labels],
+            dtype=np.float64,
+        )
+
+    total = max(len(dataset.files), 1)
+    neg = total - pos
+    weights = neg / np.maximum(pos, 1.0)
+    weights = np.clip(weights, 0.2, max_weight)
+    pos_rate = pos / total
+    print(f"[Loss] multilabel pos_rate={[round(float(x), 4) for x in pos_rate]}")
+    return torch.tensor(weights, dtype=torch.float32, device=device)
+
 
 def train_downstream(
     config: Config,
@@ -559,7 +742,10 @@ def train_downstream(
     log_fh.write(f"{'='*60}\n")
 
     # Num classes
-    if dataset == "arrhythmia":
+    multilabel = dataset in ("multidisease", "multilabel")
+    if multilabel:
+        num_classes = len(config.data.multidisease_labels)
+    elif dataset == "arrhythmia":
         num_classes = config.data.arrhythmia_num_classes
     elif dataset == "arrhythmia_binary":
         num_classes = 2
@@ -663,7 +849,13 @@ def train_downstream(
     # Build classifier (skip if dual-channel already created above)
     if not use_dual and not use_distill and not use_cotrain:
         # Pure PPG single-channel
-        if config.model.use_cot_head:
+        if config.model.use_multiscale:
+            print("[Model] MultiScale classification head")
+            model = MultiScaleClassifier(
+                encoder=encoder, encoder_dim=config.model.transformer_dim,
+                num_classes=num_classes,
+            ).to(device)
+        elif config.model.use_cot_head:
             print("[Model] CoT classification head")
             model = SignalClassifierCoT(
                 encoder=encoder, encoder_dim=config.model.transformer_dim,
@@ -677,7 +869,13 @@ def train_downstream(
             ).to(device)
     elif use_distill or use_cotrain:
         # Distill/Cotrain: single-channel + extra components
-        if config.model.use_cot_head:
+        if config.model.use_multiscale:
+            print("[Model] MultiScale classification head")
+            model = MultiScaleClassifier(
+                encoder=encoder, encoder_dim=config.model.transformer_dim,
+                num_classes=num_classes,
+            ).to(device)
+        elif config.model.use_cot_head:
             print("[Model] CoT classification head")
             model = SignalClassifierCoT(
                 encoder=encoder, encoder_dim=config.model.transformer_dim,
@@ -694,7 +892,10 @@ def train_downstream(
     # ── Auto pos_weight ──
     pos_weight = None
     if config.train.auto_pos_weight:
-        pos_weight = compute_pos_weight(train_ds, num_classes, device)
+        if multilabel:
+            pos_weight = compute_multilabel_pos_weight(train_ds, device)
+        else:
+            pos_weight = compute_pos_weight(train_ds, num_classes, device)
 
     # ── Criterion ──
     criterion = build_criterion(
@@ -707,6 +908,8 @@ def train_downstream(
         clip=config.train.asl_clip,
         label_smoothing=config.train.label_smoothing,
     )
+    if multilabel:
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     print(f"[Loss] {type(criterion).__name__}"
           f"{' pos_weight=' + str([round(w,2) for w in pos_weight.tolist()]) if pos_weight is not None else ''}")
 
@@ -745,11 +948,17 @@ def train_downstream(
                 ecg_loader=ecg_train_loader, distill_lambda=distill_lambda,
                 cotrain_mode=use_cotrain, ecg_model=ecg_encoder,
                 classifier=model.classifier if use_cotrain else None,
+                multilabel=multilabel,
             )
             eval_loader = val_loader if val_loader is not None else test_loader
-            test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate(
-                model, eval_loader, criterion, device, num_classes, is_dual=use_dual,
-            )
+            if multilabel:
+                test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate_multilabel(
+                    model, eval_loader, criterion, device, config.data.multidisease_labels,
+                )
+            else:
+                test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate(
+                    model, eval_loader, criterion, device, num_classes, is_dual=use_dual,
+                )
 
             if sched_mode == "epoch":
                 scheduler.step()
@@ -804,10 +1013,18 @@ def train_downstream(
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion, device,
             scheduler=scheduler, sched_mode=sched_mode, is_dual=use_dual, distill_mode=use_distill, ecg_encoder=ecg_encoder, proj_ppg=proj_ppg, proj_ecg=proj_ecg, ecg_loader=ecg_train_loader, distill_lambda=distill_lambda,
+            multilabel=multilabel,
         )
-        test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate(
-            model, test_loader, criterion, device, num_classes, is_dual=use_dual,
-        )
+        eval_loader = val_loader if val_loader is not None else test_loader
+        eval_name = "Val" if val_loader is not None else "Test"
+        if multilabel:
+            test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate_multilabel(
+                model, eval_loader, criterion, device, config.data.multidisease_labels,
+            )
+        else:
+            test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate(
+                model, eval_loader, criterion, device, num_classes, is_dual=use_dual,
+            )
 
         if sched_mode == "epoch":
             scheduler.step()
@@ -815,7 +1032,7 @@ def train_downstream(
         lr = optimizer.param_groups[0]['lr']
         log_line = (f"FT Epoch {epoch+1:2d} | "
                     f"Train L={train_loss:.4f} Acc={train_acc:.2f}% | "
-                    f"Test L={test_loss:.4f} Acc={test_acc:5.2f}% AUC={auc:.4f} "
+                    f"{eval_name} L={test_loss:.4f} Acc={test_acc:5.2f}% AUC={auc:.4f} "
                     f"P={prec:.4f} R={rec:.4f} F1={f1:.4f} F0.5={f05:.4f} | lr={lr:.2e}")
         print(log_line)
         log_fh.write(log_line + "\n"); log_fh.flush()
@@ -823,8 +1040,8 @@ def train_downstream(
         if auc > best_auc:
             best_auc = auc
             best_state = {
-                "epoch": epoch, "model_state_dict": model.state_dict(),
-                "test_acc": test_acc, "test_auc": auc, "test_f1": f1,
+                "epoch": epoch, "model_state_dict": copy.deepcopy(model.state_dict()),
+                "val_acc": test_acc, "val_auc": auc, "val_f1": f1,
             }
             no_improve = 0
         else:
@@ -842,10 +1059,16 @@ def train_downstream(
     # Load best model and re-evaluate
     if best_state is not None:
         model.load_state_dict(best_state["model_state_dict"])
-    (_, test_acc, auc, auc_list,
-     prec, rec, f1, f05, report, _, _, _) = evaluate(
-        model, test_loader, criterion, device, num_classes, is_dual=use_dual,
-    )
+    if multilabel:
+        (_, test_acc, auc, auc_list,
+         prec, rec, f1, f05, report, _, _, _) = evaluate_multilabel(
+            model, test_loader, criterion, device, config.data.multidisease_labels,
+        )
+    else:
+        (_, test_acc, auc, auc_list,
+         prec, rec, f1, f05, report, _, _, _) = evaluate(
+            model, test_loader, criterion, device, num_classes, is_dual=use_dual,
+        )
 
     print(f"Best Test Acc:       {test_acc:.2f}%")
     print(f"Best Test AUC (macro): {auc:.4f}")
@@ -882,7 +1105,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to pre-trained JEPA checkpoint")
     parser.add_argument("--dataset", type=str, default="chd",
-                        choices=["chd", "arrhythmia", "arrhythmia_binary"])
+                        choices=["chd", "arrhythmia", "arrhythmia_binary",
+                                 "multidisease", "multilabel"])
     parser.add_argument("--output_dir", type=str, default="./outputs")
     args = parser.parse_args()
 

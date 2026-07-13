@@ -489,3 +489,105 @@ class DualDownstreamDataset(Dataset):
         ppg_data, label, uid = self.ppg_dataset[idx]
         ecg_data, _, _ = self.ecg_dataset[idx]
         return ecg_data, ppg_data, label, uid
+
+
+class MultiDiseaseDataset(Dataset):
+    """
+    Multi-label downstream dataset for 9 disease labels.
+
+    Files are split by filename prefix: train_<uid>_<segment>.pkl / test_<uid>_<segment>.pkl.
+    Each sample contains:
+        - data: (2, 1000) or (1000,) float signal
+        - uid: patient id
+        - label: dict disease_name -> 0/1
+
+    By default this returns one channel so it can reuse the existing 1-channel
+    pretrained encoder. Set channel=None only for models that explicitly accept
+    multi-channel input.
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        split: str = "train",
+        disease_labels: Optional[List[str]] = None,
+        normalize: str = "zscore",
+        normalize_clip: float = 10.0,
+        channel: Optional[int] = 0,
+        target_length: int = None,
+    ):
+        self.data_dir = data_dir
+        self.split = split
+        self.normalize = normalize
+        self.normalize_clip = normalize_clip
+        self.channel = channel
+        self.target_length = target_length
+        self.disease_labels = disease_labels or [
+            "高血压", "高血糖", "高血脂", "下肢动脉硬化闭塞症", "冠心病",
+            "心律失常（房颤、频发早搏等）", "糖尿病", "脑卒中（中风）", "颈动脉斑块",
+        ]
+
+        prefix = split + "_"
+        self.files = sorted([
+            f for f in os.listdir(data_dir)
+            if f.endswith(".pkl") and f.startswith(prefix)
+        ])
+        print(f"[MultiDiseaseDataset] {split}: {len(self.files)} files from {data_dir}")
+        print(f"[MultiDiseaseDataset] labels={self.disease_labels}")
+
+    def __len__(self) -> int:
+        return len(self.files)
+
+    def _zscore(self, x: np.ndarray) -> np.ndarray:
+        mean = x.mean(axis=-1, keepdims=True)
+        std = x.std(axis=-1, keepdims=True)
+        std = np.where(std == 0, 1.0, std)
+        return (x - mean) / std
+
+    def _iqr(self, x: np.ndarray) -> np.ndarray:
+        median = np.median(x, axis=-1, keepdims=True)
+        q25 = np.percentile(x, 25, axis=-1, keepdims=True)
+        q75 = np.percentile(x, 75, axis=-1, keepdims=True)
+        iqr_val = q75 - q25
+        iqr_val = np.where(iqr_val < 1e-6, 1.0, iqr_val)
+        return (x - median) / iqr_val
+
+    def _minmax(self, x: np.ndarray) -> np.ndarray:
+        x_min = x.min(axis=-1, keepdims=True)
+        x_max = x.max(axis=-1, keepdims=True)
+        denom = np.where(x_max - x_min == 0, 1.0, x_max - x_min)
+        return (x - x_min) / denom
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
+        filepath = os.path.join(self.data_dir, self.files[idx])
+        with open(filepath, "rb") as f:
+            sample = pickle.load(f)
+
+        data = sample["data"].astype(np.float32)
+        if data.ndim == 1:
+            data = data[None, :]
+        elif self.channel is not None:
+            data = data[self.channel:self.channel + 1]
+
+        if self.target_length is not None and data.shape[-1] != self.target_length:
+            from scipy.signal import resample
+            data = resample(data, self.target_length, axis=-1).astype(np.float32)
+
+        if self.normalize == "zscore":
+            data = self._zscore(data)
+        elif self.normalize == "iqr":
+            data = self._iqr(data)
+        elif self.normalize == "minmax":
+            data = self._minmax(data)
+
+        if self.normalize in ("zscore", "iqr"):
+            data = np.clip(data, -self.normalize_clip, self.normalize_clip)
+
+        label_dict = sample["label"]
+        labels = np.array(
+            [float(label_dict.get(name, 0)) for name in self.disease_labels],
+            dtype=np.float32,
+        )
+        uid = str(sample.get("uid", self.files[idx].split("_")[1]))
+
+        return torch.from_numpy(data.copy()).float(), torch.from_numpy(labels), uid

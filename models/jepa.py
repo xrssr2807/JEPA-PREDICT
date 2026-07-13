@@ -431,8 +431,6 @@ class JEPA(nn.Module):
 
         for i in range(N):
             # 只在可见 token 上计算
-            if token_mask is not None and not token_mask[0, 0, i]:
-                continue
 
             # 局部搜索窗口: [i-window, i+window]
             start = max(0, i - align_window)
@@ -455,10 +453,16 @@ class JEPA(nn.Module):
 
             # 对齐损失
             align_cos = F.cosine_similarity(ecg_tok.squeeze(1), aligned_ppg, dim=-1)
-            total_loss += (1.0 - align_cos).sum()
-            valid_count += 1
+            loss_i = 1.0 - align_cos
+            if token_mask is not None:
+                visible = token_mask[:, 0, i].float()
+                total_loss += (loss_i * visible).sum()
+                valid_count += visible.sum().item()
+            else:
+                total_loss += loss_i.sum()
+                valid_count += ecg_tokens.size(0)
 
-        loss = total_loss / max(valid_count * ecg_tokens.size(0), 1)
+        loss = total_loss / max(valid_count, 1)
         return loss, {"token_align": loss.item(), "window": align_window}
 
     def freeze_target_encoder(self):
