@@ -102,6 +102,55 @@ def build_downstream_dataloaders(
     else:
         train_dataset, test_dataset = ppg_train, ppg_test
 
+    # ★ 从训练集划分验证集 (按 UID, 防数据泄露)
+    val_loader = None
+    if data_config.val_split > 0:
+        from sklearn.model_selection import train_test_split
+        # 收集训练集UID和标签
+        train_uids, train_labels = [], []
+        for fname in ppg_train.files:
+            uid = fname.split('_')[0]  # 从文件名提取UID (去除片段后缀)
+            train_uids.append(uid)
+        # 简化: 直接用文件索引做分层抽样
+        train_files = ppg_train.files
+        train_file_labels = []
+        for fname in train_files:
+            # 读取标签 (临时)
+            import pickle
+            with open(os.path.join(ppg_dir, fname), 'rb') as f:
+                d = pickle.load(f)
+            train_file_labels.append(d['label'][0]['class'])
+        # 分层拆分: 85% train, 15% val
+        train_idx, val_idx = train_test_split(
+            range(len(train_files)), test_size=data_config.val_split,
+            stratify=train_file_labels, random_state=42,
+        )
+        val_files = [train_files[i] for i in val_idx]
+        train_files = [train_files[i] for i in train_idx]
+        print(f"[Data] Train→Val split: {len(train_files)} train + {len(val_files)} val")
+
+        # 重建数据集
+        from copy import deepcopy
+        ppg_val = deepcopy(ppg_train)
+        ppg_val.files = val_files
+        ppg_train.files = train_files
+
+        val_dataset = ppg_val
+        if use_dual and ecg_dir is not None:
+            ecg_val = deepcopy(ecg_train)
+            ecg_val.files = val_files
+            ecg_train.files = train_files
+            val_dataset = DualDownstreamDataset(ppg_val, ecg_val)
+            train_dataset = DualDownstreamDataset(ppg_train, ecg_train)
+        else:
+            train_dataset = ppg_train
+            val_dataset = ppg_val
+
+        val_loader = DataLoader(
+            val_dataset, batch_size=train_config.downstream_batch_size,
+            shuffle=False, num_workers=4, pin_memory=True,
+        )
+
     train_loader = DataLoader(
         train_dataset, batch_size=train_config.downstream_batch_size,
         shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
@@ -110,8 +159,9 @@ def build_downstream_dataloaders(
         test_dataset, batch_size=train_config.downstream_batch_size,
         shuffle=False, num_workers=4, pin_memory=True,
     )
-    print(f"[Data] train={len(train_dataset)} test={len(test_dataset)}")
-    return train_loader, test_loader, train_dataset, test_dataset
+    vlen = len(val_dataset) if val_dataset is not None else 0
+    print(f"[Data] train={len(train_dataset)} val={vlen} test={len(test_dataset)}")
+    return train_loader, val_loader, test_loader, train_dataset, test_dataset
 
 
 # ── Encoder ─────────────────────────────────────────────────────
@@ -534,7 +584,7 @@ def train_downstream(
         print(f"[SingleChannel] No ECG data at {ecg_data_dir} → PPG only")
 
     # Data
-    train_loader, test_loader, train_ds, test_ds = build_downstream_dataloaders(
+    train_loader, val_loader, test_loader, train_ds, test_ds = build_downstream_dataloaders(
         config.data, config.train, dataset, use_dual=use_dual,
     )
 
@@ -696,8 +746,9 @@ def train_downstream(
                 cotrain_mode=use_cotrain, ecg_model=ecg_encoder,
                 classifier=model.classifier if use_cotrain else None,
             )
+            eval_loader = val_loader if val_loader is not None else test_loader
             test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate(
-                model, test_loader, criterion, device, num_classes, is_dual=use_dual,
+                model, eval_loader, criterion, device, num_classes, is_dual=use_dual,
             )
 
             if sched_mode == "epoch":

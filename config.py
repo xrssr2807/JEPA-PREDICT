@@ -30,6 +30,7 @@ class DataConfig:
 
     # ★ 信号质量门控：过滤低质量PPG样本 (PPG BP综述: 使用SQA后精度提升19-24%)
     signal_quality_gate: float = 0.0  # 0=关闭 (SQI对CHD数据过滤过严)
+    val_split: float = 0.15  # 训练集留出15%做验证集 (按标签分层)
     signal_align_to: int = 0  # 下游信号对齐到预训练长度 (0=不对齐)
 
     # Augmentation (PhysioAugment — applied to ECG context signal)
@@ -160,12 +161,12 @@ class TrainConfig:
     ema_schedule: str = "cosine"  # cosine schedule for target encoder momentum
 
     # Downstream
-    downstream_epochs: int = 100
-    downstream_batch_size: int = 128
-    downstream_lr: float = 5e-4  # FT base=5e-5 (anti-overfit)
+    downstream_epochs: int = 50
+    downstream_batch_size: int = 256
+    downstream_lr: float = 5e-4  # FT base=5e-5 (anti-overfit, 最优)
     downstream_min_lr: float = 1e-6
     downstream_warmup_epochs: int = 5
-    downstream_probe_epochs: int = 30   # 信号对齐后跳过probe, 直接FT
+    downstream_probe_epochs: int = 20  # AUC在E20后不再提升
     downstream_scheduler: str = "step"  # "epoch" or "step" (step-based for warmup+cosine)
 
     # ★ Token 对齐续训练 (冻结 target, 训练 context 对齐到 target)
