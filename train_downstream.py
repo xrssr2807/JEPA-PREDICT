@@ -393,7 +393,9 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                 proj_ppg=None, proj_ecg=None,
                 ecg_loader=None, distill_lambda=0.5,
                 cotrain_mode=False, ecg_model=None, classifier=None,
-                multilabel=False):
+                multilabel=False, focus_label_index: int = 4,
+                focus_loss_weight: float = 0.0,
+                focus_pos_weight: Optional[torch.Tensor] = None):
     """Single training epoch with optional ECG distillation."""
     model.train()
     if distill_mode:
@@ -457,6 +459,14 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
             else:
                 logits = model(x)
                 loss = criterion(logits, labels)
+
+        if multilabel and focus_loss_weight > 0 and 0 <= focus_label_index < logits.size(1):
+            focus_logits = logits[:, focus_label_index]
+            focus_labels = labels[:, focus_label_index].float()
+            focus_loss = F.binary_cross_entropy_with_logits(
+                focus_logits, focus_labels, pos_weight=focus_pos_weight
+            )
+            loss = loss + focus_loss_weight * focus_loss
 
         optimizer.zero_grad()
         if not torch.isfinite(loss):
@@ -774,6 +784,23 @@ def format_multilabel_metrics_table(rows: List[dict]) -> str:
     return "\n".join(lines)
 
 
+def get_focus_auc(auc_list: List[float], focus_index: int) -> float:
+    """Return AUC for the focused label, falling back to macro AUC if needed."""
+    if 0 <= focus_index < len(auc_list):
+        return float(auc_list[focus_index])
+    return float(np.mean(auc_list)) if auc_list else 0.5
+
+
+def compute_best_metric(macro_auc: float, focus_auc: float, train_config: TrainConfig) -> float:
+    """Metric used for checkpoint selection and early stopping."""
+    if train_config.best_metric == "chd_auc":
+        return focus_auc
+    if train_config.best_metric == "hybrid":
+        alpha = train_config.best_metric_chd_alpha
+        return alpha * focus_auc + (1.0 - alpha) * macro_auc
+    return macro_auc
+
+
 def compute_multilabel_pos_weight(dataset, device, max_weight: float = 20.0):
     """Compute BCE pos_weight from multi-label train files."""
     if not all(hasattr(dataset, attr) for attr in ("files", "data_dir", "disease_labels")):
@@ -979,20 +1006,32 @@ def train_downstream(
             pos_weight = compute_pos_weight(train_ds, num_classes, device)
 
     # ── Criterion ──
+    criterion_loss_type = config.train.multilabel_loss_type if multilabel else config.train.loss_type
+    criterion_pos_weight = pos_weight
+    if multilabel and criterion_loss_type == "asl":
+        # ASL already down-weights easy negatives; use pos_weight only in the
+        # focused CHD auxiliary BCE term below.
+        criterion_pos_weight = None
     criterion = build_criterion(
-        loss_type=config.train.loss_type,
+        loss_type=criterion_loss_type,
         num_classes=num_classes,
-        pos_weight=pos_weight,
+        pos_weight=criterion_pos_weight,
         gamma=config.train.focal_gamma,
         gamma_neg=config.train.asl_gamma_neg,
         gamma_pos=config.train.asl_gamma_pos,
         clip=config.train.asl_clip,
         label_smoothing=config.train.label_smoothing,
     )
-    if multilabel:
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     print(f"[Loss] {type(criterion).__name__}"
           f"{' pos_weight=' + str([round(w,2) for w in pos_weight.tolist()]) if pos_weight is not None else ''}")
+    focus_idx = config.train.chd_label_index
+    focus_pos_weight = pos_weight[focus_idx] if (multilabel and pos_weight is not None) else None
+    if multilabel:
+        print(
+            f"[Focus] CHD label index={focus_idx} "
+            f"extra_loss_weight={config.train.chd_focus_loss_weight} "
+            f"best_metric={config.train.best_metric}"
+        )
 
     # ── Phase 1: Linear Probe ──
     n_probe = config.train.downstream_probe_epochs
@@ -1030,6 +1069,9 @@ def train_downstream(
                 cotrain_mode=use_cotrain, ecg_model=ecg_encoder,
                 classifier=model.classifier if use_cotrain else None,
                 multilabel=multilabel,
+                focus_label_index=focus_idx,
+                focus_loss_weight=config.train.chd_focus_loss_weight if multilabel else 0.0,
+                focus_pos_weight=focus_pos_weight,
             )
             eval_loader = val_loader if val_loader is not None else test_loader
             if multilabel:
@@ -1040,6 +1082,7 @@ def train_downstream(
                 test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate(
                     model, eval_loader, criterion, device, num_classes, is_dual=use_dual,
                 )
+            focus_auc = get_focus_auc(auc_list, focus_idx) if multilabel else None
 
             if sched_mode == "epoch":
                 scheduler.step()
@@ -1048,6 +1091,8 @@ def train_downstream(
                         f"Train L={train_loss:.4f} Acc={train_acc:.2f}% | "
                         f"Test L={test_loss:.4f} Acc={test_acc:5.2f}% AUC={auc:.4f} "
                         f"P={prec:.4f} R={rec:.4f} F1={f1:.4f} F0.5={f05:.4f}")
+            if focus_auc is not None:
+                log_line += f" CHD_AUC={focus_auc:.4f}"
             print(log_line)
             log_fh.write(log_line + "\n"); log_fh.flush()
     else:
@@ -1086,7 +1131,7 @@ def train_downstream(
 
     scheduler, sched_mode = build_scheduler(optimizer, config.train, ft_steps)
 
-    best_auc = 0.0
+    best_score = float("-inf")
     best_state = None
     no_improve = 0
 
@@ -1095,6 +1140,9 @@ def train_downstream(
             model, train_loader, optimizer, criterion, device,
             scheduler=scheduler, sched_mode=sched_mode, is_dual=use_dual, distill_mode=use_distill, ecg_encoder=ecg_encoder, proj_ppg=proj_ppg, proj_ecg=proj_ecg, ecg_loader=ecg_train_loader, distill_lambda=distill_lambda,
             multilabel=multilabel,
+            focus_label_index=focus_idx,
+            focus_loss_weight=config.train.chd_focus_loss_weight if multilabel else 0.0,
+            focus_pos_weight=focus_pos_weight,
         )
         eval_loader = val_loader if val_loader is not None else test_loader
         eval_name = "Val" if val_loader is not None else "Test"
@@ -1106,6 +1154,10 @@ def train_downstream(
             test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate(
                 model, eval_loader, criterion, device, num_classes, is_dual=use_dual,
             )
+        focus_auc = get_focus_auc(auc_list, focus_idx) if multilabel else None
+        selected_metric = (
+            compute_best_metric(auc, focus_auc, config.train) if multilabel else auc
+        )
 
         if sched_mode == "epoch":
             scheduler.step()
@@ -1115,21 +1167,25 @@ def train_downstream(
                     f"Train L={train_loss:.4f} Acc={train_acc:.2f}% | "
                     f"{eval_name} L={test_loss:.4f} Acc={test_acc:5.2f}% AUC={auc:.4f} "
                     f"P={prec:.4f} R={rec:.4f} F1={f1:.4f} F0.5={f05:.4f} | lr={lr:.2e}")
+        if focus_auc is not None:
+            log_line += f" CHD_AUC={focus_auc:.4f} Select={selected_metric:.4f}"
         print(log_line)
         log_fh.write(log_line + "\n"); log_fh.flush()
 
-        if auc > best_auc:
-            best_auc = auc
+        if selected_metric > best_score:
+            best_score = selected_metric
             best_state = {
                 "epoch": epoch, "model_state_dict": copy.deepcopy(model.state_dict()),
                 "val_acc": test_acc, "val_auc": auc, "val_f1": f1,
+                "val_chd_auc": focus_auc, "val_best_metric": selected_metric,
+                "best_metric": config.train.best_metric,
             }
             no_improve = 0
         else:
             no_improve += 1
 
         if no_improve >= 5:
-            print(f"\n[EarlyStop] AUC 连续 {no_improve} epoch 未提升 → 停止")
+            print(f"\n[EarlyStop] {config.train.best_metric} no improvement for {no_improve} epochs -> stop")
             break
 
     # ── Final Report ──

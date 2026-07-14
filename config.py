@@ -188,6 +188,11 @@ class TrainConfig:
     asl_clip: float = 0.05
     label_smoothing: float = 0.0
     auto_pos_weight: bool = True  # compute pos_weight from training data
+    multilabel_loss_type: str = "asl"  # "asl" | "bce"
+    chd_label_index: int = 4  # 冠心病在 multidisease_labels 中的索引
+    chd_focus_loss_weight: float = 1.0  # extra BCE loss weight for 冠心病
+    best_metric: str = "chd_auc"  # "chd_auc" | "macro_auc" | "hybrid"
+    best_metric_chd_alpha: float = 0.7  # hybrid = alpha*CHD_AUC + (1-alpha)*macro_AUC
 
 
 @dataclass
