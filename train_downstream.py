@@ -36,12 +36,15 @@ from sklearn.metrics import (
 )
 
 from config import Config, DataConfig, ModelConfig, TrainConfig
-from dataset.data import DownstreamDataset, DualDownstreamDataset, MultiDiseaseDataset
+from dataset.data import (
+    DownstreamDataset, DualDownstreamDataset,
+    MultiDiseaseDataset, MultiDiseasePatientMILDataset,
+)
 from models.encoder import SignalEncoder
 from models.classifier import (
     SignalClassifier, DualChannelClassifier,
     SignalClassifierCoT, DualChannelClassifierCoT,
-    MultiScaleClassifier,
+    MultiScaleClassifier, PatientMILClassifier,
 )
 from models.losses import build_criterion, compute_pos_weight
 
@@ -104,7 +107,7 @@ def build_downstream_dataloaders(
             disease_labels=data_config.multidisease_labels,
             normalize=data_config.normalize,
             normalize_clip=data_config.normalize_clip,
-            channel=0,
+            channel=data_config.multidisease_channel,
             target_length=target_len,
         )
         test_dataset = MultiDiseaseDataset(
@@ -113,7 +116,7 @@ def build_downstream_dataloaders(
             disease_labels=data_config.multidisease_labels,
             normalize=data_config.normalize,
             normalize_clip=data_config.normalize_clip,
-            channel=0,
+            channel=data_config.multidisease_channel,
             target_length=target_len,
         )
         val_dataset = None
@@ -130,6 +133,45 @@ def build_downstream_dataloaders(
             train_dataset.files = train_files
             val_dataset.files = val_files
             print(f"[Data] UID-group train/val split: {len(train_files)} train + {len(val_files)} val")
+
+        if data_config.multidisease_patient_mil:
+            train_dataset = MultiDiseasePatientMILDataset(
+                data_dir=data_config.multidisease_dir,
+                split="train",
+                disease_labels=data_config.multidisease_labels,
+                normalize=data_config.normalize,
+                normalize_clip=data_config.normalize_clip,
+                channel=data_config.multidisease_channel,
+                target_length=target_len,
+                max_segments=data_config.multidisease_mil_segments,
+                files=train_dataset.files,
+                train=True,
+            )
+            if val_dataset is not None:
+                val_dataset = MultiDiseasePatientMILDataset(
+                    data_dir=data_config.multidisease_dir,
+                    split="train",
+                    disease_labels=data_config.multidisease_labels,
+                    normalize=data_config.normalize,
+                    normalize_clip=data_config.normalize_clip,
+                    channel=data_config.multidisease_channel,
+                    target_length=target_len,
+                    max_segments=data_config.multidisease_mil_segments,
+                    files=val_dataset.files,
+                    train=False,
+                )
+            test_dataset = MultiDiseasePatientMILDataset(
+                data_dir=data_config.multidisease_dir,
+                split="test",
+                disease_labels=data_config.multidisease_labels,
+                normalize=data_config.normalize,
+                normalize_clip=data_config.normalize_clip,
+                channel=data_config.multidisease_channel,
+                target_length=target_len,
+                max_segments=data_config.multidisease_mil_segments,
+                files=test_dataset.files,
+                train=False,
+            )
 
         train_loader = DataLoader(
             train_dataset, batch_size=train_config.downstream_batch_size,
@@ -247,9 +289,9 @@ def build_downstream_dataloaders(
 
 # ── Encoder ─────────────────────────────────────────────────────
 
-def build_encoder(model_config: ModelConfig) -> SignalEncoder:
+def build_encoder(model_config: ModelConfig, in_channels: Optional[int] = None) -> SignalEncoder:
     return SignalEncoder(
-        in_channels=model_config.in_channels,
+        in_channels=in_channels or model_config.in_channels,
         cnn_channels=tuple(model_config.cnn_channels),
         cnn_kernel_sizes=tuple(model_config.cnn_kernel_sizes),
         cnn_strides=tuple(model_config.cnn_strides),
@@ -268,9 +310,10 @@ def build_encoder(model_config: ModelConfig) -> SignalEncoder:
 def load_pretrained_encoder(
     checkpoint_path: str, model_config: ModelConfig,
     encoder_type: str, device: torch.device,
+    in_channels: Optional[int] = None,
 ) -> SignalEncoder:
     """Load a pre-trained encoder from JEPA checkpoint."""
-    encoder = build_encoder(model_config).to(device)
+    encoder = build_encoder(model_config, in_channels=in_channels).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
 
     key = f"{encoder_type}_encoder"
@@ -283,6 +326,18 @@ def load_pretrained_encoder(
             k[len(prefix):]: v for k, v in msd.items()
             if k.startswith(prefix)
         }
+
+    first_conv_key = "cnn.conv_blocks.0.0.weight"
+    if first_conv_key in state_dict:
+        old_w = state_dict[first_conv_key]
+        new_w = encoder.state_dict()[first_conv_key]
+        if old_w.shape != new_w.shape and old_w.dim() == 3 and new_w.dim() == 3:
+            if old_w.size(1) == 1 and new_w.size(1) > 1:
+                state_dict[first_conv_key] = old_w.repeat(1, new_w.size(1), 1) / new_w.size(1)
+                print(f"[Encoder] Adapted first conv 1ch -> {new_w.size(1)}ch")
+            elif new_w.size(1) == 1:
+                state_dict[first_conv_key] = old_w.mean(dim=1, keepdim=True)
+                print(f"[Encoder] Adapted first conv {old_w.size(1)}ch -> 1ch")
 
     encoder.load_state_dict(state_dict, strict=True)
     print(f"Loaded {encoder_type}_encoder from {checkpoint_path}")
@@ -920,6 +975,17 @@ def train_downstream(
     else:
         num_classes = config.data.num_classes
     print(f"Num classes: {num_classes}")
+    downstream_in_channels = (
+        2 if multilabel and config.data.multidisease_channel == "both"
+        else config.model.in_channels
+    )
+    if multilabel:
+        print(
+            f"[MultiDisease] channel={config.data.multidisease_channel} "
+            f"in_channels={downstream_in_channels} "
+            f"patient_mil={config.data.multidisease_patient_mil} "
+            f"multiscale={config.data.multidisease_use_multiscale or config.model.use_multiscale}"
+        )
 
     # ── Check for ECG modes ──
     ecg_data_dir = os.path.join(config.data.chd_ecg_dir, config.data.chd_ecg_subdir)
@@ -1012,12 +1078,27 @@ def train_downstream(
 
     # Load encoder (PPG student / primary) — skip if dual-channel already set
     if not use_dual:
-        encoder = load_pretrained_encoder(checkpoint_path, config.model, "target", device)
+        encoder = load_pretrained_encoder(
+            checkpoint_path, config.model, "target", device,
+            in_channels=downstream_in_channels,
+        )
 
     # Build classifier (skip if dual-channel already created above)
     if not use_dual and not use_distill and not use_cotrain:
         # Pure PPG single-channel
-        if config.model.use_multiscale:
+        use_multiscale_head = config.model.use_multiscale or (
+            multilabel and config.data.multidisease_use_multiscale
+        )
+        if multilabel and config.data.multidisease_patient_mil:
+            print("[Model] Patient-level MIL head"
+                  f" (multiscale={use_multiscale_head})")
+            model = PatientMILClassifier(
+                encoder=encoder,
+                encoder_dim=config.model.transformer_dim,
+                num_classes=num_classes,
+                use_multiscale=use_multiscale_head,
+            ).to(device)
+        elif use_multiscale_head:
             print("[Model] MultiScale classification head")
             model = MultiScaleClassifier(
                 encoder=encoder, encoder_dim=config.model.transformer_dim,

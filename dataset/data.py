@@ -515,12 +515,16 @@ class MultiDiseaseDataset(Dataset):
         normalize_clip: float = 10.0,
         channel: Optional[int] = 0,
         target_length: int = None,
+        files: Optional[List[str]] = None,
     ):
         self.data_dir = data_dir
         self.split = split
         self.normalize = normalize
         self.normalize_clip = normalize_clip
-        self.channel = channel
+        if isinstance(channel, str):
+            self.channel = None if channel == "both" else int(channel)
+        else:
+            self.channel = channel
         self.target_length = target_length
         self.disease_labels = disease_labels or [
             "高血压", "高血糖", "高血脂", "下肢动脉硬化闭塞症", "冠心病",
@@ -528,12 +532,15 @@ class MultiDiseaseDataset(Dataset):
         ]
 
         prefix = split + "_"
-        self.files = sorted([
-            f for f in os.listdir(data_dir)
-            if f.endswith(".pkl") and f.startswith(prefix)
-        ])
+        if files is None:
+            self.files = sorted([
+                f for f in os.listdir(data_dir)
+                if f.endswith(".pkl") and f.startswith(prefix)
+            ])
+        else:
+            self.files = sorted(files)
         print(f"[MultiDiseaseDataset] {split}: {len(self.files)} files from {data_dir}")
-        print(f"[MultiDiseaseDataset] labels={self.disease_labels}")
+        print(f"[MultiDiseaseDataset] channel={channel} labels={self.disease_labels}")
 
     def __len__(self) -> int:
         return len(self.files)
@@ -594,3 +601,90 @@ class MultiDiseaseDataset(Dataset):
         uid = str(sample.get("uid", self.files[idx].split("_")[1]))
 
         return torch.from_numpy(data.copy()).float(), torch.from_numpy(labels), uid
+
+
+class MultiDiseasePatientMILDataset(Dataset):
+    """
+    Patient-level multi-instance dataset.
+
+    Each item is a fixed-size bag of segments from one UID:
+        segments: (S, C, L)
+        labels:   (num_labels,)
+        uid:      str
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        split: str = "train",
+        disease_labels: Optional[List[str]] = None,
+        normalize: str = "zscore",
+        normalize_clip: float = 10.0,
+        channel: Optional[int] = 0,
+        target_length: int = None,
+        max_segments: int = 8,
+        files: Optional[List[str]] = None,
+        train: bool = True,
+    ):
+        self.segment_dataset = MultiDiseaseDataset(
+            data_dir=data_dir,
+            split=split,
+            disease_labels=disease_labels,
+            normalize=normalize,
+            normalize_clip=normalize_clip,
+            channel=channel,
+            target_length=target_length,
+            files=files,
+        )
+        self.max_segments = max_segments
+        self.train = train
+        self.uid_to_indices = {}
+        for idx, fname in enumerate(self.segment_dataset.files):
+            uid = self._uid_from_file(fname)
+            self.uid_to_indices.setdefault(uid, []).append(idx)
+        self.uids = sorted(self.uid_to_indices)
+        self.files = [
+            self.segment_dataset.files[self.uid_to_indices[uid][0]]
+            for uid in self.uids
+        ]
+        self.data_dir = data_dir
+        self.disease_labels = self.segment_dataset.disease_labels
+        print(
+            f"[MultiDiseasePatientMILDataset] {split}: {len(self.uids)} patients, "
+            f"max_segments={max_segments}"
+        )
+
+    @staticmethod
+    def _uid_from_file(fname: str) -> str:
+        parts = fname.split("_")
+        if parts[0] in {"train", "test", "val"} and len(parts) >= 3:
+            return parts[1]
+        return parts[0]
+
+    def __len__(self) -> int:
+        return len(self.uids)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
+        uid = self.uids[idx]
+        indices = self.uid_to_indices[uid]
+        if len(indices) >= self.max_segments:
+            if self.train:
+                chosen = np.random.choice(indices, self.max_segments, replace=False)
+            else:
+                chosen = np.linspace(0, len(indices) - 1, self.max_segments).round().astype(int)
+                chosen = [indices[i] for i in chosen]
+        else:
+            if self.train:
+                chosen = np.random.choice(indices, self.max_segments, replace=True)
+            else:
+                repeats = int(np.ceil(self.max_segments / len(indices)))
+                chosen = (indices * repeats)[:self.max_segments]
+
+        segments = []
+        label = None
+        for segment_idx in chosen:
+            x, y, _ = self.segment_dataset[int(segment_idx)]
+            segments.append(x)
+            if label is None:
+                label = y
+        return torch.stack(segments, dim=0), label, uid

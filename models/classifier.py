@@ -550,6 +550,87 @@ class MultiScaleClassifier(nn.Module):
         return logits
 
 
+class PatientMILClassifier(nn.Module):
+    """
+    Patient-level multi-instance classifier.
+
+    Input is a bag of segments per patient: (B, S, C, L). Each segment is
+    encoded independently, then an attention pooling head aggregates segment
+    embeddings into one patient representation.
+    """
+
+    def __init__(
+        self,
+        encoder: SignalEncoder,
+        encoder_dim: int = 512,
+        num_classes: int = 9,
+        use_multiscale: bool = True,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.use_multiscale = use_multiscale
+
+        rep_dim = encoder_dim * 3 if use_multiscale else encoder_dim
+        self.segment_proj = nn.Sequential(
+            nn.Linear(rep_dim, encoder_dim),
+            nn.BatchNorm1d(encoder_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.attention = nn.Sequential(
+            nn.Linear(encoder_dim, encoder_dim // 2),
+            nn.Tanh(),
+            nn.Linear(encoder_dim // 2, 1),
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(encoder_dim, encoder_dim // 2),
+            nn.BatchNorm1d(encoder_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(encoder_dim // 2, num_classes),
+        )
+
+    def freeze_encoder(self):
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+
+    def unfreeze_encoder(self):
+        for param in self.encoder.parameters():
+            param.requires_grad = True
+
+    @staticmethod
+    def _multiscale_from_tokens(tokens: torch.Tensor) -> torch.Tensor:
+        B, N, D = tokens.shape
+        n1 = max((N // 2) * 2, 2)
+        n2 = max((N // 4) * 4, 4)
+        s1 = tokens[:, :n1].reshape(B, -1, 2, D).mean(dim=2).mean(dim=1)
+        s2 = tokens[:, :n2].reshape(B, -1, 4, D).mean(dim=2).mean(dim=1)
+        s3 = tokens.mean(dim=1)
+        return torch.cat([s1, s2, s3], dim=-1)
+
+    def forward(self, x: torch.Tensor, return_embedding: bool = False):
+        if x.dim() != 4:
+            raise ValueError(f"PatientMILClassifier expects (B,S,C,L), got {tuple(x.shape)}")
+        B, S, C, L = x.shape
+        flat = x.reshape(B * S, C, L)
+
+        if self.use_multiscale:
+            _, tokens = self.encoder(flat, return_all=True)
+            segment_repr = self._multiscale_from_tokens(tokens)
+        else:
+            segment_repr, _ = self.encoder(flat)
+
+        segment_repr = self.segment_proj(segment_repr).reshape(B, S, -1)
+        attn = torch.softmax(self.attention(segment_repr).squeeze(-1), dim=1)
+        patient_repr = (segment_repr * attn.unsqueeze(-1)).sum(dim=1)
+        logits = self.classifier(patient_repr)
+
+        if return_embedding:
+            return logits, patient_repr
+        return logits
+
+
 class SimpleFusion(nn.Module):
     """
     ★ M2AE 风格简单融合分类头 (替代 DualChannelClassifierCoT)。

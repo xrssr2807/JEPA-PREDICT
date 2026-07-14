@@ -33,6 +33,10 @@ class DataConfig:
     signal_quality_gate: float = 0.0  # 0=关闭 (SQI对CHD数据过滤过严)
     val_split: float = 0.15  # 训练集留出15%做验证集 (按标签分层)
     signal_align_to: int = 0  # 下游信号对齐到预训练长度 (0=不对齐)
+    multidisease_channel: str = "both"  # "0" | "1" | "both"
+    multidisease_use_multiscale: bool = True
+    multidisease_patient_mil: bool = True
+    multidisease_mil_segments: int = 8
 
     # Augmentation (PhysioAugment — applied to ECG context signal)
     use_augment: bool = False
