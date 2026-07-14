@@ -173,18 +173,27 @@ def build_downstream_dataloaders(
                 train=False,
             )
 
+        batch_size = train_config.downstream_batch_size
+        if data_config.multidisease_patient_mil:
+            batch_size = getattr(train_config, "multidisease_mil_batch_size", batch_size)
+            print(
+                f"[Data] Patient-MIL batch_size={batch_size} "
+                f"segments={data_config.multidisease_mil_segments} "
+                f"(effective segments/step={batch_size * data_config.multidisease_mil_segments})"
+            )
+
         train_loader = DataLoader(
-            train_dataset, batch_size=train_config.downstream_batch_size,
+            train_dataset, batch_size=batch_size,
             shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
         )
         val_loader = None
         if val_dataset is not None:
             val_loader = DataLoader(
-                val_dataset, batch_size=train_config.downstream_batch_size,
+                val_dataset, batch_size=batch_size,
                 shuffle=False, num_workers=4, pin_memory=True,
             )
         test_loader = DataLoader(
-            test_dataset, batch_size=train_config.downstream_batch_size,
+            test_dataset, batch_size=batch_size,
             shuffle=False, num_workers=4, pin_memory=True,
         )
         vlen = len(val_dataset) if val_dataset is not None else 0
@@ -1091,12 +1100,14 @@ def train_downstream(
         )
         if multilabel and config.data.multidisease_patient_mil:
             print("[Model] Patient-level MIL head"
-                  f" (multiscale={use_multiscale_head})")
+                  f" (multiscale={use_multiscale_head}, "
+                  f"encoder_chunk_size={config.data.multidisease_mil_encoder_chunk_size})")
             model = PatientMILClassifier(
                 encoder=encoder,
                 encoder_dim=config.model.transformer_dim,
                 num_classes=num_classes,
                 use_multiscale=use_multiscale_head,
+                encoder_chunk_size=config.data.multidisease_mil_encoder_chunk_size,
             ).to(device)
         elif use_multiscale_head:
             print("[Model] MultiScale classification head")

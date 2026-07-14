@@ -37,6 +37,7 @@ class DataConfig:
     multidisease_use_multiscale: bool = True
     multidisease_patient_mil: bool = True
     multidisease_mil_segments: int = 8
+    multidisease_mil_encoder_chunk_size: int = 64  # encode at most this many segments at once
 
     # Augmentation (PhysioAugment — applied to ECG context signal)
     use_augment: bool = False
@@ -172,6 +173,7 @@ class TrainConfig:
     # Downstream
     downstream_epochs: int = 50
     downstream_batch_size: int = 256
+    multidisease_mil_batch_size: int = 32  # patient-level MIL is B*S segments, so keep it smaller
     downstream_lr: float = 5e-4  # FT base=5e-5 (anti-overfit, 最优)
     downstream_min_lr: float = 1e-6
     downstream_warmup_epochs: int = 5

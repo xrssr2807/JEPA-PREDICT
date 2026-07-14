@@ -566,10 +566,12 @@ class PatientMILClassifier(nn.Module):
         num_classes: int = 9,
         use_multiscale: bool = True,
         dropout: float = 0.3,
+        encoder_chunk_size: int = 0,
     ):
         super().__init__()
         self.encoder = encoder
         self.use_multiscale = use_multiscale
+        self.encoder_chunk_size = int(encoder_chunk_size or 0)
 
         rep_dim = encoder_dim * 3 if use_multiscale else encoder_dim
         self.segment_proj = nn.Sequential(
@@ -609,17 +611,32 @@ class PatientMILClassifier(nn.Module):
         s3 = tokens.mean(dim=1)
         return torch.cat([s1, s2, s3], dim=-1)
 
+    def _encode_flat(self, flat: torch.Tensor) -> torch.Tensor:
+        chunk_size = self.encoder_chunk_size
+        if chunk_size <= 0 or flat.size(0) <= chunk_size:
+            if self.use_multiscale:
+                _, tokens = self.encoder(flat, return_all=True)
+                return self._multiscale_from_tokens(tokens)
+            segment_repr, _ = self.encoder(flat)
+            return segment_repr
+
+        reps = []
+        for start in range(0, flat.size(0), chunk_size):
+            chunk = flat[start:start + chunk_size]
+            if self.use_multiscale:
+                _, tokens = self.encoder(chunk, return_all=True)
+                reps.append(self._multiscale_from_tokens(tokens))
+            else:
+                segment_repr, _ = self.encoder(chunk)
+                reps.append(segment_repr)
+        return torch.cat(reps, dim=0)
+
     def forward(self, x: torch.Tensor, return_embedding: bool = False):
         if x.dim() != 4:
             raise ValueError(f"PatientMILClassifier expects (B,S,C,L), got {tuple(x.shape)}")
         B, S, C, L = x.shape
         flat = x.reshape(B * S, C, L)
-
-        if self.use_multiscale:
-            _, tokens = self.encoder(flat, return_all=True)
-            segment_repr = self._multiscale_from_tokens(tokens)
-        else:
-            segment_repr, _ = self.encoder(flat)
+        segment_repr = self._encode_flat(flat)
 
         segment_repr = self.segment_proj(segment_repr).reshape(B, S, -1)
         attn = torch.softmax(self.attention(segment_repr).squeeze(-1), dim=1)
