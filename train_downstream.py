@@ -628,7 +628,8 @@ def evaluate(model, dataloader, criterion, device, num_classes: int,
 
 @torch.no_grad()
 def evaluate_multilabel(model, dataloader, criterion, device,
-                        label_names: List[str], aggregate_by_uid: bool = True):
+                        label_names: List[str], aggregate_by_uid: bool = True,
+                        thresholds: Optional[np.ndarray] = None):
     """Evaluate multi-label disease prediction with sigmoid probabilities."""
     model.eval()
     running_loss = 0.0
@@ -675,7 +676,10 @@ def evaluate_multilabel(model, dataloader, criterion, device,
     logits_arr = np.nan_to_num(logits_arr, nan=0.0, posinf=60.0, neginf=-60.0)
     logits_arr = np.clip(logits_arr, -60.0, 60.0)
     probs = 1.0 / (1.0 + np.exp(-logits_arr))
-    preds = (probs >= 0.5).astype(np.float32)
+    if thresholds is None:
+        thresholds = np.full(labels_arr.shape[1], 0.5, dtype=np.float32)
+    thresholds = np.asarray(thresholds, dtype=np.float32).reshape(1, -1)
+    preds = (probs >= thresholds).astype(np.float32)
 
     auc_list = []
     for c in range(labels_arr.shape[1]):
@@ -703,6 +707,32 @@ def evaluate_multilabel(model, dataloader, criterion, device,
 
 
 # ── Main Pipeline ───────────────────────────────────────────────
+
+def tune_multilabel_thresholds(labels: np.ndarray, probs: np.ndarray,
+                               beta: float = 1.0,
+                               min_threshold: float = 0.05,
+                               max_threshold: float = 0.95) -> np.ndarray:
+    """Tune one decision threshold per label on validation predictions."""
+    grid = np.linspace(min_threshold, max_threshold, 91)
+    thresholds = np.full(labels.shape[1], 0.5, dtype=np.float32)
+
+    for c in range(labels.shape[1]):
+        y_true = labels[:, c]
+        if len(np.unique(y_true)) < 2:
+            continue
+
+        best_score = -1.0
+        best_thr = 0.5
+        for thr in grid:
+            y_pred = (probs[:, c] >= thr).astype(np.float32)
+            score = fbeta_score(y_true, y_pred, beta=beta, zero_division=0)
+            if score > best_score:
+                best_score = score
+                best_thr = float(thr)
+        thresholds[c] = best_thr
+
+    return thresholds
+
 
 def compute_multilabel_pos_weight(dataset, device, max_weight: float = 20.0):
     """Compute BCE pos_weight from multi-label train files."""
@@ -1071,9 +1101,21 @@ def train_downstream(
     if best_state is not None:
         model.load_state_dict(best_state["model_state_dict"])
     if multilabel:
+        thresholds = None
+        if val_loader is not None:
+            (_, _, _, _, _, _, _, _, _, _, val_labels, val_probs) = evaluate_multilabel(
+                model, val_loader, criterion, device, config.data.multidisease_labels,
+            )
+            thresholds = tune_multilabel_thresholds(val_labels, val_probs, beta=1.0)
+            print(f"Tuned thresholds:     {[round(float(t), 3) for t in thresholds]}")
+            log_fh.write(f"Tuned thresholds: {[round(float(t), 3) for t in thresholds]}\n")
+            if best_state is not None:
+                best_state["thresholds"] = thresholds.tolist()
+
         (_, test_acc, auc, auc_list,
          prec, rec, f1, f05, report, _, _, _) = evaluate_multilabel(
             model, test_loader, criterion, device, config.data.multidisease_labels,
+            thresholds=thresholds,
         )
     else:
         (_, test_acc, auc, auc_list,
