@@ -734,6 +734,46 @@ def tune_multilabel_thresholds(labels: np.ndarray, probs: np.ndarray,
     return thresholds
 
 
+def multilabel_per_class_metrics(label_names: List[str], labels: np.ndarray,
+                                 preds: np.ndarray, probs: np.ndarray,
+                                 auc_list: List[float]) -> List[dict]:
+    """Build per-disease metrics for final multi-label reporting."""
+    rows = []
+    for i, name in enumerate(label_names):
+        y_true = labels[:, i]
+        y_pred = preds[:, i]
+        precision = precision_score(y_true, y_pred, zero_division=0)
+        recall = recall_score(y_true, y_pred, zero_division=0)
+        f1 = fbeta_score(y_true, y_pred, beta=1, zero_division=0)
+        f05 = fbeta_score(y_true, y_pred, beta=0.5, zero_division=0)
+        rows.append({
+            "name": name,
+            "auc": float(auc_list[i]) if i < len(auc_list) else 0.5,
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+            "f05": float(f05),
+            "support": int(y_true.sum()),
+            "pred_pos": int(y_pred.sum()),
+        })
+    return rows
+
+
+def format_multilabel_metrics_table(rows: List[dict]) -> str:
+    """Format per-disease metrics as a compact text table."""
+    lines = [
+        "Per-disease metrics:",
+        "Disease\tAUC\tPrecision\tRecall\tF1\tF0.5\tSupport\tPred+",
+    ]
+    for row in rows:
+        lines.append(
+            f"{row['name']}\t{row['auc']:.4f}\t{row['precision']:.4f}\t"
+            f"{row['recall']:.4f}\t{row['f1']:.4f}\t{row['f05']:.4f}\t"
+            f"{row['support']}\t{row['pred_pos']}"
+        )
+    return "\n".join(lines)
+
+
 def compute_multilabel_pos_weight(dataset, device, max_weight: float = 20.0):
     """Compute BCE pos_weight from multi-label train files."""
     if not all(hasattr(dataset, attr) for attr in ("files", "data_dir", "disease_labels")):
@@ -1113,29 +1153,50 @@ def train_downstream(
                 best_state["thresholds"] = thresholds.tolist()
 
         (_, test_acc, auc, auc_list,
-         prec, rec, f1, f05, report, _, _, _) = evaluate_multilabel(
+         prec, rec, f1, f05, report, test_preds, test_labels, test_probs) = evaluate_multilabel(
             model, test_loader, criterion, device, config.data.multidisease_labels,
             thresholds=thresholds,
         )
+        per_class_rows = multilabel_per_class_metrics(
+            config.data.multidisease_labels, test_labels, test_preds, test_probs, auc_list
+        )
+        per_class_table = format_multilabel_metrics_table(per_class_rows)
+        # In config.data.multidisease_labels, CHD/冠心病 is the 5th label.
+        chd_row = per_class_rows[4] if len(per_class_rows) > 4 else None
     else:
         (_, test_acc, auc, auc_list,
          prec, rec, f1, f05, report, _, _, _) = evaluate(
             model, test_loader, criterion, device, num_classes, is_dual=use_dual,
         )
+        per_class_table = None
+        chd_row = None
 
     print(f"Best Test Acc:       {test_acc:.2f}%")
     print(f"Best Test AUC (macro): {auc:.4f}")
     if auc_list:
         print(f"Per-class AUC:        {[round(a, 4) for a in auc_list]}")
+    if chd_row is not None:
+        print(
+            f"CHD/冠心病 AUC:        {chd_row['auc']:.4f} "
+            f"(P={chd_row['precision']:.4f}, R={chd_row['recall']:.4f}, "
+            f"F1={chd_row['f1']:.4f}, support={chd_row['support']})"
+        )
     print(f"Precision (macro):   {prec:.4f}")
     print(f"Recall (macro):      {rec:.4f}")
     print(f"F1 (macro):          {f1:.4f}")
     print(f"F0.5 (macro):        {f05:.4f}")
+    if per_class_table is not None:
+        print(f"\n{per_class_table}")
     print(f"\nClassification Report:\n{report}")
 
     # Save
     save_path = os.path.join(config.output_dir, f"downstream_{dataset}_best.pt")
     if best_state is not None:
+        if multilabel and per_class_table is not None:
+            best_state["test_auc"] = float(auc)
+            best_state["test_per_class_metrics"] = per_class_rows
+            if chd_row is not None:
+                best_state["test_chd_auc"] = float(chd_row["auc"])
         torch.save(best_state, save_path)
         print(f"Model saved → {save_path}")
         log_fh.write(f"Model saved → {save_path}\n")
@@ -1143,6 +1204,16 @@ def train_downstream(
     # ── Final log ──
     log_fh.write(f"\n{'='*60}\n")
     log_fh.write(f"FINAL | Acc={test_acc:.2f}% AUC={auc:.4f} F1={f1:.4f}\n")
+    if auc_list:
+        log_fh.write(f"Per-class AUC: {[round(float(a), 4) for a in auc_list]}\n")
+    if chd_row is not None:
+        log_fh.write(
+            f"CHD/冠心病 AUC: {chd_row['auc']:.4f} "
+            f"P={chd_row['precision']:.4f} R={chd_row['recall']:.4f} "
+            f"F1={chd_row['f1']:.4f} support={chd_row['support']}\n"
+        )
+    if per_class_table is not None:
+        log_fh.write(per_class_table + "\n")
     log_fh.write(f"Classification Report:\n{report}\n")
     log_fh.close()
 
