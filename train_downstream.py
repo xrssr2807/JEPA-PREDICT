@@ -744,6 +744,66 @@ def tune_multilabel_thresholds(labels: np.ndarray, probs: np.ndarray,
     return thresholds
 
 
+def _threshold_score(y_true: np.ndarray, y_pred: np.ndarray, metric: str) -> float:
+    if metric == "accuracy":
+        return float((y_true == y_pred).mean())
+    if metric == "precision":
+        return float(precision_score(y_true, y_pred, zero_division=0))
+    if metric == "f1":
+        return float(fbeta_score(y_true, y_pred, beta=1.0, zero_division=0))
+    return float(fbeta_score(y_true, y_pred, beta=0.5, zero_division=0))
+
+
+def tune_multilabel_thresholds_recall_floor(
+    labels: np.ndarray,
+    probs: np.ndarray,
+    recall_floor: float = 0.60,
+    opt_metric: str = "f05",
+    min_threshold: float = 0.05,
+    max_threshold: float = 0.95,
+) -> np.ndarray:
+    """Tune thresholds with a minimum recall constraint per label."""
+    grid = np.linspace(min_threshold, max_threshold, 91)
+    thresholds = np.full(labels.shape[1], 0.5, dtype=np.float32)
+
+    for c in range(labels.shape[1]):
+        y_true = labels[:, c]
+        if len(np.unique(y_true)) < 2:
+            continue
+
+        candidates = []
+        fallback = (-1.0, -1.0, 0.5)  # recall, score, threshold
+        for thr in grid:
+            y_pred = (probs[:, c] >= thr).astype(np.float32)
+            recall = recall_score(y_true, y_pred, zero_division=0)
+            score = _threshold_score(y_true, y_pred, opt_metric)
+            if recall >= recall_floor:
+                candidates.append((score, thr))
+            if recall > fallback[0] or (recall == fallback[0] and score > fallback[1]):
+                fallback = (recall, score, float(thr))
+
+        if candidates:
+            best_score, best_thr = max(candidates, key=lambda x: x[0])
+            thresholds[c] = float(best_thr)
+        else:
+            thresholds[c] = fallback[2]
+
+    return thresholds
+
+
+def tune_thresholds_from_config(labels: np.ndarray, probs: np.ndarray,
+                                train_config: TrainConfig) -> np.ndarray:
+    if train_config.threshold_strategy == "recall_floor":
+        return tune_multilabel_thresholds_recall_floor(
+            labels, probs,
+            recall_floor=train_config.threshold_recall_floor,
+            opt_metric=train_config.threshold_opt_metric,
+        )
+    return tune_multilabel_thresholds(
+        labels, probs, beta=train_config.threshold_beta,
+    )
+
+
 def multilabel_per_class_metrics(label_names: List[str], labels: np.ndarray,
                                  preds: np.ndarray, probs: np.ndarray,
                                  auc_list: List[float]) -> List[dict]:
@@ -1202,9 +1262,15 @@ def train_downstream(
             (_, _, _, _, _, _, _, _, _, _, val_labels, val_probs) = evaluate_multilabel(
                 model, val_loader, criterion, device, config.data.multidisease_labels,
             )
-            thresholds = tune_multilabel_thresholds(val_labels, val_probs, beta=1.0)
-            print(f"Tuned thresholds:     {[round(float(t), 3) for t in thresholds]}")
-            log_fh.write(f"Tuned thresholds: {[round(float(t), 3) for t in thresholds]}\n")
+            thresholds = tune_thresholds_from_config(val_labels, val_probs, config.train)
+            threshold_msg = (
+                f"Tuned thresholds ({config.train.threshold_strategy}, "
+                f"recall_floor={config.train.threshold_recall_floor}, "
+                f"metric={config.train.threshold_opt_metric}): "
+                f"{[round(float(t), 3) for t in thresholds]}"
+            )
+            print(threshold_msg)
+            log_fh.write(threshold_msg + "\n")
             if best_state is not None:
                 best_state["thresholds"] = thresholds.tolist()
 
