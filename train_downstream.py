@@ -19,6 +19,7 @@ import math
 import json
 import copy
 import pickle
+import random
 from collections import defaultdict
 from typing import Optional, Tuple, List
 
@@ -47,6 +48,24 @@ from models.classifier import (
     MultiScaleClassifier, PatientMILClassifier, DualStreamPatientMILClassifier,
 )
 from models.losses import build_criterion, compute_pos_weight
+
+
+def seed_everything(seed: int):
+    """Seed downstream initialization, sampling, shuffling, and CUDA RNGs."""
+    seed = int(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    print(f"[Seed] {seed}")
+
+
+def seed_dataloader_worker(worker_id: int):
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def uid_from_filename(fname: str) -> str:
@@ -90,6 +109,7 @@ def dataloader_performance_kwargs(train_config: TrainConfig) -> dict:
         "pin_memory": torch.cuda.is_available(),
     }
     if workers > 0:
+        kwargs["worker_init_fn"] = seed_dataloader_worker
         kwargs["persistent_workers"] = bool(
             getattr(train_config, "dataloader_persistent_workers", True)
         )
@@ -1062,6 +1082,7 @@ def train_downstream(
         checkpoint_path: path to pre-trained JEPA checkpoint
         dataset: "chd" or "arrhythmia"
     """
+    seed_everything(config.seed)
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     configure_cuda_performance(device, config.train)
     print(f"Device: {device} | Dataset: {dataset}")
@@ -1194,8 +1215,18 @@ def train_downstream(
 
     # Load encoder (PPG student / primary) — skip if dual-channel already set
     if not use_dual and not use_multidisease_dual_stream:
+        encoder_role = "target"
+        if (
+            multilabel
+            and str(config.data.multidisease_channel)
+            == str(config.data.multidisease_ecg_channel)
+        ):
+            encoder_role = "context"
+        if multilabel:
+            modality = "PPG" if encoder_role == "target" else "ECG"
+            print(f"[Model] Single-stream {modality}: {encoder_role}_encoder")
         encoder = load_pretrained_encoder(
-            checkpoint_path, config.model, "target", device,
+            checkpoint_path, config.model, encoder_role, device,
             in_channels=downstream_in_channels,
         )
 
@@ -1326,7 +1357,7 @@ def train_downstream(
         n_probe = 1  # 快速初始化, 避免冻结下坍塌
     # dual-channel uses full probe (30 epochs) — 即使不稳定, FT能恢复
     if n_probe > 0:
-        if use_multidisease_dual_stream:
+        if multilabel and config.data.multidisease_patient_mil:
             probe_batch_size = max(
                 config.train.multidisease_mil_batch_size,
                 int(config.train.multidisease_probe_batch_size),
@@ -1501,6 +1532,10 @@ def train_downstream(
                 "val_acc": test_acc, "val_auc": auc, "val_f1": f1,
                 "val_chd_auc": focus_auc, "val_best_metric": selected_metric,
                 "best_metric": config.train.best_metric,
+                "seed": config.seed,
+                "multidisease_channel": (
+                    config.data.multidisease_channel if multilabel else None
+                ),
             }
             no_improve = 0
         else:
@@ -1616,9 +1651,25 @@ if __name__ == "__main__":
                         choices=["chd", "arrhythmia", "arrhythmia_binary",
                                  "multidisease", "multilabel"])
     parser.add_argument("--output_dir", type=str, default="./outputs")
+    parser.add_argument(
+        "--multidisease_channel",
+        choices=["both", "ppg", "ecg"],
+        default=None,
+        help="Multidisease modality ablation; default keeps config.py behavior",
+    )
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     config = Config()
+    config.seed = args.seed
+    if args.multidisease_channel is not None:
+        channel_map = {
+            "both": "both",
+            "ppg": str(config.data.multidisease_ppg_channel),
+            "ecg": str(config.data.multidisease_ecg_channel),
+        }
+        config.data.multidisease_channel = channel_map[args.multidisease_channel]
+        config.data.multidisease_dual_stream = args.multidisease_channel == "both"
     config.output_dir = args.output_dir
     os.makedirs(config.output_dir, exist_ok=True)
 
