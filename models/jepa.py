@@ -193,6 +193,7 @@ class JEPA(nn.Module):
         contrast_loss_weight: float = 1.0,
         use_token_align: bool = False,
         token_align_weight: float = 0.5,
+        token_align_window: int = 3,
         use_se: bool = False,
         use_inception: bool = False,
         vicreg_sim_weight: float = 1.0,
@@ -261,7 +262,7 @@ class JEPA(nn.Module):
         self.contrast_loss_weight = contrast_loss_weight
         self.use_token_align = use_token_align
         self.token_align_weight = token_align_weight
-        self.align_window = 3  # Soft-DTW 搜索窗口 (±3 token)
+        self.align_window = int(token_align_window)
         if use_stats_loss:
             self.stats_pred_head = StatsPredHead(
                 in_dim=transformer_dim, hidden_dim=transformer_dim, num_stats=16
@@ -553,7 +554,12 @@ class JEPA(nn.Module):
 
         # ★ 一次前向同时拿 pooled embedding + token 序列 (避免二次前向导致 OOM)
         need_tokens = self.use_token_align
-        context_embed, ctx_tokens = self.forward_context(ecg_masked, return_tokens=need_tokens)
+        context_out = self.forward_context(ecg_masked, return_tokens=need_tokens)
+        if need_tokens:
+            context_embed, ctx_tokens = context_out
+        else:
+            context_embed = context_out
+            ctx_tokens = None
         target_out = self.forward_target(ppg, return_tokens=need_tokens)
         if need_tokens:
             target_embed, tgt_tokens = target_out

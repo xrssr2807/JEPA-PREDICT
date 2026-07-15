@@ -102,6 +102,7 @@ def build_model(model_config: ModelConfig) -> JEPA:
         use_inception=model_config.cnn_use_inception,
         use_token_align=model_config.use_token_align,
         token_align_weight=model_config.token_align_weight,
+        token_align_window=model_config.token_align_window,
         vicreg_sim_weight=model_config.vicreg_sim_weight,
         vicreg_var_weight=model_config.vicreg_var_weight,
         vicreg_cov_weight=model_config.vicreg_cov_weight,
@@ -115,7 +116,9 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
     # Data
     dataloader = build_dataloader(config.data, config.train)
     steps_per_epoch = len(dataloader)
-    total_steps = steps_per_epoch * config.train.pretrain_epochs
+    accum_steps = max(1, config.train.pretrain_accum_steps)
+    optimizer_steps_per_epoch = math.ceil(steps_per_epoch / accum_steps)
+    total_steps = optimizer_steps_per_epoch * config.train.pretrain_epochs
 
     # Model
     model = build_model(config.model).to(device)
@@ -125,6 +128,8 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
     trainable_params = list(model.context_encoder.parameters()) + \
                        list(model.context_proj.parameters()) + \
                        list(model.predictor.parameters())
+    if model.use_stats_loss:
+        trainable_params += list(model.stats_pred_head.parameters())
     optimizer = AdamW(
         trainable_params,
         lr=config.train.pretrain_lr,
@@ -157,7 +162,7 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
 
     # LR schedule: warmup + cosine (adjusted for resume)
     remaining_epochs = config.train.pretrain_epochs - start_epoch
-    remaining_steps = remaining_epochs * steps_per_epoch
+    remaining_steps = remaining_epochs * optimizer_steps_per_epoch
     # Skip warmup when resuming (already past warmup phase)
     if start_epoch >= config.train.pretrain_warmup_epochs:
         warmup_scheduler = LinearLR(
@@ -170,7 +175,9 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
             milestones=[1],
         )
     else:
-        warmup_steps = (config.train.pretrain_warmup_epochs - start_epoch) * steps_per_epoch
+        warmup_steps = (
+            config.train.pretrain_warmup_epochs - start_epoch
+        ) * optimizer_steps_per_epoch
         cosine_steps = remaining_steps - warmup_steps
         warmup_scheduler = LinearLR(
             optimizer, start_factor=1e-6, end_factor=1.0, total_iters=max(1, warmup_steps)
@@ -187,11 +194,13 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
     log_file = os.path.join(config.output_dir, "pretrain_log.txt")
 
     best_loss = float("inf")
+    optimizer_step = start_epoch * optimizer_steps_per_epoch
 
     for epoch in range(start_epoch, config.train.pretrain_epochs):
         model.train()
         epoch_losses = defaultdict(float)
         epoch_start = time.time()
+        optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, batch_data in enumerate(dataloader):
             # Handle both old (ecg, ppg) and new (ecg, ppg, stats) formats
@@ -212,10 +221,8 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                 ecg = lam * ecg + (1 - lam) * ecg[idx]
                 ppg = lam * ppg + (1 - lam) * ppg[idx]
 
-            global_step = epoch * steps_per_epoch + batch_idx
-
             # EMA momentum schedule (cosine towards 1.0)
-            ema_progress = global_step / total_steps
+            ema_progress = optimizer_step / max(total_steps - 1, 1)
             ema_momentum = cosine_schedule(
                 config.model.ema_momentum,
                 config.model.ema_end_momentum,
@@ -226,19 +233,21 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
             loss, info = model.compute_loss(ecg, ppg, ecg_stats)
             epoch_losses["loss"] += info.get("total_loss", loss.item())
 
-            # ★ 梯度累积: effective batch = 180×2 = 360
-            accum_steps = 2
-            loss = loss / accum_steps
-            loss.backward()
+            group_start = (batch_idx // accum_steps) * accum_steps
+            group_size = min(accum_steps, steps_per_epoch - group_start)
+            (loss / group_size).backward()
 
-            if (batch_idx + 1) % accum_steps == 0:
+            should_step = (
+                (batch_idx + 1) % accum_steps == 0
+                or (batch_idx + 1) == steps_per_epoch
+            )
+            if should_step:
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                 optimizer.step()
                 scheduler.step()
-                optimizer.zero_grad()
-
-            # EMA update target encoder
-            model.update_target_encoder(ema_momentum)
+                model.update_target_encoder(ema_momentum)
+                optimizer.zero_grad(set_to_none=True)
+                optimizer_step += 1
 
             if batch_idx % 50 == 0:
                 log_msg = (
@@ -308,7 +317,7 @@ def train_token_align(config: Config, checkpoint_path: str):
     print(f"Device: {device}")
 
     # Data
-    dataloader = build_dataloader(config.data, config.train, config.model)
+    dataloader = build_dataloader(config.data, config.train, use_processed=True)
     steps_per_epoch = len(dataloader)
     total_steps = steps_per_epoch * config.train.token_align_epochs
     print(f"Data: {len(dataloader.dataset)} samples, {steps_per_epoch} steps/epoch")
@@ -367,6 +376,8 @@ def train_token_align(config: Config, checkpoint_path: str):
 
     for epoch in range(config.train.token_align_epochs):
         model.train()
+        model.target_encoder.eval()
+        model.target_proj.eval()
         epoch_losses = defaultdict(float)
         epoch_start = time.time()
 

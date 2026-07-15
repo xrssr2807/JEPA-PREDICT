@@ -44,7 +44,7 @@ from models.encoder import SignalEncoder
 from models.classifier import (
     SignalClassifier, DualChannelClassifier,
     SignalClassifierCoT, DualChannelClassifierCoT,
-    MultiScaleClassifier, PatientMILClassifier,
+    MultiScaleClassifier, PatientMILClassifier, DualStreamPatientMILClassifier,
 )
 from models.losses import build_criterion, compute_pos_weight
 
@@ -323,7 +323,7 @@ def load_pretrained_encoder(
 ) -> SignalEncoder:
     """Load a pre-trained encoder from JEPA checkpoint."""
     encoder = build_encoder(model_config, in_channels=in_channels).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
 
     key = f"{encoder_type}_encoder"
     if key in ckpt:
@@ -451,6 +451,17 @@ def build_scheduler(optimizer, train_config, steps_per_epoch: int):
 
 # ── Training ────────────────────────────────────────────────────
 
+def pairwise_auc_margin_loss(logits: torch.Tensor, targets: torch.Tensor,
+                             margin: float = 0.2) -> torch.Tensor:
+    """Smooth pairwise ranking surrogate for patient-level ROC AUC."""
+    positives = logits[targets > 0.5]
+    negatives = logits[targets <= 0.5]
+    if positives.numel() == 0 or negatives.numel() == 0:
+        return logits.sum() * 0.0
+    score_diff = positives[:, None] - negatives[None, :]
+    return F.softplus(float(margin) - score_diff).mean()
+
+
 def train_epoch(model, dataloader, optimizer, criterion, device,
                 scheduler=None, sched_mode="epoch", is_dual=False,
                 distill_mode=False, ecg_encoder=None,
@@ -459,7 +470,9 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                 cotrain_mode=False, ecg_model=None, classifier=None,
                 multilabel=False, focus_label_index: int = 4,
                 focus_loss_weight: float = 0.0,
-                focus_pos_weight: Optional[torch.Tensor] = None):
+                focus_pos_weight: Optional[torch.Tensor] = None,
+                focus_auc_loss_weight: float = 0.0,
+                focus_auc_margin: float = 0.2):
     """Single training epoch with optional ECG distillation."""
     model.train()
     if distill_mode:
@@ -531,6 +544,13 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                 focus_logits, focus_labels, pos_weight=focus_pos_weight
             )
             loss = loss + focus_loss_weight * focus_loss
+
+        if multilabel and focus_auc_loss_weight > 0 and 0 <= focus_label_index < logits.size(1):
+            auc_loss = pairwise_auc_margin_loss(
+                logits[:, focus_label_index], labels[:, focus_label_index].float(),
+                margin=focus_auc_margin,
+            )
+            loss = loss + focus_auc_loss_weight * auc_loss
 
         optimizer.zero_grad()
         if not torch.isfinite(loss):
@@ -858,11 +878,20 @@ def tune_multilabel_thresholds_recall_floor(
 def tune_thresholds_from_config(labels: np.ndarray, probs: np.ndarray,
                                 train_config: TrainConfig) -> np.ndarray:
     if train_config.threshold_strategy == "recall_floor":
-        return tune_multilabel_thresholds_recall_floor(
+        recall_thresholds = tune_multilabel_thresholds_recall_floor(
             labels, probs,
             recall_floor=train_config.threshold_recall_floor,
             opt_metric=train_config.threshold_opt_metric,
         )
+        if train_config.threshold_recall_floor_all_labels:
+            return recall_thresholds
+        thresholds = tune_multilabel_thresholds(
+            labels, probs, beta=train_config.threshold_beta,
+        )
+        focus_idx = train_config.chd_label_index
+        if 0 <= focus_idx < thresholds.size:
+            thresholds[focus_idx] = recall_thresholds[focus_idx]
+        return thresholds
     return tune_multilabel_thresholds(
         labels, probs, beta=train_config.threshold_beta,
     )
@@ -995,6 +1024,12 @@ def train_downstream(
             f"patient_mil={config.data.multidisease_patient_mil} "
             f"multiscale={config.data.multidisease_use_multiscale or config.model.use_multiscale}"
         )
+    use_multidisease_dual_stream = bool(
+        multilabel
+        and config.data.multidisease_patient_mil
+        and config.data.multidisease_channel == "both"
+        and config.data.multidisease_dual_stream
+    )
 
     # ── Check for ECG modes ──
     ecg_data_dir = os.path.join(config.data.chd_ecg_dir, config.data.chd_ecg_subdir)
@@ -1086,14 +1121,37 @@ def train_downstream(
         print(f"[CoTrain] ECG encoder loaded (trainable), shared classifier, {len(ecg_train_ds)} ECG samples")
 
     # Load encoder (PPG student / primary) — skip if dual-channel already set
-    if not use_dual:
+    if not use_dual and not use_multidisease_dual_stream:
         encoder = load_pretrained_encoder(
             checkpoint_path, config.model, "target", device,
             in_channels=downstream_in_channels,
         )
 
     # Build classifier (skip if dual-channel already created above)
-    if not use_dual and not use_distill and not use_cotrain:
+    if use_multidisease_dual_stream:
+        print(
+            "[Model] Dual-stream patient MIL: "
+            "ECG=context_encoder + PPG=target_encoder + disease-conditioned attention"
+        )
+        ecg_encoder = load_pretrained_encoder(
+            checkpoint_path, config.model, "context", device, in_channels=1,
+        )
+        ppg_encoder = load_pretrained_encoder(
+            checkpoint_path, config.model, "target", device, in_channels=1,
+        )
+        model = DualStreamPatientMILClassifier(
+            ecg_encoder=ecg_encoder,
+            ppg_encoder=ppg_encoder,
+            encoder_dim=config.model.transformer_dim,
+            num_classes=num_classes,
+            use_multiscale=(
+                config.data.multidisease_use_multiscale or config.model.use_multiscale
+            ),
+            encoder_chunk_size=config.data.multidisease_mil_encoder_chunk_size,
+            ppg_channel=config.data.multidisease_ppg_channel,
+            ecg_channel=config.data.multidisease_ecg_channel,
+        ).to(device)
+    elif not use_dual and not use_distill and not use_cotrain:
         # Pure PPG single-channel
         use_multiscale_head = config.model.use_multiscale or (
             multilabel and config.data.multidisease_use_multiscale
@@ -1182,6 +1240,7 @@ def train_downstream(
         print(
             f"[Focus] CHD label index={focus_idx} "
             f"extra_loss_weight={config.train.chd_focus_loss_weight} "
+            f"auc_loss_weight={config.train.chd_auc_loss_weight} "
             f"best_metric={config.train.best_metric}"
         )
 
@@ -1224,6 +1283,8 @@ def train_downstream(
                 focus_label_index=focus_idx,
                 focus_loss_weight=config.train.chd_focus_loss_weight if multilabel else 0.0,
                 focus_pos_weight=focus_pos_weight,
+                focus_auc_loss_weight=config.train.chd_auc_loss_weight if multilabel else 0.0,
+                focus_auc_margin=config.train.chd_auc_margin,
             )
             eval_loader = val_loader if val_loader is not None else test_loader
             if multilabel:
@@ -1295,6 +1356,8 @@ def train_downstream(
             focus_label_index=focus_idx,
             focus_loss_weight=config.train.chd_focus_loss_weight if multilabel else 0.0,
             focus_pos_weight=focus_pos_weight,
+            focus_auc_loss_weight=config.train.chd_auc_loss_weight if multilabel else 0.0,
+            focus_auc_margin=config.train.chd_auc_margin,
         )
         eval_loader = val_loader if val_loader is not None else test_loader
         eval_name = "Val" if val_loader is not None else "Test"

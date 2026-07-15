@@ -479,6 +479,36 @@ class DualChannelClassifier(nn.Module):
         return logits
 
 
+class TemporalPyramidPool(nn.Module):
+    """Learned pooling over progressively smoothed temporal token sequences."""
+
+    def __init__(self, dim: int, scales=(1, 2, 4)):
+        super().__init__()
+        self.scales = tuple(scales)
+        self.queries = nn.Parameter(torch.empty(len(self.scales), dim))
+        self.norms = nn.ModuleList([nn.LayerNorm(dim) for _ in self.scales])
+        nn.init.normal_(self.queries, std=dim ** -0.5)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        if tokens.dim() != 3:
+            raise ValueError(f"TemporalPyramidPool expects (B,N,D), got {tuple(tokens.shape)}")
+        x = tokens.transpose(1, 2)
+        outputs = []
+        score_scale = tokens.size(-1) ** -0.5
+        for idx, kernel in enumerate(self.scales):
+            if kernel > 1 and tokens.size(1) >= kernel:
+                pooled = F.avg_pool1d(
+                    x, kernel_size=kernel, stride=max(1, kernel // 2), ceil_mode=True,
+                ).transpose(1, 2)
+            else:
+                pooled = tokens
+            pooled = self.norms[idx](pooled)
+            scores = torch.einsum("bnd,d->bn", pooled, self.queries[idx]) * score_scale
+            weights = torch.softmax(scores, dim=1)
+            outputs.append(torch.sum(pooled * weights.unsqueeze(-1), dim=1))
+        return torch.cat(outputs, dim=-1)
+
+
 class MultiScaleClassifier(nn.Module):
     """
     ★ HiMAE 风格多尺度分类头。
@@ -500,6 +530,7 @@ class MultiScaleClassifier(nn.Module):
     ):
         super().__init__()
         self.encoder = encoder
+        self.temporal_pyramid = TemporalPyramidPool(encoder_dim)
 
         # 三尺度拼接 → MLP分类头
         total_dim = encoder_dim * 3
@@ -527,27 +558,34 @@ class MultiScaleClassifier(nn.Module):
             logits: (B, num_classes)
         """
         _, tokens = self.encoder(x, return_all=True)  # (B, N, D)
-        B, N, D = tokens.shape
-
-        # ── 尺度1 (细粒度): 每2个token池化 → 平均 ──
-        # 捕获局部波形形态 (如PPG的切迹、上升支斜率)
-        n1 = N // 2 * 2
-        s1 = tokens[:, :n1].reshape(B, -1, 2, D).mean(dim=2).mean(dim=1)  # (B, D)
-
-        # ── 尺度2 (中粒度): 每4个token池化 → 平均 ──
-        # 捕获心跳级别的模式 (如心率变异性)
-        n2 = N // 4 * 4
-        s2 = tokens[:, :n2].reshape(B, -1, 4, D).mean(dim=2).mean(dim=1)  # (B, D)
-
-        # ── 尺度3 (粗粒度): 全局平均 ──
-        # 捕获整体趋势 (如基线漂移、长期变化)
-        s3 = tokens.mean(dim=1)  # (B, D)
-
-        # ── 拼接三个尺度 ──
-        out = torch.cat([s1, s2, s3], dim=-1)  # (B, 3*D)
+        out = self.temporal_pyramid(tokens)
         logits = self.classifier(out)
 
         return logits
+
+
+class DiseaseConditionedMILHead(nn.Module):
+    """One segment-attention distribution and decision head per disease."""
+
+    def __init__(self, dim: int, num_classes: int, dropout: float):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(dim, dim // 2),
+            nn.Tanh(),
+            nn.Linear(dim // 2, num_classes),
+        )
+        self.norm = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(dropout)
+        self.weight = nn.Parameter(torch.empty(num_classes, dim))
+        self.bias = nn.Parameter(torch.zeros(num_classes))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, segment_repr: torch.Tensor):
+        attention = torch.softmax(self.attention(segment_repr), dim=1)
+        patient_repr = torch.einsum("bsk,bsd->bkd", attention, segment_repr)
+        patient_repr = self.dropout(self.norm(patient_repr))
+        logits = torch.einsum("bkd,kd->bk", patient_repr, self.weight) + self.bias
+        return logits, patient_repr, attention
 
 
 class PatientMILClassifier(nn.Module):
@@ -574,24 +612,14 @@ class PatientMILClassifier(nn.Module):
         self.encoder_chunk_size = int(encoder_chunk_size or 0)
 
         rep_dim = encoder_dim * 3 if use_multiscale else encoder_dim
+        self.temporal_pyramid = TemporalPyramidPool(encoder_dim) if use_multiscale else None
         self.segment_proj = nn.Sequential(
             nn.Linear(rep_dim, encoder_dim),
             nn.BatchNorm1d(encoder_dim),
             nn.GELU(),
             nn.Dropout(dropout),
         )
-        self.attention = nn.Sequential(
-            nn.Linear(encoder_dim, encoder_dim // 2),
-            nn.Tanh(),
-            nn.Linear(encoder_dim // 2, 1),
-        )
-        self.classifier = nn.Sequential(
-            nn.Linear(encoder_dim, encoder_dim // 2),
-            nn.BatchNorm1d(encoder_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(encoder_dim // 2, num_classes),
-        )
+        self.mil_head = DiseaseConditionedMILHead(encoder_dim, num_classes, dropout)
 
     def freeze_encoder(self):
         for param in self.encoder.parameters():
@@ -601,22 +629,12 @@ class PatientMILClassifier(nn.Module):
         for param in self.encoder.parameters():
             param.requires_grad = True
 
-    @staticmethod
-    def _multiscale_from_tokens(tokens: torch.Tensor) -> torch.Tensor:
-        B, N, D = tokens.shape
-        n1 = max((N // 2) * 2, 2)
-        n2 = max((N // 4) * 4, 4)
-        s1 = tokens[:, :n1].reshape(B, -1, 2, D).mean(dim=2).mean(dim=1)
-        s2 = tokens[:, :n2].reshape(B, -1, 4, D).mean(dim=2).mean(dim=1)
-        s3 = tokens.mean(dim=1)
-        return torch.cat([s1, s2, s3], dim=-1)
-
     def _encode_flat(self, flat: torch.Tensor) -> torch.Tensor:
         chunk_size = self.encoder_chunk_size
         if chunk_size <= 0 or flat.size(0) <= chunk_size:
             if self.use_multiscale:
                 _, tokens = self.encoder(flat, return_all=True)
-                return self._multiscale_from_tokens(tokens)
+                return self.temporal_pyramid(tokens)
             segment_repr, _ = self.encoder(flat)
             return segment_repr
 
@@ -625,7 +643,7 @@ class PatientMILClassifier(nn.Module):
             chunk = flat[start:start + chunk_size]
             if self.use_multiscale:
                 _, tokens = self.encoder(chunk, return_all=True)
-                reps.append(self._multiscale_from_tokens(tokens))
+                reps.append(self.temporal_pyramid(tokens))
             else:
                 segment_repr, _ = self.encoder(chunk)
                 reps.append(segment_repr)
@@ -639,12 +657,93 @@ class PatientMILClassifier(nn.Module):
         segment_repr = self._encode_flat(flat)
 
         segment_repr = self.segment_proj(segment_repr).reshape(B, S, -1)
-        attn = torch.softmax(self.attention(segment_repr).squeeze(-1), dim=1)
-        patient_repr = (segment_repr * attn.unsqueeze(-1)).sum(dim=1)
-        logits = self.classifier(patient_repr)
+        logits, patient_repr, _ = self.mil_head(segment_repr)
 
         if return_embedding:
-            return logits, patient_repr
+            return logits, patient_repr.mean(dim=1)
+        return logits
+
+
+class DualStreamPatientMILClassifier(nn.Module):
+    """Patient-level fusion using ECG-context and PPG-target JEPA encoders."""
+
+    def __init__(self, ecg_encoder: SignalEncoder, ppg_encoder: SignalEncoder,
+                 encoder_dim: int = 512, num_classes: int = 9,
+                 use_multiscale: bool = True, dropout: float = 0.3,
+                 encoder_chunk_size: int = 0, ppg_channel: int = 0,
+                 ecg_channel: int = 1):
+        super().__init__()
+        self.ecg_encoder = ecg_encoder
+        self.ppg_encoder = ppg_encoder
+        self.use_multiscale = use_multiscale
+        self.encoder_chunk_size = int(encoder_chunk_size or 0)
+        self.ppg_channel = int(ppg_channel)
+        self.ecg_channel = int(ecg_channel)
+
+        rep_dim = encoder_dim * 3 if use_multiscale else encoder_dim
+        self.ecg_pyramid = TemporalPyramidPool(encoder_dim) if use_multiscale else None
+        self.ppg_pyramid = TemporalPyramidPool(encoder_dim) if use_multiscale else None
+        self.ecg_proj = nn.Sequential(nn.Linear(rep_dim, encoder_dim), nn.LayerNorm(encoder_dim))
+        self.ppg_proj = nn.Sequential(nn.Linear(rep_dim, encoder_dim), nn.LayerNorm(encoder_dim))
+        self.modality_gate = nn.Linear(encoder_dim * 2, encoder_dim)
+        self.interaction = nn.Sequential(
+            nn.Linear(encoder_dim * 2, encoder_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.segment_norm = nn.LayerNorm(encoder_dim)
+        self.mil_head = DiseaseConditionedMILHead(encoder_dim, num_classes, dropout)
+
+    def freeze_encoder(self):
+        for encoder in (self.ecg_encoder, self.ppg_encoder):
+            for param in encoder.parameters():
+                param.requires_grad = False
+
+    def unfreeze_encoder(self):
+        for encoder in (self.ecg_encoder, self.ppg_encoder):
+            for param in encoder.parameters():
+                param.requires_grad = True
+
+    def _encode_one(self, encoder, pyramid, signal):
+        if self.use_multiscale:
+            _, tokens = encoder(signal, return_all=True)
+            return pyramid(tokens)
+        pooled, _ = encoder(signal)
+        return pooled
+
+    def _encode_flat(self, flat: torch.Tensor):
+        chunk_size = self.encoder_chunk_size or flat.size(0)
+        ecg_reps, ppg_reps = [], []
+        for start in range(0, flat.size(0), chunk_size):
+            chunk = flat[start:start + chunk_size]
+            ppg = chunk[:, self.ppg_channel:self.ppg_channel + 1]
+            ecg = chunk[:, self.ecg_channel:self.ecg_channel + 1]
+            ecg_reps.append(self._encode_one(self.ecg_encoder, self.ecg_pyramid, ecg))
+            ppg_reps.append(self._encode_one(self.ppg_encoder, self.ppg_pyramid, ppg))
+        return torch.cat(ecg_reps, dim=0), torch.cat(ppg_reps, dim=0)
+
+    def forward(self, x: torch.Tensor, return_embedding: bool = False):
+        if x.dim() != 4:
+            raise ValueError(
+                f"DualStreamPatientMILClassifier expects (B,S,C,L), got {tuple(x.shape)}"
+            )
+        B, S, C, L = x.shape
+        required_channels = max(self.ppg_channel, self.ecg_channel) + 1
+        if C < required_channels:
+            raise ValueError(f"Expected at least {required_channels} channels, got {C}")
+
+        ecg_repr, ppg_repr = self._encode_flat(x.reshape(B * S, C, L))
+        ecg_repr = self.ecg_proj(ecg_repr)
+        ppg_repr = self.ppg_proj(ppg_repr)
+        gate = torch.sigmoid(self.modality_gate(torch.cat([ecg_repr, ppg_repr], dim=-1)))
+        cross = self.interaction(torch.cat([
+            torch.abs(ecg_repr - ppg_repr), ecg_repr * ppg_repr,
+        ], dim=-1))
+        segment_repr = self.segment_norm(gate * ecg_repr + (1.0 - gate) * ppg_repr + cross)
+        segment_repr = segment_repr.reshape(B, S, -1)
+        logits, patient_repr, _ = self.mil_head(segment_repr)
+        if return_embedding:
+            return logits, patient_repr.mean(dim=1)
         return logits
 
 

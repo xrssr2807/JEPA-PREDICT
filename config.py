@@ -34,10 +34,13 @@ class DataConfig:
     val_split: float = 0.15  # 训练集留出15%做验证集 (按标签分层)
     signal_align_to: int = 0  # 下游信号对齐到预训练长度 (0=不对齐)
     multidisease_channel: str = "both"  # "0" | "1" | "both"
+    multidisease_dual_stream: bool = True
+    multidisease_ppg_channel: int = 0
+    multidisease_ecg_channel: int = 1
     multidisease_use_multiscale: bool = True
     multidisease_patient_mil: bool = True
     multidisease_mil_segments: int = 8
-    multidisease_mil_encoder_chunk_size: int = 64  # encode at most this many segments at once
+    multidisease_mil_encoder_chunk_size: int = 16  # two encoders, so keep activation chunks small
 
     # Augmentation (PhysioAugment — applied to ECG context signal)
     use_augment: bool = False
@@ -155,6 +158,7 @@ class TrainConfig:
     # Pre-training
     pretrain_epochs: int = 150
     pretrain_batch_size: int = 240
+    pretrain_accum_steps: int = 2
     pretrain_lr: float = 5e-4
     pretrain_warmup_epochs: int = 5  # shorter warmup → earlier cosine decay
     pretrain_weight_decay: float = 0.05
@@ -173,7 +177,7 @@ class TrainConfig:
     # Downstream
     downstream_epochs: int = 50
     downstream_batch_size: int = 256
-    multidisease_mil_batch_size: int = 32  # patient-level MIL is B*S segments, so keep it smaller
+    multidisease_mil_batch_size: int = 16  # dual-stream MIL runs two encoders per segment
     downstream_lr: float = 5e-4  # FT base=5e-5 (anti-overfit, 最优)
     downstream_min_lr: float = 1e-6
     downstream_warmup_epochs: int = 5
@@ -197,9 +201,12 @@ class TrainConfig:
     multilabel_loss_type: str = "asl"  # "asl" | "bce"
     chd_label_index: int = 4  # 冠心病在 multidisease_labels 中的索引
     chd_focus_loss_weight: float = 0.5  # extra BCE loss weight for 冠心病
+    chd_auc_loss_weight: float = 0.1  # patient-level pairwise ranking loss
+    chd_auc_margin: float = 0.2
     best_metric: str = "hybrid"  # "chd_auc" | "macro_auc" | "hybrid"
     best_metric_chd_alpha: float = 0.7  # hybrid = alpha*CHD_AUC + (1-alpha)*macro_AUC
     threshold_strategy: str = "recall_floor"  # "fbeta" | "recall_floor"
+    threshold_recall_floor_all_labels: bool = False  # keep the recall constraint focused on CHD
     threshold_beta: float = 0.75
     threshold_recall_floor: float = 0.60
     threshold_opt_metric: str = "f05"  # "accuracy" | "precision" | "f05" | "f1"
