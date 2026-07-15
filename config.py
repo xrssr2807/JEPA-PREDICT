@@ -178,6 +178,12 @@ class TrainConfig:
     downstream_epochs: int = 50
     downstream_batch_size: int = 256
     multidisease_mil_batch_size: int = 16  # dual-stream MIL runs two encoders per segment
+    multidisease_probe_batch_size: int = 64  # frozen encoders allow a much larger patient batch
+    multidisease_probe_encoder_chunk_size: int = 128
+    dataloader_workers: int = 8
+    dataloader_prefetch_factor: int = 4
+    dataloader_persistent_workers: bool = True
+    enable_tf32: bool = True
     downstream_lr: float = 5e-4  # FT base=5e-5 (anti-overfit, 最优)
     downstream_min_lr: float = 1e-6
     downstream_warmup_epochs: int = 5

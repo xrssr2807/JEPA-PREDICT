@@ -82,6 +82,62 @@ def split_files_by_uid(files: List[str], labels: List[int], val_split: float):
 
 # ── Data ────────────────────────────────────────────────────────
 
+def dataloader_performance_kwargs(train_config: TrainConfig) -> dict:
+    """Shared loader settings tuned for many small signal pickle files."""
+    workers = max(0, int(getattr(train_config, "dataloader_workers", 4)))
+    kwargs = {
+        "num_workers": workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if workers > 0:
+        kwargs["persistent_workers"] = bool(
+            getattr(train_config, "dataloader_persistent_workers", True)
+        )
+        kwargs["prefetch_factor"] = max(
+            1, int(getattr(train_config, "dataloader_prefetch_factor", 2))
+        )
+    return kwargs
+
+
+def rebuild_train_loader(dataloader: DataLoader, batch_size: int,
+                         train_config: TrainConfig) -> DataLoader:
+    """Rebuild a training loader for a phase-specific batch size."""
+    return DataLoader(
+        dataloader.dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+        **dataloader_performance_kwargs(train_config),
+    )
+
+
+def configure_cuda_performance(device: torch.device, train_config: TrainConfig):
+    """Enable high-throughput CUDA kernels without changing model numerics materially."""
+    if device.type != "cuda":
+        return
+    torch.backends.cudnn.benchmark = True
+    enable_tf32 = bool(getattr(train_config, "enable_tf32", True))
+    torch.backends.cuda.matmul.allow_tf32 = enable_tf32
+    torch.backends.cudnn.allow_tf32 = enable_tf32
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high" if enable_tf32 else "highest")
+    print(f"[CUDA] cuDNN benchmark=on TF32={'on' if enable_tf32 else 'off'}")
+
+
+def reset_gpu_peak_memory(device: torch.device):
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def gpu_peak_memory_message(device: torch.device) -> str:
+    if device.type != "cuda":
+        return ""
+    total = torch.cuda.get_device_properties(device).total_memory
+    allocated = 100.0 * torch.cuda.max_memory_allocated(device) / total
+    reserved = 100.0 * torch.cuda.max_memory_reserved(device) / total
+    return f" GPU_peak={allocated:.1f}% reserved={reserved:.1f}%"
+
+
 def build_downstream_dataloaders(
     data_config: DataConfig,
     train_config: TrainConfig,
@@ -182,19 +238,26 @@ def build_downstream_dataloaders(
                 f"(effective segments/step={batch_size * data_config.multidisease_mil_segments})"
             )
 
+        loader_kwargs = dataloader_performance_kwargs(train_config)
+        print(
+            f"[Data] workers={loader_kwargs['num_workers']} "
+            f"prefetch={loader_kwargs.get('prefetch_factor', 0)} "
+            f"persistent={loader_kwargs.get('persistent_workers', False)} "
+            f"pin_memory={loader_kwargs['pin_memory']}"
+        )
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size,
-            shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
+            shuffle=True, drop_last=True, **loader_kwargs,
         )
         val_loader = None
         if val_dataset is not None:
             val_loader = DataLoader(
                 val_dataset, batch_size=batch_size,
-                shuffle=False, num_workers=4, pin_memory=True,
+                shuffle=False, **loader_kwargs,
             )
         test_loader = DataLoader(
             test_dataset, batch_size=batch_size,
-            shuffle=False, num_workers=4, pin_memory=True,
+            shuffle=False, **loader_kwargs,
         )
         vlen = len(val_dataset) if val_dataset is not None else 0
         print(f"[Data] train={len(train_dataset)} val={vlen} test={len(test_dataset)}")
@@ -487,7 +550,9 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
     for batch in dataloader:
         if is_dual:
             ecg, ppg, labels, *_ = batch
-            ecg, ppg, labels = ecg.to(device), ppg.to(device), labels.to(device)
+            ecg = ecg.to(device, non_blocking=True)
+            ppg = ppg.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             logits = model(ecg, ppg)
             loss = criterion(logits, labels)
         else:
@@ -495,7 +560,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                 x, labels, *_ = batch
             else:
                 x, labels = batch
-            x, labels = x.to(device), labels.to(device)
+            x = x.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
 
             if distill_mode:
@@ -510,7 +576,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                     ecg_iter = iter(ecg_loader)
                     ecg_batch = next(ecg_iter)
                 ex, *_ = ecg_batch
-                ex = ex.to(device)
+                ex = ex.to(device, non_blocking=True)
                 with torch.no_grad():
                     ecg_pooled, _ = ecg_encoder(ex)
                 align_loss = (1 - F.cosine_similarity(
@@ -528,7 +594,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                     ecg_iter = iter(ecg_loader)
                     ecg_batch = next(ecg_iter)
                 ex, elabels, *_ = ecg_batch
-                ex, elabels = ex.to(device), elabels.to(device)
+                ex = ex.to(device, non_blocking=True)
+                elabels = elabels.to(device, non_blocking=True)
                 ecg_pooled, _ = ecg_encoder(ex)
                 ecg_logits = classifier(ecg_pooled)
                 cls_loss_ecg = criterion(ecg_logits, elabels)
@@ -610,7 +677,9 @@ def evaluate(model, dataloader, criterion, device, num_classes: int,
     for batch in dataloader:
         if is_dual:
             ecg, ppg, labels, *_ = batch
-            ecg, ppg, labels = ecg.to(device), ppg.to(device), labels.to(device)
+            ecg = ecg.to(device, non_blocking=True)
+            ppg = ppg.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             logits = model(ecg, ppg)
             uids = batch[3] if len(batch) >= 4 else None
         else:
@@ -620,7 +689,8 @@ def evaluate(model, dataloader, criterion, device, num_classes: int,
             else:
                 x, labels = batch
                 uids = None
-            x, labels = x.to(device), labels.to(device)
+            x = x.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             logits = model(x)
 
         loss = criterion(logits, labels)
@@ -735,7 +805,8 @@ def evaluate_multilabel(model, dataloader, criterion, device,
     for batch in dataloader:
         x, labels, *rest = batch
         uids = rest[0] if rest else None
-        x, labels = x.to(device), labels.to(device)
+        x = x.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
         x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
         logits = model(x)
         loss = criterion(logits, labels)
@@ -992,6 +1063,7 @@ def train_downstream(
         dataset: "chd" or "arrhythmia"
     """
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+    configure_cuda_performance(device, config.train)
     print(f"Device: {device} | Dataset: {dataset}")
 
     # ── Log file ──
@@ -1245,11 +1317,32 @@ def train_downstream(
         )
 
     # ── Phase 1: Linear Probe ──
+    full_train_loader = train_loader
+    full_encoder_chunk_size = getattr(model, "encoder_chunk_size", None)
+    probe_train_loader = None
+
     n_probe = config.train.downstream_probe_epochs
     if use_distill or use_cotrain:
         n_probe = 1  # 快速初始化, 避免冻结下坍塌
     # dual-channel uses full probe (30 epochs) — 即使不稳定, FT能恢复
     if n_probe > 0:
+        if use_multidisease_dual_stream:
+            probe_batch_size = max(
+                config.train.multidisease_mil_batch_size,
+                int(config.train.multidisease_probe_batch_size),
+            )
+            probe_train_loader = rebuild_train_loader(
+                full_train_loader, probe_batch_size, config.train
+            )
+            train_loader = probe_train_loader
+            model.encoder_chunk_size = max(
+                1, int(config.train.multidisease_probe_encoder_chunk_size)
+            )
+            print(
+                f"[Probe GPU] batch_size={probe_batch_size} "
+                f"encoder_chunk_size={model.encoder_chunk_size} "
+                f"steps/epoch={len(train_loader)}"
+            )
         print("\n" + "=" * 60)
         distill_tag = " + ECG Distill" if use_distill else ""
         print(f"Phase 1: Linear Probe (frozen encoder{distill_tag}, {n_probe} epochs)")
@@ -1271,6 +1364,7 @@ def train_downstream(
         scheduler, sched_mode = build_scheduler(optimizer, config.train, probe_steps)
 
         for epoch in range(n_probe):
+            reset_gpu_peak_memory(device)
             train_loss, train_acc = train_epoch(
                 model, train_loader, optimizer, criterion, device,
                 scheduler=scheduler, sched_mode=sched_mode, is_dual=use_dual,
@@ -1306,12 +1400,23 @@ def train_downstream(
                         f"P={prec:.4f} R={rec:.4f} F1={f1:.4f} F0.5={f05:.4f}")
             if focus_auc is not None:
                 log_line += f" CHD_AUC={focus_auc:.4f}"
+            log_line += gpu_peak_memory_message(device)
             print(log_line)
             log_fh.write(log_line + "\n"); log_fh.flush()
     else:
         print("\n[Probe] Skipped → direct Full Fine-tune (signal aligned)")
 
     # ── Phase 2: Full Fine-tune ──
+    if probe_train_loader is not None:
+        train_loader = full_train_loader
+        model.encoder_chunk_size = full_encoder_chunk_size
+        del probe_train_loader
+        print(
+            f"[Full FT GPU] batch_size={train_loader.batch_size} "
+            f"encoder_chunk_size={model.encoder_chunk_size} "
+            f"steps/epoch={len(train_loader)}"
+        )
+
     print("\n" + "=" * 60)
     print("Phase 2: Full Fine-tune")
     print("=" * 60)
@@ -1349,6 +1454,7 @@ def train_downstream(
     no_improve = 0
 
     for epoch in range(ft_epochs):
+        reset_gpu_peak_memory(device)
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion, device,
             scheduler=scheduler, sched_mode=sched_mode, is_dual=use_dual, distill_mode=use_distill, ecg_encoder=ecg_encoder, proj_ppg=proj_ppg, proj_ecg=proj_ecg, ecg_loader=ecg_train_loader, distill_lambda=distill_lambda,
@@ -1384,6 +1490,7 @@ def train_downstream(
                     f"P={prec:.4f} R={rec:.4f} F1={f1:.4f} F0.5={f05:.4f} | lr={lr:.2e}")
         if focus_auc is not None:
             log_line += f" CHD_AUC={focus_auc:.4f} Select={selected_metric:.4f}"
+        log_line += gpu_peak_memory_message(device)
         print(log_line)
         log_fh.write(log_line + "\n"); log_fh.flush()
 
