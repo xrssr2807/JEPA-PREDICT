@@ -12,6 +12,7 @@ from dataset.data import (
 )
 from models.jepa import JEPA, StatsPredHead, ema_update
 from preprocess import zscore_per_channel
+from train_pretrain import _representation_is_healthy
 
 
 class Phase0DataTests(unittest.TestCase):
@@ -122,6 +123,24 @@ class Phase0TeacherTests(unittest.TestCase):
         normalized = head.normalize_targets(targets)
         self.assertTrue(torch.isfinite(head.running_var).all())
         self.assertTrue(torch.isfinite(normalized).all())
+
+    def test_collapsed_representation_is_not_checkpoint_eligible(self):
+        collapsed = {
+            "total_loss": 0.001,
+            "context_std": 0.2,
+            "target_std": 0.0002,
+            "context_collapsed_fraction": 0.0,
+            "target_collapsed_fraction": 0.999,
+        }
+        healthy = {
+            "total_loss": 0.08,
+            "context_std": 0.3,
+            "target_std": 0.1,
+            "context_collapsed_fraction": 0.0,
+            "target_collapsed_fraction": 0.0,
+        }
+        self.assertFalse(_representation_is_healthy(collapsed))
+        self.assertTrue(_representation_is_healthy(healthy))
 
 
 if __name__ == "__main__":

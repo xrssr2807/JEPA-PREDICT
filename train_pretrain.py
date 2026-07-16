@@ -257,6 +257,34 @@ def _metric(metrics, key: str) -> float:
     return float(metrics.get(key, 0.0))
 
 
+def _representation_is_healthy(metrics) -> bool:
+    """Reject deceptively low validation losses caused by latent collapse."""
+    if not metrics:
+        return False
+    values = (
+        _metric(metrics, "total_loss"),
+        _metric(metrics, "context_std"),
+        _metric(metrics, "target_std"),
+        _metric(metrics, "context_collapsed_fraction"),
+        _metric(metrics, "target_collapsed_fraction"),
+    )
+    if not all(math.isfinite(value) for value in values):
+        return False
+    return (
+        _metric(metrics, "context_std") >= 0.01
+        and _metric(metrics, "target_std") >= 0.01
+        and _metric(metrics, "context_collapsed_fraction") <= 0.10
+        and _metric(metrics, "target_collapsed_fraction") <= 0.10
+    )
+
+
+def _save_checkpoint(payload, path):
+    """Atomically replace a checkpoint so interruptions cannot corrupt it."""
+    tmp_path = path + ".tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
+
+
 def _load_jepa_state_dict(model, state_dict):
     """Load old checkpoints while allowing only the new Phase 0 stats counter."""
     result = model.load_state_dict(state_dict, strict=False)
@@ -332,7 +360,15 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                 print("[Resume] Loaded optimizer state")
             except Exception as e:
                 print(f"[Resume] Optimizer state restore failed (reinit): {e}")
-        resume_best_loss = float(ckpt.get("best_val_loss", ckpt.get("val_loss", float("inf"))))
+        if ckpt.get("best_checkpoint_eligible", False):
+            resume_best_loss = float(
+                ckpt.get("best_val_loss", ckpt.get("val_loss", float("inf")))
+            )
+        else:
+            print(
+                "[Resume] Reset best validation loss because this checkpoint "
+                "predates collapse-aware selection"
+            )
         model._enforce_teacher_eval()
         print(f"[Resume] Continuing from epoch {start_epoch}")
 
@@ -487,6 +523,7 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                 f" | Val total={_metric(val_metrics, 'total_loss'):.6f} "
                 f"jepa={_metric(val_metrics, 'jepa'):.6f} "
                 f"stats={_metric(val_metrics, 'stats'):.6f} "
+                f"token={_metric(val_metrics, 'token_align'):.6f} "
                 f"ctx_std={_metric(val_metrics, 'context_std'):.4f} "
                 f"tgt_std={_metric(val_metrics, 'target_std'):.4f} "
                 f"ctx_collapse={_metric(val_metrics, 'context_collapsed_fraction'):.3f} "
@@ -507,14 +544,24 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
         with open(log_file, "a") as f:
             f.write(summary + "\n")
 
-        # Save best by patient-held-out validation loss, not training loss.
+        # Save by held-out loss only after ruling out a collapsed representation.
         current_val_loss = (
             _metric(val_metrics, "total_loss") if val_metrics is not None else None
         )
-        if current_val_loss is not None and current_val_loss < best_loss:
+        checkpoint_eligible = _representation_is_healthy(val_metrics)
+        if val_metrics is not None and not checkpoint_eligible:
+            print(
+                "[CheckpointSkip] Validation representation is collapsed; "
+                "not eligible for jepa_best.pt"
+            )
+        if (
+            current_val_loss is not None
+            and checkpoint_eligible
+            and current_val_loss < best_loss
+        ):
             best_loss = current_val_loss
             checkpoint_path = os.path.join(config.output_dir, "jepa_best.pt")
-            torch.save(
+            _save_checkpoint(
                 {
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
@@ -526,6 +573,7 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                     "val_loss": current_val_loss,
                     "val_metrics": val_metrics,
                     "best_val_loss": best_loss,
+                    "best_checkpoint_eligible": True,
                     "seed": config.seed,
                     "train_segments": len(train_loader.dataset),
                     "val_segments": len(val_loader.dataset),
@@ -534,10 +582,30 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
             )
             print(f"Saved best validation model to {checkpoint_path}")
 
+        # Always keep a resumable non-corrupt checkpoint, independent of best selection.
+        last_path = os.path.join(config.output_dir, "jepa_last.pt")
+        _save_checkpoint(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "context_encoder": model.context_encoder.state_dict(),
+                "target_encoder": model.target_encoder.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "loss": epoch_loss,
+                "train_metrics": train_metrics,
+                "val_loss": current_val_loss,
+                "val_metrics": val_metrics,
+                "best_val_loss": best_loss,
+                "best_checkpoint_eligible": checkpoint_eligible,
+                "seed": config.seed,
+            },
+            last_path,
+        )
+
         # Save periodic
         if (epoch + 1) % 20 == 0:
             ckpt_path = os.path.join(config.output_dir, f"jepa_epoch_{epoch+1}.pt")
-            torch.save(
+            _save_checkpoint(
                 {
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
@@ -547,6 +615,7 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                     "train_metrics": train_metrics,
                     "val_metrics": val_metrics,
                     "best_val_loss": best_loss,
+                    "best_checkpoint_eligible": checkpoint_eligible,
                     "seed": config.seed,
                 },
                 ckpt_path,
