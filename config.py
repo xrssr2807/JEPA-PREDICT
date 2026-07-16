@@ -13,6 +13,7 @@ class DataConfig:
     pretrain_dir: str = "/root/autodl-tmp/split"
     # Preprocessed pre-training data (.pt files, after channel extraction + Z-score)
     pretrain_processed_dir: str = "/root/autodl-tmp/split_processed"
+    pretrain_val_split: float = 0.10  # patient-group holdout for Phase 0 validation
 
     # Downstream data
     chd_ppg_dir: str = "/root/chd_ppg"
@@ -109,17 +110,10 @@ class ModelConfig:
     # ── Auxiliary losses (from CWT-MAE v3) ──
     use_stats_loss: bool = True        # auxiliary statistics prediction (Apple-style)
     stats_loss_weight: float = 0.1     # weight for stats loss
-    use_contrast_loss: bool = False    # M2AE 已移除, 用 Token Align 替代
-    contrast_loss_weight: float = 0.1
     # Token级对齐
     use_token_align: bool = True       # ★ Soft-DTW 弹性对齐
     token_align_weight: float = 0.1    # 辅助损失权重 (和 StatsLoss 同级)
     token_align_window: int = 3        # Soft-DTW 搜索窗口 (±3 token ≈ ±300ms)
-    use_freq_loss: bool = False        # 频谱损失 (Token Align可选)
-    freq_loss_weight: float = 0.1      # 频谱损失权重
-    vicreg_sim_weight: float = 1.0     # (保留, 未使用)
-    vicreg_var_weight: float = 1.0
-    vicreg_cov_weight: float = 0.04
 
     # ── CNN 增强 ──
     cnn_use_se: bool = True            # SE Block 通道注意力
@@ -162,6 +156,7 @@ class TrainConfig:
     pretrain_lr: float = 5e-4
     pretrain_warmup_epochs: int = 5  # shorter warmup → earlier cosine decay
     pretrain_weight_decay: float = 0.05
+    pretrain_val_every: int = 1
 
     # Optimizer
     optimizer: str = "adamw"
@@ -227,6 +222,7 @@ class Config:
     device: str = "cuda"
     seed: int = 42
     output_dir: str = "/root/autodl-tmp/JEPA-PREDICT/outputs"
+    deterministic: bool = True
 
 
 # Default config instance

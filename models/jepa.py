@@ -10,9 +10,8 @@ Context Encoder (ECG) ──→ Embedding ──→ Predictor(s_x, z) ──→ 
 Target Encoder (PPG)  ──→ Embedding ───────────────────────▶ L2 loss
   (EMA updated, stop_gradient)
 
-New additions (from CWT-MAE v3):
-  - StatsPredHead: auxiliary task predicting 16 physiological statistics
-  - CMAE-style contrastive loss with teacher EMA projector
+Auxiliary objective:
+  - StatsPredHead: predicts 16 physiological statistics saved by preprocessing
 """
 import copy
 from typing import Optional, Tuple
@@ -25,10 +24,26 @@ from .encoder import SignalEncoder
 
 
 def ema_update(student: nn.Module, teacher: nn.Module, momentum: float):
-    """Exponential moving average update of teacher from student."""
+    """EMA-update matching parameters and buffers from student to teacher."""
     with torch.no_grad():
-        for param_s, param_t in zip(student.parameters(), teacher.parameters()):
-            param_t.data.mul_(momentum).add_(param_s.data, alpha=1 - momentum)
+        student_params = dict(student.named_parameters())
+        teacher_params = dict(teacher.named_parameters())
+        if student_params.keys() != teacher_params.keys():
+            raise ValueError("Student and teacher parameter structures do not match")
+        for name, param_s in student_params.items():
+            param_t = teacher_params[name]
+            param_t.mul_(momentum).add_(param_s, alpha=1 - momentum)
+
+        student_buffers = dict(student.named_buffers())
+        teacher_buffers = dict(teacher.named_buffers())
+        if student_buffers.keys() != teacher_buffers.keys():
+            raise ValueError("Student and teacher buffer structures do not match")
+        for name, buffer_s in student_buffers.items():
+            buffer_t = teacher_buffers[name]
+            if torch.is_floating_point(buffer_t):
+                buffer_t.mul_(momentum).add_(buffer_s, alpha=1 - momentum)
+            else:
+                buffer_t.copy_(buffer_s)
 
 
 def cosine_schedule(start: float, end: float, progress: float) -> float:
@@ -128,6 +143,7 @@ class StatsPredHead(nn.Module):
         # Running statistics for target normalization
         self.register_buffer('running_mean', torch.zeros(num_stats))
         self.register_buffer('running_var', torch.ones(num_stats))
+        self.register_buffer('num_updates', torch.zeros((), dtype=torch.long))
         self.momentum = 0.01
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -139,8 +155,13 @@ class StatsPredHead(nn.Module):
         with torch.no_grad():
             batch_mean = targets.mean(dim=0)
             batch_var = targets.var(dim=0, unbiased=False)
-            self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * batch_mean
-            self.running_var = (1 - self.momentum) * self.running_var + self.momentum * batch_var
+            if self.num_updates.item() == 0:
+                self.running_mean.copy_(batch_mean)
+                self.running_var.copy_(batch_var)
+            else:
+                self.running_mean.lerp_(batch_mean, self.momentum)
+                self.running_var.lerp_(batch_var, self.momentum)
+            self.num_updates.add_(1)
 
     def normalize_targets(self, targets: torch.Tensor) -> torch.Tensor:
         """Normalize targets to zero-mean unit-variance."""
@@ -158,9 +179,7 @@ class JEPA(nn.Module):
 
     During pre-training, only context_encoder and predictor receive gradients.
 
-    New (from CWT-MAE v3):
-        - StatsPredHead: auxiliary task predicting physiological statistics
-        - CMAE contrastive loss: BYOL-style with teacher EMA projector
+    Auxiliary statistics are optional and must be present in the dataset.
     """
 
     def __init__(
@@ -189,16 +208,11 @@ class JEPA(nn.Module):
         # New: auxiliary loss config
         use_stats_loss: bool = False,
         stats_loss_weight: float = 0.1,
-        use_contrast_loss: bool = False,
-        contrast_loss_weight: float = 1.0,
         use_token_align: bool = False,
         token_align_weight: float = 0.5,
         token_align_window: int = 3,
         use_se: bool = False,
         use_inception: bool = False,
-        vicreg_sim_weight: float = 1.0,
-        vicreg_var_weight: float = 1.0,
-        vicreg_cov_weight: float = 0.04,
     ):
         super().__init__()
 
@@ -258,8 +272,6 @@ class JEPA(nn.Module):
     # ── New: Statistics Prediction Head ──
         self.use_stats_loss = use_stats_loss
         self.stats_loss_weight = stats_loss_weight
-        self.use_contrast_loss = use_contrast_loss
-        self.contrast_loss_weight = contrast_loss_weight
         self.use_token_align = use_token_align
         self.token_align_weight = token_align_weight
         self.align_window = int(token_align_window)
@@ -278,12 +290,39 @@ class JEPA(nn.Module):
         # ★ JETS 掩码参数
         self.mask_ratio = mask_ratio
         self.mask_patch_size = mask_patch_size
+        self._enforce_teacher_eval()
+
+    def _enforce_teacher_eval(self):
+        """Teacher targets must not depend on dropout or batch statistics."""
+        self.target_encoder.eval()
+        self.target_proj.eval()
+
+    def train(self, mode: bool = True):
+        """Set online modules to ``mode`` while always keeping teachers in eval."""
+        super().train(mode)
+        self._enforce_teacher_eval()
+        return self
 
     def update_target_encoder(self, momentum: float):
         """EMA update target encoder towards context encoder."""
         ema_update(self.context_encoder, self.target_encoder, momentum)
         ema_update(self.context_proj, self.target_proj, momentum)
-        # ★ M2AE 对比学习不需要EMA更新投影头（共享投影头无teacher）
+        self._enforce_teacher_eval()
+
+    def teacher_student_parameter_cosine(self) -> float:
+        """Cosine similarity between online and EMA encoder parameters."""
+        dot = torch.zeros((), device=next(self.parameters()).device)
+        student_norm = torch.zeros_like(dot)
+        teacher_norm = torch.zeros_like(dot)
+        with torch.no_grad():
+            teacher_params = dict(self.target_encoder.named_parameters())
+            for name, student in self.context_encoder.named_parameters():
+                teacher = teacher_params[name]
+                dot += (student.float() * teacher.float()).sum()
+                student_norm += student.float().square().sum()
+                teacher_norm += teacher.float().square().sum()
+            cosine = dot / (student_norm.sqrt() * teacher_norm.sqrt()).clamp_min(1e-12)
+        return cosine.item()
 
     def forward_context(self, x: torch.Tensor, return_tokens: bool = False):
         """Encode context signal (ECG).
@@ -338,6 +377,7 @@ class JEPA(nn.Module):
         B = ecg.size(0)
         all_losses = []
         best_z = None
+        best_pred = None
         best_loss_per_sample = torch.full((B,), float("inf"), device=ecg.device)
 
         for _ in range(self.num_latent_samples):
@@ -348,13 +388,20 @@ class JEPA(nn.Module):
             improved = loss_per_sample < best_loss_per_sample
             if best_z is None:
                 best_z = z.clone()
+                best_pred = pred.clone()
             else:
                 best_z[improved] = z[improved].clone()
+                best_pred[improved] = pred[improved].clone()
             best_loss_per_sample = torch.minimum(best_loss_per_sample, loss_per_sample)
             all_losses.append(loss_per_sample.mean())
 
         loss = best_loss_per_sample.mean()
-        return loss, {"jepa": loss.item(), "all_samples": [l.item() for l in all_losses]}
+        pred_std = best_pred.detach().float().std(dim=0, unbiased=False).mean()
+        return loss, {
+            "jepa": loss.item(),
+            "prediction_std": pred_std.item(),
+            "all_samples": [l.item() for l in all_losses],
+        }
 
     def _compute_stats_loss(self, context_embed, stats_target):
         """Auxiliary statistics prediction loss."""
@@ -379,19 +426,6 @@ class JEPA(nn.Module):
 
         loss = F.smooth_l1_loss(pred_stats, stats_target_norm)
         return loss, {"stats": loss.item()}
-
-    def _compute_contrast_loss(self, ecg_embed, ppg_embed):
-        """M2AE InfoNCE: 对称对比ECG↔PPG"""
-        if not hasattr(self, 'contrast_projector'):
-            return torch.tensor(0.0, device=ecg_embed.device), {"contrast": 0.0}
-        z_ecg = F.normalize(self.contrast_projector(ecg_embed), dim=-1)
-        z_ppg = F.normalize(self.contrast_projector(ppg_embed), dim=-1)
-        logits = torch.mm(z_ecg, z_ppg.t()) / self.contrast_temperature
-        B = ecg_embed.size(0)
-        labels = torch.arange(B, device=ecg_embed.device)
-        l1 = F.cross_entropy(logits, labels)
-        l2 = F.cross_entropy(logits.t(), labels)
-        return (l1+l2)/2, {"contrast": (l1+l2).item()/2}
 
     def _compute_token_align_loss(self, ecg=None, ppg=None, token_mask=None,
                                    align_window=3, soft_temperature=0.1,
@@ -533,6 +567,7 @@ class JEPA(nn.Module):
         ecg: torch.Tensor,
         ppg: torch.Tensor,
         ecg_stats: Optional[torch.Tensor] = None,
+        collect_diagnostics: bool = False,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute total pre-training loss.
@@ -573,6 +608,25 @@ class JEPA(nn.Module):
         )
         total_loss = jepa_loss
         info = dict(jepa_info)
+
+        # Cheap collapse indicators are logged for both train and validation.
+        for prefix, embedding in (
+            ("context", context_embed),
+            ("target", target_embed),
+        ):
+            detached = embedding.detach().float()
+            variances = detached.var(dim=0, unbiased=False)
+            info[f"{prefix}_std"] = variances.sqrt().mean().item()
+            info[f"{prefix}_collapsed_fraction"] = (
+                variances < 1e-4
+            ).float().mean().item()
+            if collect_diagnostics and detached.size(0) > 1:
+                centered = detached - detached.mean(dim=0, keepdim=True)
+                covariance = centered.T @ centered / (detached.size(0) - 1)
+                off_diagonal = covariance - torch.diag_embed(torch.diagonal(covariance))
+                info[f"{prefix}_cov_offdiag_rms"] = (
+                    off_diagonal.square().mean().sqrt().item()
+                )
 
         # 2. Statistics prediction loss (auxiliary)
         if self.use_stats_loss and ecg_stats is not None:

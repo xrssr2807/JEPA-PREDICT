@@ -42,8 +42,6 @@ CFG = dict(
     # Auxiliary losses
     use_stats_loss=True,
     stats_loss_weight=0.1,
-    use_contrast_loss=True,
-    contrast_loss_weight=0.1,
 
     # Training
     epochs=30,
@@ -89,8 +87,6 @@ model = JEPA(
     ema_momentum=CFG["ema_momentum"],
     use_stats_loss=CFG["use_stats_loss"],
     stats_loss_weight=CFG["stats_loss_weight"],
-    use_contrast_loss=CFG["use_contrast_loss"],
-    contrast_loss_weight=CFG["contrast_loss_weight"],
 )
 
 n_total = sum(p.numel() for p in model.parameters())
@@ -114,13 +110,13 @@ best_loss = float("inf")
 print(f"\n{'='*60}")
 print(f"Training: {CFG['epochs']} epochs × {steps_per_epoch} batches = {total_steps} steps")
 print(f"Warmup: {CFG['warmup_epochs']} epochs ({warmup_steps} steps)")
-print(f"Norm: {CFG['normalize']} | Augment: {CFG['use_augment']} | Stats: {CFG['use_stats_loss']} | Contrast: {CFG['use_contrast_loss']}")
+print(f"Norm: {CFG['normalize']} | Augment: {CFG['use_augment']} | Stats: {CFG['use_stats_loss']}")
 print(f"{'='*60}\n")
 
 for epoch in range(CFG["epochs"]):
     model.train()
     t0 = time.time()
-    ep_loss = ep_jepa = ep_stats = ep_contrast = 0.0
+    ep_loss = ep_jepa = ep_stats = 0.0
     n = 0
 
     for bi, batch in enumerate(dl):
@@ -155,21 +151,20 @@ for epoch in range(CFG["epochs"]):
         ep_loss += info["total_loss"]
         ep_jepa += info.get("jepa", 0)
         ep_stats += info.get("stats", 0)
-        ep_contrast += info.get("contrast", 0)
         n += 1
 
         if bi % 10 == 0:
             line = (f"  E{epoch:2d} B{bi:3d}/{steps_per_epoch} | "
                     f"loss={info['total_loss']:.4f} "
-                    f"j={info.get('jepa',0):.4f} s={info.get('stats',0):.4f} c={info.get('contrast',0):.4f} "
+                    f"j={info.get('jepa',0):.4f} s={info.get('stats',0):.4f} "
                     f"| lr={lr:.2e} ema={ema_m:.4f}")
             print(line)
 
-    ep_loss /= n; ep_jepa /= n; ep_stats /= n; ep_contrast /= n
+    ep_loss /= n; ep_jepa /= n; ep_stats /= n
     t = time.time() - t0
 
     line = (f"Epoch {epoch:2d} | L={ep_loss:.4f} "
-            f"j={ep_jepa:.4f} s={ep_stats:.4f} c={ep_contrast:.4f} "
+            f"j={ep_jepa:.4f} s={ep_stats:.4f} "
             f"| {t:.1f}s")
     print(line); print("-" * 60)
     log.write(line + "\n"); log.flush()

@@ -13,6 +13,11 @@ from tqdm import tqdm
 import numpy as np
 import torch
 
+from dataset.data import compute_signal_stats, infer_pretrain_uid
+
+
+PREPROCESS_VERSION = 2
+
 
 def zscore_per_channel(x: np.ndarray) -> np.ndarray:
     """Per-channel Z-score normalization."""
@@ -31,12 +36,22 @@ def process_one(args):
 
         data = sample["data"]  # (5, 3000)
         data = data[channels]  # (2, 3000): [ECG, PPG]
+        ecg_stats = torch.from_numpy(compute_signal_stats(data[0])).float()
         data = zscore_per_channel(data)  # 归一化
 
         ecg = torch.from_numpy(data[0:1].copy()).float()  # (1, 3000)
         ppg = torch.from_numpy(data[1:2].copy()).float()  # (1, 3000)
 
-        torch.save({"ecg": ecg, "ppg": ppg}, dst_path)
+        torch.save(
+            {
+                "ecg": ecg,
+                "ppg": ppg,
+                "ecg_stats": ecg_stats,
+                "uid": infer_pretrain_uid(os.path.basename(src_path)),
+                "preprocess_version": PREPROCESS_VERSION,
+            },
+            dst_path,
+        )
         return True, src_path, None
     except Exception as e:
         return False, src_path, str(e)
@@ -54,6 +69,8 @@ def main():
                         help="并行进程数")
     parser.add_argument("--skip_bad", action="store_true", default=True,
                         help="跳过损坏文件 (默认: True)")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="覆盖旧 .pt 文件，用于升级stats等预处理字段")
     args = parser.parse_args()
 
     os.makedirs(args.dst_dir, exist_ok=True)
@@ -77,7 +94,7 @@ def main():
     for fname in all_files:
         src = os.path.join(args.src_dir, fname)
         dst = os.path.join(args.dst_dir, fname.replace(".pkl", ".pt"))
-        if os.path.exists(dst):
+        if os.path.exists(dst) and not args.overwrite:
             continue  # 跳过已处理完成的
         tasks.append((src, dst, args.channels))
 

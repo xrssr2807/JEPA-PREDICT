@@ -6,11 +6,70 @@ Supports: zscore, iqr (robust), minmax, none
 """
 import os
 import pickle
-from typing import List, Tuple, Optional
+import re
+from typing import List, Tuple, Optional, Sequence
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+
+def infer_pretrain_uid(filename: str) -> str:
+    """Infer a patient/recording UID from a pre-training filename.
+
+    The current corpus uses names such as
+    ``combined_processed_data_2d_part10269_10.pkl`` where ``part10269`` is
+    the patient group and the final integer is a segment index.
+    """
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    match = re.search(r"(?:^|_)(part\d+)(?:_|$)", stem, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
+
+    match = re.search(
+        r"(?:^|_)((?:uid|patient|subject)[_-]?[a-z0-9]+)(?:_|$)",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return match.group(1).lower()
+
+    # Best-effort fallback for ``recording_id_segmentIndex`` datasets.
+    stripped = re.sub(r"_\d+$", "", stem)
+    return stripped or stem
+
+
+def split_pretrain_files(
+    files: Sequence[str], val_ratio: float, seed: int
+) -> Tuple[List[str], List[str]]:
+    """Deterministically split files by UID so patients cannot leak."""
+    if not 0.0 < val_ratio < 1.0:
+        raise ValueError(f"val_ratio must be in (0, 1), got {val_ratio}")
+
+    uid_to_files = {}
+    for filename in sorted(files):
+        uid_to_files.setdefault(infer_pretrain_uid(filename), []).append(filename)
+
+    uids = sorted(uid_to_files)
+    if len(uids) < 2:
+        raise ValueError(
+            "Patient-level pre-training validation needs at least two UIDs; "
+            f"found {len(uids)} from {len(files)} files."
+        )
+
+    rng = np.random.default_rng(seed)
+    shuffled_uids = list(uids)
+    rng.shuffle(shuffled_uids)
+    num_val = min(len(uids) - 1, max(1, round(len(uids) * val_ratio)))
+    val_uids = set(shuffled_uids[:num_val])
+
+    train_files = []
+    val_files = []
+    for uid in uids:
+        target = val_files if uid in val_uids else train_files
+        target.extend(uid_to_files[uid])
+
+    return sorted(train_files), sorted(val_files)
 
 
 def compute_signal_stats(signal: np.ndarray, eps: float = 1e-6) -> np.ndarray:
@@ -101,6 +160,7 @@ class PretrainDataset(Dataset):
         augment: bool = False,
         augment_config: Optional[dict] = None,
         return_stats: bool = False,
+        files: Optional[Sequence[str]] = None,
     ):
         """
         Args:
@@ -112,6 +172,7 @@ class PretrainDataset(Dataset):
             augment: whether to apply PhysioAugment to ECG
             augment_config: dict of augmentation parameters
             return_stats: whether to return precomputed physiological statistics
+            files: optional explicit subset used by patient-level splitting
         """
         if channels is None:
             channels = [0, 4]  # ECG, PPG
@@ -129,7 +190,7 @@ class PretrainDataset(Dataset):
         else:
             self.augmenter = None
 
-        raw_files = sorted([
+        raw_files = sorted(files) if files is not None else sorted([
             f for f in os.listdir(data_dir)
             if f.endswith(".pkl") and f.startswith("combined_processed_data")
         ])
@@ -414,21 +475,28 @@ class PretrainDatasetPT(Dataset):
     每个 .pt 文件包含:
         - ecg: (1, 3000) float32 tensor
         - ppg: (1, 3000) float32 tensor
+        - ecg_stats: (16,) float32 tensor (Phase 0 preprocessing)
+        - uid: patient/recording group identifier
     """
 
     def __init__(
         self,
         data_dir: str,
         max_files: Optional[int] = None,
+        return_stats: bool = False,
+        files: Optional[Sequence[str]] = None,
     ):
         """
         Args:
             data_dir: 预处理后 .pt 文件所在目录
             max_files: 限制文件数（调试用）
+            return_stats: 是否要求并返回 ecg_stats
+            files: 可选的显式文件子集
         """
         self.data_dir = data_dir
+        self.return_stats = return_stats
 
-        self.files = sorted([
+        self.files = sorted(files) if files is not None else sorted([
             f for f in os.listdir(data_dir)
             if f.endswith(".pt")
         ])
@@ -437,23 +505,39 @@ class PretrainDatasetPT(Dataset):
             self.files = self.files[:max_files]
 
         print(f"[PretrainDatasetPT] 找到 {len(self.files)} 个预处理文件于 {data_dir}")
+        if self.return_stats and self.files:
+            first_path = os.path.join(self.data_dir, self.files[0])
+            first_sample = torch.load(first_path, map_location="cpu", weights_only=True)
+            if "ecg_stats" not in first_sample:
+                raise RuntimeError(
+                    "Stats loss is enabled, but preprocessed files do not contain "
+                    f"'ecg_stats' (checked {first_path}). Re-run: "
+                    "python preprocess.py --overwrite"
+                )
 
     def __len__(self) -> int:
         return len(self.files)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple:
         """
         Returns:
             ecg: (1, 3000) tensor — context signal
             ppg: (1, 3000) tensor — target signal
+            ecg_stats: (16,) tensor when return_stats=True
         """
         filepath = os.path.join(self.data_dir, self.files[idx])
         try:
             sample = torch.load(filepath, weights_only=True)
-            return sample["ecg"], sample["ppg"]
-        except Exception:
-            fallback_idx = (idx + 1) % len(self.files)
-            return self.__getitem__(fallback_idx)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load pre-training file: {filepath}") from exc
+
+        if self.return_stats:
+            if "ecg_stats" not in sample:
+                raise RuntimeError(
+                    f"Missing ecg_stats in {filepath}; re-run preprocess.py --overwrite"
+                )
+            return sample["ecg"], sample["ppg"], sample["ecg_stats"]
+        return sample["ecg"], sample["ppg"]
 
 
 class DualDownstreamDataset(Dataset):

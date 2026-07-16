@@ -71,9 +71,6 @@ class C:
     ema_end = 1.0
     use_stats_loss = True
     stats_loss_weight = 0.1
-    use_contrast_loss = True
-    contrast_loss_weight = 0.1
-    contrast_decay = 0.999
     use_augment = True
     signal_len = 1000
 
@@ -91,7 +88,7 @@ aug = PhysioAugment(seed=42) if cfg.use_augment else None
 print(f"Train: {len(train_ds)} samples, {len(train_dl)} batches")
 print(f"Test:  {len(test_ds)} samples, {len(test_dl)} batches")
 print(f"Model: {cfg.transformer_layers} layers, dim={cfg.transformer_dim}, "
-      f"stats_loss={cfg.use_stats_loss}, contrast_loss={cfg.use_contrast_loss}, augment={cfg.use_augment}")
+      f"stats_loss={cfg.use_stats_loss}, augment={cfg.use_augment}")
 
 # ── Model ──────────────────────────────────────────────────────
 model = JEPA(
@@ -113,9 +110,6 @@ model = JEPA(
     ema_momentum=cfg.ema_momentum,
     use_stats_loss=cfg.use_stats_loss,
     stats_loss_weight=cfg.stats_loss_weight,
-    use_contrast_loss=cfg.use_contrast_loss,
-    contrast_loss_weight=cfg.contrast_loss_weight,
-    contrast_decay=cfg.contrast_decay,
 )
 n_params = sum(p.numel() for p in model.parameters())
 n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -143,7 +137,6 @@ for epoch in range(cfg.epochs):
     train_loss = 0.0
     train_jepa = 0.0
     train_stats = 0.0
-    train_contrast = 0.0
 
     for bi, batch in enumerate(train_dl):
         if len(batch) == 3:
@@ -174,12 +167,11 @@ for epoch in range(cfg.epochs):
         train_loss += info["total_loss"]
         train_jepa += info.get("jepa", 0)
         train_stats += info.get("stats", 0)
-        train_contrast += info.get("contrast", 0)
 
         if bi % 10 == 0:
             print(f"  E{epoch} B{bi:3d} | loss={info['total_loss']:.4f} "
                   f"jepa={info.get('jepa',0):.4f} stats={info.get('stats',0):.4f} "
-                  f"contrast={info.get('contrast',0):.4f} | EMA={ema_m:.4f}")
+                  f"| EMA={ema_m:.4f}")
 
     n = steps_per_epoch
     epoch_time = time.time() - epoch_start
@@ -198,7 +190,7 @@ for epoch in range(cfg.epochs):
     val_loss /= len(test_dl)
 
     print(f"Epoch {epoch:2d} | Train: {train_loss/n:.4f} "
-          f"(jepa={train_jepa/n:.4f} stats={train_stats/n:.4f} contrast={train_contrast/n:.4f}) "
+          f"(jepa={train_jepa/n:.4f} stats={train_stats/n:.4f}) "
           f"| Val: {val_loss:.4f} | Time: {epoch_time:.1f}s")
     print("-" * 60)
 
