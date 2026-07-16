@@ -11,6 +11,7 @@ from dataset.data import (
     split_pretrain_files,
 )
 from models.jepa import JEPA, StatsPredHead, ema_update
+from preprocess import zscore_per_channel
 
 
 class Phase0DataTests(unittest.TestCase):
@@ -48,6 +49,12 @@ class Phase0DataTests(unittest.TestCase):
              mock.patch("dataset.data.torch.load", return_value=invalid_sample):
             with self.assertRaisesRegex(RuntimeError, "preprocess.py --overwrite"):
                 PretrainDatasetPT("mock_data", return_stats=True)
+
+    def test_preprocess_rejects_nonfinite_signal(self):
+        signal = torch.zeros(2, 32).numpy()
+        signal[0, 3] = float("nan")
+        with self.assertRaisesRegex(ValueError, "NaN or Inf"):
+            zscore_per_channel(signal)
 
 
 class Phase0TeacherTests(unittest.TestCase):
@@ -95,11 +102,26 @@ class Phase0TeacherTests(unittest.TestCase):
         head = StatsPredHead(in_dim=8, hidden_dim=8, num_stats=2)
         targets = torch.tensor([[2.0, 4.0], [4.0, 8.0]])
         head.update_stats(targets)
-        self.assertTrue(torch.allclose(head.running_mean, targets.mean(dim=0)))
+        self.assertTrue(torch.allclose(
+            head.running_mean, targets.double().mean(dim=0)
+        ))
         self.assertTrue(
-            torch.allclose(head.running_var, targets.var(dim=0, unbiased=False))
+            torch.allclose(
+                head.running_var, targets.double().var(dim=0, unbiased=False)
+            )
         )
         self.assertEqual(head.num_updates.item(), 1)
+
+    def test_stats_normalization_stays_finite_for_large_targets(self):
+        head = StatsPredHead(in_dim=8, hidden_dim=8, num_stats=2)
+        targets = torch.tensor([
+            [3e30, -3e30],
+            [-3e30, 3e30],
+        ], dtype=torch.float32)
+        head.update_stats(targets)
+        normalized = head.normalize_targets(targets)
+        self.assertTrue(torch.isfinite(head.running_var).all())
+        self.assertTrue(torch.isfinite(normalized).all())
 
 
 if __name__ == "__main__":

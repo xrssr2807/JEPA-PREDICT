@@ -531,10 +531,24 @@ class PretrainDatasetPT(Dataset):
         except Exception as exc:
             raise RuntimeError(f"Failed to load pre-training file: {filepath}") from exc
 
+        for key in ("ecg", "ppg"):
+            if key not in sample:
+                raise RuntimeError(f"Missing '{key}' in {filepath}")
+            if not torch.isfinite(sample[key]).all():
+                raise RuntimeError(
+                    f"Non-finite values found in '{key}' at {filepath}; "
+                    "re-run preprocess.py --overwrite with the Phase 0 code"
+                )
+
         if self.return_stats:
             if "ecg_stats" not in sample:
                 raise RuntimeError(
                     f"Missing ecg_stats in {filepath}; re-run preprocess.py --overwrite"
+                )
+            if not torch.isfinite(sample["ecg_stats"]).all():
+                raise RuntimeError(
+                    f"Non-finite values found in 'ecg_stats' at {filepath}; "
+                    "re-run preprocess.py --overwrite with the Phase 0 code"
                 )
             return sample["ecg"], sample["ppg"], sample["ecg_stats"]
         return sample["ecg"], sample["ppg"]

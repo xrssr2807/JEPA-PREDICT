@@ -19,12 +19,21 @@ from dataset.data import compute_signal_stats, infer_pretrain_uid
 PREPROCESS_VERSION = 2
 
 
-def zscore_per_channel(x: np.ndarray) -> np.ndarray:
-    """Per-channel Z-score normalization."""
+def zscore_per_channel(x: np.ndarray, clip: float = 10.0) -> np.ndarray:
+    """Per-channel Z-score normalization with strict finite-value checks."""
+    x = np.asarray(x, dtype=np.float64)
+    if not np.isfinite(x).all():
+        raise ValueError("raw signal contains NaN or Inf")
+
     mean = x.mean(axis=-1, keepdims=True)
     std = x.std(axis=-1, keepdims=True)
-    std = np.where(std == 0, 1.0, std)
-    return (x - mean) / std
+    std = np.where(std < 1e-8, 1.0, std)
+    normalized = (x - mean) / std
+    if clip > 0:
+        normalized = np.clip(normalized, -clip, clip)
+    if not np.isfinite(normalized).all():
+        raise ValueError("normalized signal contains NaN or Inf")
+    return normalized.astype(np.float32, copy=False)
 
 
 def process_one(args):
@@ -34,14 +43,24 @@ def process_one(args):
         with open(src_path, "rb") as f:
             sample = pickle.load(f)
 
-        data = sample["data"]  # (5, 3000)
+        data = np.asarray(sample["data"])  # (5, 3000)
+        if data.ndim != 2 or max(channels) >= data.shape[0]:
+            raise ValueError(
+                f"invalid signal shape {data.shape} for channels {channels}"
+            )
         data = data[channels]  # (2, 3000): [ECG, PPG]
+        if not np.isfinite(data).all():
+            raise ValueError("raw signal contains NaN or Inf")
         ecg_stats = torch.from_numpy(compute_signal_stats(data[0])).float()
         data = zscore_per_channel(data)  # 归一化
 
         ecg = torch.from_numpy(data[0:1].copy()).float()  # (1, 3000)
         ppg = torch.from_numpy(data[1:2].copy()).float()  # (1, 3000)
 
+        if not all(torch.isfinite(tensor).all() for tensor in (ecg, ppg, ecg_stats)):
+            raise ValueError("preprocessed tensors contain NaN or Inf")
+
+        tmp_path = dst_path + ".tmp"
         torch.save(
             {
                 "ecg": ecg,
@@ -50,10 +69,17 @@ def process_one(args):
                 "uid": infer_pretrain_uid(os.path.basename(src_path)),
                 "preprocess_version": PREPROCESS_VERSION,
             },
-            dst_path,
+            tmp_path,
         )
+        os.replace(tmp_path, dst_path)
         return True, src_path, None
     except Exception as e:
+        tmp_path = dst_path + ".tmp"
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        # A failed overwrite must not leave a previously generated bad sample.
+        if os.path.exists(dst_path):
+            os.remove(dst_path)
         return False, src_path, str(e)
 
 

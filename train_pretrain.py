@@ -28,6 +28,8 @@ from models.jepa import JEPA, cosine_schedule
 def seed_everything(seed: int, deterministic: bool = True):
     """Seed Python, NumPy and PyTorch for a reproducible baseline."""
     os.environ["PYTHONHASHSEED"] = str(seed)
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -412,6 +414,11 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
 
             # Forward + loss (with optional stats)
             loss, info = model.compute_loss(ecg, ppg, ecg_stats)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    f"Non-finite loss at epoch={epoch}, batch={batch_idx}. "
+                    "Check the preprocessed ECG/PPG tensors and ecg_stats."
+                )
             _accumulate_metrics(epoch_losses, info)
 
             group_start = (batch_idx // accum_steps) * accum_steps
@@ -423,7 +430,15 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                 or (batch_idx + 1) == steps_per_epoch
             )
             if should_step:
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    trainable_params, max_norm=1.0, error_if_nonfinite=False
+                )
+                if not torch.isfinite(grad_norm):
+                    optimizer.zero_grad(set_to_none=True)
+                    raise FloatingPointError(
+                        f"Non-finite gradient norm at epoch={epoch}, "
+                        f"batch={batch_idx}; optimizer step was skipped."
+                    )
                 optimizer.step()
                 scheduler.step()
                 model.update_target_encoder(ema_momentum)

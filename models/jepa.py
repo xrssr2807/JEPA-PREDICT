@@ -141,8 +141,9 @@ class StatsPredHead(nn.Module):
             nn.Linear(hidden_dim, num_stats),
         )
         # Running statistics for target normalization
-        self.register_buffer('running_mean', torch.zeros(num_stats))
-        self.register_buffer('running_var', torch.ones(num_stats))
+        # Float64 avoids overflow when raw-device scales vary by many orders.
+        self.register_buffer('running_mean', torch.zeros(num_stats, dtype=torch.float64))
+        self.register_buffer('running_var', torch.ones(num_stats, dtype=torch.float64))
         self.register_buffer('num_updates', torch.zeros((), dtype=torch.long))
         self.momentum = 0.01
 
@@ -153,8 +154,13 @@ class StatsPredHead(nn.Module):
     def update_stats(self, targets: torch.Tensor):
         """Update running statistics from batch targets."""
         with torch.no_grad():
-            batch_mean = targets.mean(dim=0)
-            batch_var = targets.var(dim=0, unbiased=False)
+            if not torch.isfinite(targets).all():
+                raise FloatingPointError("Stats targets contain NaN or Inf")
+            targets64 = targets.detach().to(dtype=torch.float64)
+            batch_mean = targets64.mean(dim=0)
+            batch_var = targets64.var(dim=0, unbiased=False)
+            if not torch.isfinite(batch_mean).all() or not torch.isfinite(batch_var).all():
+                raise FloatingPointError("Stats running moments overflowed")
             if self.num_updates.item() == 0:
                 self.running_mean.copy_(batch_mean)
                 self.running_var.copy_(batch_var)
@@ -165,8 +171,15 @@ class StatsPredHead(nn.Module):
 
     def normalize_targets(self, targets: torch.Tensor) -> torch.Tensor:
         """Normalize targets to zero-mean unit-variance."""
-        normed = (targets - self.running_mean) / torch.sqrt(self.running_var + 1e-5)
-        return torch.clamp(normed, min=-10.0, max=10.0)
+        if not torch.isfinite(targets).all():
+            raise FloatingPointError("Stats targets contain NaN or Inf")
+        normed = (
+            targets.to(dtype=torch.float64) - self.running_mean
+        ) / torch.sqrt(self.running_var.clamp_min(0.0) + 1e-5)
+        normed = torch.clamp(normed, min=-10.0, max=10.0)
+        if not torch.isfinite(normed).all():
+            raise FloatingPointError("Normalized stats targets contain NaN or Inf")
+        return normed.to(dtype=targets.dtype)
 
 
 class JEPA(nn.Module):
