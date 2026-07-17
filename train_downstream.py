@@ -126,92 +126,85 @@ def resolve_multidisease_split_file(split_file: str, data_dir: str) -> str:
     )
 
 
-def load_multidisease_development_split(
+def load_multidisease_split_manifest(
     split_file: str,
     data_dir: str,
-    available_train_files: List[str],
-    test_files: Optional[List[str]] = None,
-) -> Tuple[List[str], List[str], str]:
-    """Load and validate the exact development train/val file manifest."""
+    available_files: List[str],
+) -> Tuple[List[str], List[str], List[str], str]:
+    """Load and validate an exact patient-disjoint train/val/test manifest."""
     resolved = resolve_multidisease_split_file(split_file, data_dir)
     with open(resolved, "r", encoding="utf-8") as f:
         manifest = json.load(f)
 
     if not isinstance(manifest, dict):
-        raise ValueError("Development split must be a JSON object with train/val lists")
+        raise ValueError("Multidisease split must be a JSON object")
 
     split_lists = {}
-    for split_name in ("train", "val"):
+    for split_name in ("train", "val", "test"):
         files = manifest.get(split_name)
         if not isinstance(files, list) or not files:
-            raise ValueError(f"Development split '{split_name}' must be a non-empty list")
+            raise ValueError(f"Multidisease split '{split_name}' must be a non-empty list")
         if any(not isinstance(name, str) for name in files):
-            raise ValueError(f"Development split '{split_name}' contains a non-string filename")
+            raise ValueError(f"Multidisease split '{split_name}' contains a non-string filename")
         invalid = [
             name for name in files
             if "/" in name or "\\" in name
-            or not name.startswith("train_") or not name.endswith(".pkl")
+            or not name.endswith(".pkl")
+            or not name.startswith(("train_", "test_"))
         ]
         if invalid:
             raise ValueError(
-                f"Development split '{split_name}' contains invalid filenames: "
+                f"Multidisease split '{split_name}' contains invalid filenames: "
                 f"{invalid[:5]}"
             )
         duplicates = len(files) - len(set(files))
         if duplicates:
             raise ValueError(
-                f"Development split '{split_name}' contains {duplicates} duplicate files"
+                f"Multidisease split '{split_name}' contains {duplicates} duplicate files"
             )
         split_lists[split_name] = files
 
     train_files = split_lists["train"]
     val_files = split_lists["val"]
-    file_overlap = set(train_files) & set(val_files)
-    if file_overlap:
-        raise ValueError(
-            f"Development train/val file leakage: {len(file_overlap)} overlapping files"
-        )
+    test_files = split_lists["test"]
+    file_sets = {name: set(files) for name, files in split_lists.items()}
+    uid_sets = {
+        name: {uid_from_filename(filename) for filename in files}
+        for name, files in split_lists.items()
+    }
+    for left, right in (("train", "val"), ("train", "test"), ("val", "test")):
+        file_overlap = file_sets[left] & file_sets[right]
+        if file_overlap:
+            raise ValueError(
+                f"Multidisease {left}/{right} file leakage: "
+                f"{len(file_overlap)} overlapping files"
+            )
+        uid_overlap = uid_sets[left] & uid_sets[right]
+        if uid_overlap:
+            raise ValueError(
+                f"Multidisease {left}/{right} patient leakage: "
+                f"{len(uid_overlap)} overlapping UIDs; "
+                f"examples={sorted(uid_overlap)[:5]}"
+            )
 
-    train_uids = {uid_from_filename(name) for name in train_files}
-    val_uids = {uid_from_filename(name) for name in val_files}
-    uid_overlap = train_uids & val_uids
-    if uid_overlap:
-        raise ValueError(
-            f"Development train/val patient leakage: {len(uid_overlap)} overlapping UIDs; "
-            f"examples={sorted(uid_overlap)[:5]}"
-        )
-
-    available = set(available_train_files)
-    requested = set(train_files) | set(val_files)
+    available = set(available_files)
+    requested = file_sets["train"] | file_sets["val"] | file_sets["test"]
     missing = requested - available
     if missing:
         raise FileNotFoundError(
-            f"Development split references {len(missing)} files missing from {data_dir}; "
+            f"Multidisease split references {len(missing)} files missing from {data_dir}; "
             f"examples={sorted(missing)[:5]}"
         )
 
     ignored = available - requested
     print(
         f"[DataSplit] manifest={resolved} | "
-        f"train={len(train_files)} files/{len(train_uids)} UIDs | "
-        f"val={len(val_files)} files/{len(val_uids)} UIDs | "
-        f"ignored_train_files={len(ignored)}"
+        f"train={len(train_files)} files/{len(uid_sets['train'])} UIDs | "
+        f"val={len(val_files)} files/{len(uid_sets['val'])} UIDs | "
+        f"test={len(test_files)} files/{len(uid_sets['test'])} UIDs | "
+        f"ignored_files={len(ignored)}"
     )
-
-    if test_files:
-        test_uids = {uid_from_filename(name) for name in test_files}
-        train_test_overlap = train_uids & test_uids
-        val_test_overlap = val_uids & test_uids
-        if train_test_overlap or val_test_overlap:
-            print(
-                "[DataSplit][WARNING] Patient leakage with the existing test_*.pkl set: "
-                f"train/test={len(train_test_overlap)} UIDs, "
-                f"val/test={len(val_test_overlap)} UIDs. "
-                "Test metrics may be optimistic; create a patient-disjoint test manifest "
-                "for publication results."
-            )
-
-    return sorted(train_files), sorted(val_files), resolved
+    return sorted(train_files), sorted(val_files), sorted(test_files), resolved
 
 
 # ── Data ────────────────────────────────────────────────────────
@@ -311,19 +304,24 @@ def build_downstream_dataloaders(
             target_length=target_len,
         )
         val_dataset = None
-        development_split = getattr(
-            data_config, "multidisease_development_split", ""
+        split_manifest = getattr(
+            data_config,
+            "multidisease_split_file",
+            getattr(data_config, "multidisease_development_split", ""),
         )
-        if development_split:
-            train_files, val_files, _ = load_multidisease_development_split(
-                development_split,
+        if split_manifest:
+            available_files = sorted(
+                set(train_dataset.files) | set(test_dataset.files)
+            )
+            train_files, val_files, test_files, _ = load_multidisease_split_manifest(
+                split_manifest,
                 data_config.multidisease_dir,
-                train_dataset.files,
-                test_dataset.files,
+                available_files,
             )
             val_dataset = copy.deepcopy(train_dataset)
             train_dataset.files = train_files
             val_dataset.files = val_files
+            test_dataset.files = test_files
         elif data_config.val_split > 0:
             labels_for_split = []
             for fname in train_dataset.files:
@@ -1786,12 +1784,14 @@ if __name__ == "__main__":
         help="Multidisease modality ablation; default keeps config.py behavior",
     )
     parser.add_argument(
+        "--multidisease_split",
         "--development_split",
+        dest="multidisease_split",
         type=str,
         default=None,
         help=(
-            "Exact multidisease train/val JSON manifest. Defaults to "
-            "config.data.multidisease_development_split"
+            "Exact patient-level train/val/test JSON manifest. Defaults to "
+            "config.data.multidisease_split_file"
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -1807,8 +1807,8 @@ if __name__ == "__main__":
         }
         config.data.multidisease_channel = channel_map[args.multidisease_channel]
         config.data.multidisease_dual_stream = args.multidisease_channel == "both"
-    if args.development_split is not None:
-        config.data.multidisease_development_split = args.development_split
+    if args.multidisease_split is not None:
+        config.data.multidisease_split_file = args.multidisease_split
     config.output_dir = args.output_dir
     os.makedirs(config.output_dir, exist_ok=True)
 
