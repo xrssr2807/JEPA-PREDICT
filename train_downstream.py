@@ -17,6 +17,7 @@ import sys
 import time
 import math
 import json
+import hashlib
 import copy
 import pickle
 import random
@@ -124,6 +125,20 @@ def resolve_multidisease_split_file(split_file: str, data_dir: str) -> str:
         "Multidisease development split was not found. Checked: "
         + ", ".join(checked)
     )
+
+
+def multidisease_split_provenance(split_file: str, data_dir: str) -> dict:
+    """Return portable split metadata for logs and downstream checkpoints."""
+    resolved = resolve_multidisease_split_file(split_file, data_dir)
+    with open(resolved, "rb") as f:
+        payload = f.read()
+    manifest = json.loads(payload.decode("utf-8"))
+    return {
+        "configured_path": split_file,
+        "filename": os.path.basename(resolved),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "metadata": manifest.get("metadata", {}),
+    }
 
 
 def load_multidisease_split_manifest(
@@ -1270,6 +1285,26 @@ def train_downstream(
     train_loader, val_loader, test_loader, train_ds, test_ds = build_downstream_dataloaders(
         config.data, config.train, dataset, use_dual=use_dual,
     )
+    split_provenance = None
+    if multilabel:
+        split_file = getattr(
+            config.data,
+            "multidisease_split_file",
+            getattr(config.data, "multidisease_development_split", ""),
+        )
+        split_provenance = multidisease_split_provenance(
+            split_file, config.data.multidisease_dir
+        )
+        metadata = split_provenance["metadata"]
+        split_line = (
+            f"[DataSplit] file={split_provenance['filename']} "
+            f"sha256={split_provenance['sha256']} "
+            f"patients={metadata.get('patient_counts', {})} "
+            f"files={metadata.get('file_counts', {})}"
+        )
+        print(split_line)
+        log_fh.write(split_line + "\n")
+        log_fh.flush()
 
     # ── ECG mode setup ──
     # Dual-channel: load both encoders, concat fusion
@@ -1663,6 +1698,7 @@ def train_downstream(
                 "multidisease_channel": (
                     config.data.multidisease_channel if multilabel else None
                 ),
+                "data_split": split_provenance,
             }
             no_improve = 0
         else:
