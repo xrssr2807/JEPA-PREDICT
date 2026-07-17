@@ -1538,6 +1538,7 @@ def train_downstream(
                 focus_auc_margin=config.train.chd_auc_margin,
             )
             eval_loader = val_loader if val_loader is not None else test_loader
+            eval_name = "Val" if val_loader is not None else "Test"
             if multilabel:
                 test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate_multilabel(
                     model, eval_loader, criterion, device, config.data.multidisease_labels,
@@ -1553,7 +1554,7 @@ def train_downstream(
 
             log_line = (f"Probe Epoch {epoch+1:2d} | "
                         f"Train L={train_loss:.4f} Acc={train_acc:.2f}% | "
-                        f"Test L={test_loss:.4f} Acc={test_acc:5.2f}% AUC={auc:.4f} "
+                        f"{eval_name} L={test_loss:.4f} Acc={test_acc:5.2f}% AUC={auc:.4f} "
                         f"P={prec:.4f} R={rec:.4f} F1={f1:.4f} F0.5={f05:.4f}")
             if focus_auc is not None:
                 log_line += f" CHD_AUC={focus_auc:.4f}"
