@@ -171,11 +171,13 @@ class TrainConfig:
 
     # Phase 1 doubles online branches. AMP plus accumulation keeps the
     # effective batch near the Phase 0 value while fitting a 24 GB GPU.
-    phase1_batch_size: int = 96
-    phase1_accum_steps: int = 5
+    phase1_batch_size: int = 160
+    phase1_accum_steps: int = 3
     phase1_lr: float = 3e-4
     phase1_warmup_epochs: int = 10
     phase1_use_amp: bool = True
+    pretrain_dataloader_workers: int = 8
+    pretrain_prefetch_factor: int = 4
 
     # Optimizer
     optimizer: str = "adamw"

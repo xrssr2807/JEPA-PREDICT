@@ -25,7 +25,11 @@ from dataset.data import (
 from models.jepa import JEPA, cosine_schedule
 
 
-def seed_everything(seed: int, deterministic: bool = True):
+def seed_everything(
+    seed: int,
+    deterministic: bool = True,
+    enable_tf32: bool = True,
+):
     """Seed Python, NumPy and PyTorch for a reproducible baseline."""
     os.environ["PYTHONHASHSEED"] = str(seed)
     if deterministic:
@@ -35,10 +39,13 @@ def seed_everything(seed: int, deterministic: bool = True):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cuda.matmul.allow_tf32 = enable_tf32
+        torch.backends.cudnn.allow_tf32 = enable_tf32
+        if enable_tf32:
+            torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.deterministic = deterministic
     torch.backends.cudnn.benchmark = not deterministic
-    if deterministic:
-        torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.use_deterministic_algorithms(deterministic, warn_only=True)
 
 
 def _seed_worker(worker_id: int):
@@ -125,7 +132,10 @@ def build_pretrain_dataloaders(
         f"val={len(val_files)} segments/{len(val_uids)} UIDs | seed={seed}"
     )
 
-    num_workers = 4 if use_processed else 0
+    num_workers = (
+        max(0, int(train_config.pretrain_dataloader_workers))
+        if use_processed else 0
+    )
     train_generator = torch.Generator().manual_seed(seed)
     val_generator = torch.Generator().manual_seed(seed + 1)
     common = dict(
@@ -135,6 +145,10 @@ def build_pretrain_dataloaders(
         worker_init_fn=_seed_worker,
         persistent_workers=num_workers > 0,
     )
+    if num_workers > 0:
+        common["prefetch_factor"] = max(
+            1, int(train_config.pretrain_prefetch_factor)
+        )
     train_loader = DataLoader(
         train_dataset,
         shuffle=True,
@@ -330,7 +344,11 @@ def _load_jepa_state_dict(model, state_dict):
 
 
 def train(config: Config, resume_from: str = None, start_epoch: int = 0):
-    seed_everything(config.seed, config.deterministic)
+    seed_everything(
+        config.seed,
+        config.deterministic,
+        enable_tf32=config.train.enable_tf32,
+    )
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     print(
         f"Device: {device} | seed={config.seed} | "
@@ -489,6 +507,8 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
 
     for epoch in range(start_epoch, config.train.pretrain_epochs):
         model.train()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         epoch_losses = defaultdict(float)
         epoch_start = time.time()
         optimizer.zero_grad(set_to_none=True)
@@ -638,6 +658,18 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
             ):
                 print("[CollapseWarning] More than 90% of embedding dimensions have near-zero variance")
         summary += f" | Time: {epoch_time:.1f}s"
+        samples_per_second = steps_per_epoch * batch_size / max(epoch_time, 1e-6)
+        summary += f" | Throughput={samples_per_second:.1f} samples/s"
+        if device.type == "cuda":
+            total_vram = torch.cuda.get_device_properties(device).total_memory
+            peak_allocated = torch.cuda.max_memory_allocated(device)
+            peak_reserved = torch.cuda.max_memory_reserved(device)
+            summary += (
+                f" peak_alloc={peak_allocated / 2**30:.2f}GB"
+                f"({100.0 * peak_allocated / total_vram:.1f}%)"
+                f" peak_reserved={peak_reserved / 2**30:.2f}GB"
+                f"({100.0 * peak_reserved / total_vram:.1f}%)"
+            )
         print(summary)
         print("-" * 60)
 
@@ -906,6 +938,18 @@ if __name__ == "__main__":
         "--lr", type=float, default=None,
         help="Override peak learning rate for the selected phase",
     )
+    parser.add_argument(
+        "--workers", type=int, default=None,
+        help="Override pre-training DataLoader worker count",
+    )
+    parser.add_argument(
+        "--prefetch_factor", type=int, default=None,
+        help="Batches prefetched by each DataLoader worker",
+    )
+    parser.add_argument(
+        "--performance_mode", action="store_true",
+        help="Use benchmarked CUDA kernels instead of deterministic kernels",
+    )
     parser.add_argument("--token_align", type=str, default=None,
                         help="Token 对齐续训练: --token_align outputs/jepa_best.pt")
     args = parser.parse_args()
@@ -917,6 +961,13 @@ if __name__ == "__main__":
         config.output_dir = args.output_dir
     elif config.model.pretrain_phase == 1:
         config.output_dir = config.output_dir.rstrip("/\\") + "_phase1"
+
+    if args.performance_mode:
+        config.deterministic = False
+    if args.workers is not None:
+        config.train.pretrain_dataloader_workers = args.workers
+    if args.prefetch_factor is not None:
+        config.train.pretrain_prefetch_factor = args.prefetch_factor
 
     if config.model.pretrain_phase == 1:
         if args.batch_size is not None:
