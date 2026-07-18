@@ -278,7 +278,7 @@ class SignalEncoder(nn.Module):
         self.pool_type = pool_type
         self.transformer_dim = transformer_dim
 
-    def forward(
+    def _forward_legacy(
         self, x: torch.Tensor, return_all: bool = False
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -321,3 +321,71 @@ class SignalEncoder(nn.Module):
             raise ValueError(f"Unknown pool_type: {self.pool_type}")
 
         return x, tokens
+
+    def tokenize(self, x: torch.Tensor) -> torch.Tensor:
+        """Convert a waveform into CNN tokens before positional encoding."""
+        x = self.cnn(x)
+        x = x.transpose(1, 2)
+        return self.proj(x)
+
+    def encode_tokens(
+        self,
+        tokens: torch.Tensor,
+        return_all: bool = False,
+        token_mask: Optional[torch.Tensor] = None,
+        mask_token: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Encode CNN tokens, optionally replacing hidden positions.
+
+        ``token_mask`` uses ``True`` for positions hidden from the online
+        encoder. Applying it after the CNN avoids raw zero-boundary shortcuts.
+        """
+        x = tokens
+        if token_mask is not None:
+            if token_mask.dim() == 3 and token_mask.size(1) == 1:
+                token_mask = token_mask[:, 0]
+            if token_mask.shape != x.shape[:2]:
+                raise ValueError(
+                    f"token_mask shape {tuple(token_mask.shape)} does not match "
+                    f"token sequence {tuple(x.shape[:2])}"
+                )
+            if mask_token is None:
+                raise ValueError("mask_token is required when token_mask is provided")
+            replacement = mask_token.to(dtype=x.dtype, device=x.device)
+            if replacement.dim() == 1:
+                replacement = replacement.view(1, 1, -1)
+            if replacement.size(-1) != x.size(-1):
+                raise ValueError(
+                    f"mask_token dim {replacement.size(-1)} != token dim {x.size(-1)}"
+                )
+            x = torch.where(token_mask.unsqueeze(-1), replacement, x)
+
+        x = self.pos_encoding(x)
+        x = self.transformer(x)
+        x = self.ln_final(x)
+        output_tokens = x if return_all else None
+
+        if self.pool_type == "adaptive_avg":
+            pooled = x.mean(dim=1)
+        elif self.pool_type == "max":
+            pooled = x.max(dim=1)[0]
+        elif self.pool_type == "cls":
+            pooled = x[:, 0]
+        else:
+            raise ValueError(f"Unknown pool_type: {self.pool_type}")
+        return pooled, output_tokens
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_all: bool = False,
+        token_mask: Optional[torch.Tensor] = None,
+        mask_token: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        tokens = self.tokenize(x)
+        return self.encode_tokens(
+            tokens,
+            return_all=return_all,
+            token_mask=token_mask,
+            mask_token=mask_token,
+        )

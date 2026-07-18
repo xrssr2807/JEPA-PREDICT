@@ -540,6 +540,33 @@ def build_encoder(model_config: ModelConfig, in_channels: Optional[int] = None) 
     )
 
 
+def _select_pretrained_encoder_state(ckpt: dict, encoder_type: str):
+    """Select the online modality state while preserving Phase 0 fallback."""
+    # Phase 1 stores the directly optimized PPG branch separately. Prefer it
+    # for the historical "target" role; Phase 0 checkpoints fall back to the
+    # EMA target_encoder exactly as before.
+    key = (
+        "ppg_encoder"
+        if encoder_type == "target" and "ppg_encoder" in ckpt
+        else f"{encoder_type}_encoder"
+    )
+    if key in ckpt:
+        state_dict = ckpt[key]
+    else:
+        msd = ckpt["model_state_dict"]
+        prefix = (
+            "ppg_encoder."
+            if encoder_type == "target"
+            and any(k.startswith("ppg_encoder.") for k in msd)
+            else f"{encoder_type}_encoder."
+        )
+        state_dict = {
+            k[len(prefix):]: v for k, v in msd.items()
+            if k.startswith(prefix)
+        }
+    return state_dict, key
+
+
 def load_pretrained_encoder(
     checkpoint_path: str, model_config: ModelConfig,
     encoder_type: str, device: torch.device,
@@ -548,17 +575,7 @@ def load_pretrained_encoder(
     """Load a pre-trained encoder from JEPA checkpoint."""
     encoder = build_encoder(model_config, in_channels=in_channels).to(device)
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-
-    key = f"{encoder_type}_encoder"
-    if key in ckpt:
-        state_dict = ckpt[key]
-    else:
-        msd = ckpt["model_state_dict"]
-        prefix = f"{encoder_type}_encoder."
-        state_dict = {
-            k[len(prefix):]: v for k, v in msd.items()
-            if k.startswith(prefix)
-        }
+    state_dict, key = _select_pretrained_encoder_state(ckpt, encoder_type)
 
     first_conv_key = "cnn.conv_blocks.0.0.weight"
     if first_conv_key in state_dict:
@@ -573,7 +590,7 @@ def load_pretrained_encoder(
                 print(f"[Encoder] Adapted first conv {old_w.size(1)}ch -> 1ch")
 
     encoder.load_state_dict(state_dict, strict=True)
-    print(f"Loaded {encoder_type}_encoder from {checkpoint_path}")
+    print(f"Loaded {key} for {encoder_type} role from {checkpoint_path}")
     return encoder
 
 

@@ -67,6 +67,15 @@ class DataConfig:
 class ModelConfig:
     """JEPA model architecture hyperparameters."""
 
+    # Phase 0 remains reproducible with ``python train_pretrain.py --phase 0``.
+    pretrain_phase: int = 1
+    # Phase 1: dual-online / dual-teacher masked-token JEPA (B2).
+    phase1_mask_ratio: float = 0.60
+    phase1_mask_block_tokens: int = 8
+    phase1_bidirectional: bool = True
+    phase1_token_loss_weight: float = 1.0
+    phase1_use_stats_loss: bool = False
+
     # Input
     in_channels: int = 1  # single-channel (ECG or PPG separately)
     signal_length: int = 3000  # pre-training: 30s @ 100Hz
@@ -159,6 +168,14 @@ class TrainConfig:
     pretrain_warmup_epochs: int = 5  # shorter warmup → earlier cosine decay
     pretrain_weight_decay: float = 0.05
     pretrain_val_every: int = 1
+
+    # Phase 1 doubles online branches. AMP plus accumulation keeps the
+    # effective batch near the Phase 0 value while fitting a 24 GB GPU.
+    phase1_batch_size: int = 96
+    phase1_accum_steps: int = 5
+    phase1_lr: float = 3e-4
+    phase1_warmup_epochs: int = 10
+    phase1_use_amp: bool = True
 
     # Optimizer
     optimizer: str = "adamw"

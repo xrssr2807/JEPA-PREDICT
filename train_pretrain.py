@@ -93,6 +93,7 @@ def build_pretrain_dataloaders(
     return_stats: bool,
     use_processed: bool = True,
     seed: int = 42,
+    batch_size: int = None,
 ):
     """Build deterministic patient-grouped train/validation loaders."""
     processed_dir = data_config.pretrain_processed_dir
@@ -128,7 +129,7 @@ def build_pretrain_dataloaders(
     train_generator = torch.Generator().manual_seed(seed)
     val_generator = torch.Generator().manual_seed(seed + 1)
     common = dict(
-        batch_size=train_config.pretrain_batch_size,
+        batch_size=batch_size or train_config.pretrain_batch_size,
         num_workers=num_workers,
         pin_memory=True,
         worker_init_fn=_seed_worker,
@@ -189,13 +190,22 @@ def build_model(model_config: ModelConfig) -> JEPA:
         # ★ JETS 掩码
         mask_ratio=model_config.jets_mask_ratio,
         mask_patch_size=model_config.jets_mask_patch_size,
-        use_stats_loss=model_config.use_stats_loss,
+        use_stats_loss=(
+            model_config.use_stats_loss
+            if model_config.pretrain_phase == 0
+            else model_config.phase1_use_stats_loss
+        ),
         stats_loss_weight=model_config.stats_loss_weight,
         use_se=model_config.cnn_use_se,
         use_inception=model_config.cnn_use_inception,
         use_token_align=model_config.use_token_align,
         token_align_weight=model_config.token_align_weight,
         token_align_window=model_config.token_align_window,
+        pretrain_phase=model_config.pretrain_phase,
+        phase1_mask_ratio=model_config.phase1_mask_ratio,
+        phase1_mask_block_tokens=model_config.phase1_mask_block_tokens,
+        phase1_bidirectional=model_config.phase1_bidirectional,
+        phase1_token_loss_weight=model_config.phase1_token_loss_weight,
     )
 
 
@@ -220,7 +230,7 @@ def _accumulate_metrics(totals, info):
 
 
 @torch.no_grad()
-def evaluate_pretrain(model, dataloader, device, seed: int):
+def evaluate_pretrain(model, dataloader, device, seed: int, use_amp: bool = False):
     """Evaluate a stable, unmasked held-out objective and collapse metrics."""
     model.eval()
     totals = defaultdict(float)
@@ -236,12 +246,17 @@ def evaluate_pretrain(model, dataloader, device, seed: int):
             torch.cuda.manual_seed_all(seed)
         for batch_data in dataloader:
             ecg, ppg, ecg_stats = _move_pretrain_batch(batch_data, device)
-            loss, info = model.compute_loss(
-                ecg,
-                ppg,
-                ecg_stats,
-                collect_diagnostics=True,
-            )
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=bool(use_amp and device.type == "cuda"),
+            ):
+                loss, info = model.compute_loss(
+                    ecg,
+                    ppg,
+                    ecg_stats,
+                    collect_diagnostics=True,
+                )
             info.setdefault("total_loss", loss.item())
             _accumulate_metrics(totals, info)
             num_batches += 1
@@ -285,6 +300,20 @@ def _save_checkpoint(payload, path):
     os.replace(tmp_path, path)
 
 
+def _encoder_checkpoint_payload(model) -> dict:
+    """Expose stable downstream keys plus Phase 1 online/teacher weights."""
+    payload = {
+        "context_encoder": model.context_encoder.state_dict(),
+        "target_encoder": model.target_encoder.state_dict(),
+    }
+    if model.pretrain_phase == 1:
+        payload.update({
+            "ppg_encoder": model.ppg_encoder.state_dict(),
+            "context_teacher": model.context_teacher.state_dict(),
+        })
+    return payload
+
+
 def _load_jepa_state_dict(model, state_dict):
     """Load old checkpoints while allowing only the new Phase 0 stats counter."""
     result = model.load_state_dict(state_dict, strict=False)
@@ -308,48 +337,83 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
         f"deterministic={config.deterministic}"
     )
 
+    phase = int(config.model.pretrain_phase)
+    if phase == 1:
+        batch_size = int(config.train.phase1_batch_size)
+        accum_steps = max(1, int(config.train.phase1_accum_steps))
+        pretrain_lr = float(config.train.phase1_lr)
+        warmup_epochs = int(config.train.phase1_warmup_epochs)
+        use_amp = bool(config.train.phase1_use_amp and device.type == "cuda")
+    else:
+        batch_size = int(config.train.pretrain_batch_size)
+        accum_steps = max(1, int(config.train.pretrain_accum_steps))
+        pretrain_lr = float(config.train.pretrain_lr)
+        warmup_epochs = int(config.train.pretrain_warmup_epochs)
+        use_amp = False
+    print(
+        f"[Pretrain] phase={phase} batch={batch_size} accum={accum_steps} "
+        f"effective_batch={batch_size * accum_steps} lr={pretrain_lr:.2e} "
+        f"amp={use_amp}"
+    )
+    use_stats_targets = (
+        config.model.use_stats_loss
+        if phase == 0
+        else config.model.phase1_use_stats_loss
+    )
+
     # Data
     train_loader, val_loader = build_pretrain_dataloaders(
         config.data,
         config.train,
-        return_stats=config.model.use_stats_loss,
+        return_stats=use_stats_targets,
         use_processed=True,
         seed=config.seed,
+        batch_size=batch_size,
     )
     steps_per_epoch = len(train_loader)
-    accum_steps = max(1, config.train.pretrain_accum_steps)
     optimizer_steps_per_epoch = math.ceil(steps_per_epoch / accum_steps)
     total_steps = optimizer_steps_per_epoch * config.train.pretrain_epochs
 
-    # Model
     model = build_model(config.model).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Optimizer
-    trainable_params = list(model.context_encoder.parameters()) + \
-                       list(model.context_proj.parameters()) + \
-                       list(model.predictor.parameters())
-    if model.use_stats_loss:
-        trainable_params += list(model.stats_pred_head.parameters())
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    print(
+        f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}"
+    )
     optimizer = AdamW(
         trainable_params,
-        lr=config.train.pretrain_lr,
+        lr=pretrain_lr,
         betas=(config.train.beta1, config.train.beta2),
         weight_decay=config.train.pretrain_weight_decay,
     )
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # ── Resume logic ──
     resume_best_loss = float("inf")
     if resume_from is not None:
         print(f"[Resume] Loading checkpoint: {resume_from}")
         ckpt = torch.load(resume_from, map_location=device, weights_only=False)
+        checkpoint_phase = int(ckpt.get("pretrain_phase", 0))
+        if checkpoint_phase != phase:
+            raise ValueError(
+                f"Cannot resume Phase {phase} from a Phase {checkpoint_phase} "
+                "checkpoint. Start Phase 1 from scratch or use a matching checkpoint."
+            )
         # Load encoder weights
         if "context_encoder" in ckpt:
             model.context_encoder.load_state_dict(ckpt["context_encoder"])
             print("[Resume] Loaded context_encoder weights")
+        if phase == 1 and "ppg_encoder" in ckpt:
+            model.ppg_encoder.load_state_dict(ckpt["ppg_encoder"])
+            print("[Resume] Loaded ppg_encoder weights")
         if "target_encoder" in ckpt:
             model.target_encoder.load_state_dict(ckpt["target_encoder"])
             print("[Resume] Loaded target_encoder weights")
+        if phase == 1 and "context_teacher" in ckpt:
+            model.context_teacher.load_state_dict(ckpt["context_teacher"])
+            print("[Resume] Loaded context_teacher weights")
         if "model_state_dict" in ckpt:
             _load_jepa_state_dict(model, ckpt["model_state_dict"])
             print("[Resume] Loaded full model_state_dict")
@@ -376,7 +440,7 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
     remaining_epochs = config.train.pretrain_epochs - start_epoch
     remaining_steps = remaining_epochs * optimizer_steps_per_epoch
     # Skip warmup when resuming (already past warmup phase)
-    if start_epoch >= config.train.pretrain_warmup_epochs:
+    if start_epoch >= warmup_epochs:
         warmup_scheduler = LinearLR(
             optimizer, start_factor=1.0, end_factor=1.0, total_iters=1
         )
@@ -388,7 +452,7 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
         )
     else:
         warmup_steps = (
-            config.train.pretrain_warmup_epochs - start_epoch
+            warmup_epochs - start_epoch
         ) * optimizer_steps_per_epoch
         cosine_steps = remaining_steps - warmup_steps
         warmup_scheduler = LinearLR(
@@ -405,6 +469,7 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
     os.makedirs(config.output_dir, exist_ok=True)
     log_file = os.path.join(config.output_dir, "pretrain_log.txt")
     split_manifest = {
+        "pretrain_phase": phase,
         "seed": config.seed,
         "val_ratio": config.data.pretrain_val_split,
         "train_files": list(train_loader.dataset.files),
@@ -432,7 +497,11 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
             ecg, ppg, ecg_stats = _move_pretrain_batch(batch_data, device)
 
             # ★ MixUp: 随机混合batch内样本 → 正则化
-            if config.train.use_mixup and config.train.mixup_alpha > 0:
+            if (
+                phase == 0
+                and config.train.use_mixup
+                and config.train.mixup_alpha > 0
+            ):
                 lam = np.random.beta(config.train.mixup_alpha, config.train.mixup_alpha)
                 idx = torch.randperm(ecg.size(0), device=device)
                 ecg = lam * ecg + (1 - lam) * ecg[idx]
@@ -448,8 +517,13 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                 ema_progress,
             )
 
-            # Forward + loss (with optional stats)
-            loss, info = model.compute_loss(ecg, ppg, ecg_stats)
+            # Forward + loss. Phase 1 uses AMP because it runs four encoders.
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=use_amp,
+            ):
+                loss, info = model.compute_loss(ecg, ppg, ecg_stats)
             if not torch.isfinite(loss):
                 raise FloatingPointError(
                     f"Non-finite loss at epoch={epoch}, batch={batch_idx}. "
@@ -459,13 +533,14 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
 
             group_start = (batch_idx // accum_steps) * accum_steps
             group_size = min(accum_steps, steps_per_epoch - group_start)
-            (loss / group_size).backward()
+            scaler.scale(loss / group_size).backward()
 
             should_step = (
                 (batch_idx + 1) % accum_steps == 0
                 or (batch_idx + 1) == steps_per_epoch
             )
             if should_step:
+                scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     trainable_params, max_norm=1.0, error_if_nonfinite=False
                 )
@@ -475,16 +550,25 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                         f"Non-finite gradient norm at epoch={epoch}, "
                         f"batch={batch_idx}; optimizer step was skipped."
                     )
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
                 model.update_target_encoder(ema_momentum)
                 optimizer.zero_grad(set_to_none=True)
                 optimizer_step += 1
 
             if batch_idx % 50 == 0:
+                phase_detail = ""
+                if phase == 1:
+                    phase_detail = (
+                        f" E2P: {_metric(info, 'ecg_to_ppg_token'):.5f} |"
+                        f" P2E: {_metric(info, 'ppg_to_ecg_token'):.5f} |"
+                        f" Mask: {_metric(info, 'masked_fraction'):.3f} |"
+                    )
                 log_msg = (
                     f"Epoch {epoch:3d} | Batch {batch_idx:4d}/{steps_per_epoch} | "
                     f"Loss: {loss.item():.6f} | JEPA: {_metric(info, 'jepa'):.5f} | "
+                    f"{phase_detail} "
                     f"Stats: {_metric(info, 'stats'):.5f} | "
                     f"CtxStd: {_metric(info, 'context_std'):.4f} | "
                     f"TgtStd: {_metric(info, 'target_std'):.4f} | "
@@ -507,17 +591,27 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
         val_metrics = None
         if should_validate:
             val_metrics = evaluate_pretrain(
-                model, val_loader, device, seed=config.seed + 10_000
+                model,
+                val_loader,
+                device,
+                seed=config.seed + 10_000,
+                use_amp=use_amp,
             )
 
         summary = (
-            f"Epoch {epoch:3d} | "
+            f"Epoch {epoch:3d} | Phase {phase} | "
             f"Train total={epoch_loss:.6f} jepa={_metric(train_metrics, 'jepa'):.6f} "
             f"stats={_metric(train_metrics, 'stats'):.6f} "
             f"token={_metric(train_metrics, 'token_align'):.6f} "
             f"ctx_std={_metric(train_metrics, 'context_std'):.4f} "
             f"tgt_std={_metric(train_metrics, 'target_std'):.4f}"
         )
+        if phase == 1:
+            summary += (
+                f" e2p={_metric(train_metrics, 'ecg_to_ppg_token'):.6f} "
+                f"p2e={_metric(train_metrics, 'ppg_to_ecg_token'):.6f} "
+                f"mask={_metric(train_metrics, 'masked_fraction'):.3f}"
+            )
         if val_metrics is not None:
             summary += (
                 f" | Val total={_metric(val_metrics, 'total_loss'):.6f} "
@@ -532,6 +626,12 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                 f"tgt_cov={_metric(val_metrics, 'target_cov_offdiag_rms'):.4f} "
                 f"teacher_cos={_metric(val_metrics, 'teacher_student_cosine'):.6f}"
             )
+            if phase == 1:
+                summary += (
+                    f" val_e2p={_metric(val_metrics, 'ecg_to_ppg_token'):.6f} "
+                    f"val_p2e={_metric(val_metrics, 'ppg_to_ecg_token'):.6f} "
+                    f"val_mask={_metric(val_metrics, 'masked_fraction'):.3f}"
+                )
             if (
                 _metric(val_metrics, "context_collapsed_fraction") > 0.90
                 or _metric(val_metrics, "target_collapsed_fraction") > 0.90
@@ -564,9 +664,9 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
             _save_checkpoint(
                 {
                     "epoch": epoch,
+                    "pretrain_phase": phase,
                     "model_state_dict": model.state_dict(),
-                    "context_encoder": model.context_encoder.state_dict(),
-                    "target_encoder": model.target_encoder.state_dict(),
+                    **_encoder_checkpoint_payload(model),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "loss": epoch_loss,
                     "train_metrics": train_metrics,
@@ -587,9 +687,9 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
         _save_checkpoint(
             {
                 "epoch": epoch,
+                "pretrain_phase": phase,
                 "model_state_dict": model.state_dict(),
-                "context_encoder": model.context_encoder.state_dict(),
-                "target_encoder": model.target_encoder.state_dict(),
+                **_encoder_checkpoint_payload(model),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "loss": epoch_loss,
                 "train_metrics": train_metrics,
@@ -608,9 +708,9 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
             _save_checkpoint(
                 {
                     "epoch": epoch,
+                    "pretrain_phase": phase,
                     "model_state_dict": model.state_dict(),
-                    "context_encoder": model.context_encoder.state_dict(),
-                    "target_encoder": model.target_encoder.state_dict(),
+                    **_encoder_checkpoint_payload(model),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "train_metrics": train_metrics,
                     "val_metrics": val_metrics,
@@ -649,11 +749,14 @@ def train_token_align(config: Config, checkpoint_path: str):
     total_steps = steps_per_epoch * config.train.token_align_epochs
     print(f"Data: {len(dataloader.dataset)} samples, {steps_per_epoch} steps/epoch")
 
-    # Model
+    # This legacy continuation belongs to the Phase 0 baseline only.
+    config.model.pretrain_phase = 0
     model = build_model(config.model).to(device)
 
     # 加载完整 checkpoint
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if int(ckpt.get("pretrain_phase", 0)) != 0:
+        raise ValueError("--token_align only accepts a Phase 0 checkpoint")
     if "model_state_dict" in ckpt:
         _load_jepa_state_dict(model, ckpt["model_state_dict"])
         print(f"[Load] Full model state from {checkpoint_path}")
@@ -783,11 +886,52 @@ if __name__ == "__main__":
                         help="Resume from checkpoint path")
     parser.add_argument("--start_epoch", type=int, default=0,
                         help="Epoch to start/resume from")
+    parser.add_argument(
+        "--phase", type=int, choices=[0, 1], default=None,
+        help="Pre-training stage; default comes from config.py",
+    )
+    parser.add_argument(
+        "--output_dir", type=str, default=None,
+        help="Checkpoint/log directory (Phase 1 defaults to outputs_phase1)",
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=None,
+        help="Override per-GPU batch size for the selected phase",
+    )
+    parser.add_argument(
+        "--accum_steps", type=int, default=None,
+        help="Override gradient accumulation steps for the selected phase",
+    )
+    parser.add_argument(
+        "--lr", type=float, default=None,
+        help="Override peak learning rate for the selected phase",
+    )
     parser.add_argument("--token_align", type=str, default=None,
                         help="Token 对齐续训练: --token_align outputs/jepa_best.pt")
     args = parser.parse_args()
 
     config = Config()
+    if args.phase is not None:
+        config.model.pretrain_phase = args.phase
+    if args.output_dir is not None:
+        config.output_dir = args.output_dir
+    elif config.model.pretrain_phase == 1:
+        config.output_dir = config.output_dir.rstrip("/\\") + "_phase1"
+
+    if config.model.pretrain_phase == 1:
+        if args.batch_size is not None:
+            config.train.phase1_batch_size = args.batch_size
+        if args.accum_steps is not None:
+            config.train.phase1_accum_steps = args.accum_steps
+        if args.lr is not None:
+            config.train.phase1_lr = args.lr
+    else:
+        if args.batch_size is not None:
+            config.train.pretrain_batch_size = args.batch_size
+        if args.accum_steps is not None:
+            config.train.pretrain_accum_steps = args.accum_steps
+        if args.lr is not None:
+            config.train.pretrain_lr = args.lr
 
     if args.token_align is not None:
         # ★ Token 对齐续训练模式

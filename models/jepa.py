@@ -68,6 +68,39 @@ class ProjectionHead(nn.Module):
         return self.net(x)
 
 
+class TokenProjectionHead(nn.Module):
+    """LayerNorm projector that operates independently on every token."""
+
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim),
+            nn.LayerNorm(out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class TokenPredictor(nn.Module):
+    """Predict cross-modal teacher latents at masked token positions."""
+
+    def __init__(self, dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class Predictor(nn.Module):
     """
     Predictor network: takes context embedding + latent variable,
@@ -224,10 +257,19 @@ class JEPA(nn.Module):
         use_token_align: bool = False,
         token_align_weight: float = 0.5,
         token_align_window: int = 3,
+        pretrain_phase: int = 0,
+        phase1_mask_ratio: float = 0.6,
+        phase1_mask_block_tokens: int = 8,
+        phase1_bidirectional: bool = True,
+        phase1_token_loss_weight: float = 1.0,
         use_se: bool = False,
         use_inception: bool = False,
     ):
         super().__init__()
+
+        if pretrain_phase not in (0, 1):
+            raise ValueError(f"Unsupported pretrain_phase={pretrain_phase}; expected 0 or 1")
+        self.pretrain_phase = int(pretrain_phase)
 
         # Two encoders with identical architecture
         encoder_kwargs = dict(
@@ -247,47 +289,72 @@ class JEPA(nn.Module):
         )
 
         self.context_encoder = SignalEncoder(**encoder_kwargs)
-        self.target_encoder = SignalEncoder(**encoder_kwargs)
 
-        # Copy weights: target starts identical to context
-        self.target_encoder.load_state_dict(
-            copy.deepcopy(self.context_encoder.state_dict())
-        )
+        if self.pretrain_phase == 0:
+            self.target_encoder = copy.deepcopy(self.context_encoder)
+            for param in self.target_encoder.parameters():
+                param.requires_grad = False
 
-        # Stop gradients through target encoder
-        for param in self.target_encoder.parameters():
-            param.requires_grad = False
+            self.context_proj = nn.Sequential(
+                nn.Linear(transformer_dim, embedding_dim),
+                nn.BatchNorm1d(embedding_dim),
+            )
+            self.target_proj = copy.deepcopy(self.context_proj)
+            for param in self.target_proj.parameters():
+                param.requires_grad = False
 
-        # Project context embedding to match target embedding
-        self.context_proj = nn.Sequential(
-            nn.Linear(transformer_dim, embedding_dim),
-            nn.BatchNorm1d(embedding_dim),
-        )
-        self.target_proj = nn.Sequential(
-            nn.Linear(transformer_dim, embedding_dim),
-            nn.BatchNorm1d(embedding_dim),
-        )
-        # Copy projection weights too
-        self.target_proj.load_state_dict(
-            copy.deepcopy(self.context_proj.state_dict())
-        )
-        for param in self.target_proj.parameters():
-            param.requires_grad = False
+            self.predictor = Predictor(
+                input_dim=transformer_dim,
+                hidden_dim=predictor_hidden,
+                output_dim=embedding_dim,
+                latent_dim=latent_dim,
+            )
+        else:
+            # Both modalities have an online encoder with direct gradients.
+            self.ppg_encoder = copy.deepcopy(self.context_encoder)
 
-        # Predictor
-        self.predictor = Predictor(
-            input_dim=transformer_dim,
-            hidden_dim=predictor_hidden,
-            output_dim=embedding_dim,
-            latent_dim=latent_dim,
-        )
+            # Each EMA teacher follows the online encoder of the same modality.
+            self.context_teacher = copy.deepcopy(self.context_encoder)
+            self.target_encoder = copy.deepcopy(self.ppg_encoder)
+            for module in (self.context_teacher, self.target_encoder):
+                for param in module.parameters():
+                    param.requires_grad = False
+
+            self.ecg_token_proj = TokenProjectionHead(
+                transformer_dim, transformer_dim, embedding_dim
+            )
+            self.ppg_token_proj = TokenProjectionHead(
+                transformer_dim, transformer_dim, embedding_dim
+            )
+            self.ecg_teacher_proj = copy.deepcopy(self.ecg_token_proj)
+            self.target_proj = copy.deepcopy(self.ppg_token_proj)
+            for module in (self.ecg_teacher_proj, self.target_proj):
+                for param in module.parameters():
+                    param.requires_grad = False
+
+            self.ecg_to_ppg_predictor = TokenPredictor(
+                embedding_dim, predictor_hidden
+            )
+            self.ppg_to_ecg_predictor = TokenPredictor(
+                embedding_dim, predictor_hidden
+            )
+            self.ecg_mask_token = nn.Parameter(torch.zeros(1, 1, transformer_dim))
+            self.ppg_mask_token = nn.Parameter(torch.zeros(1, 1, transformer_dim))
+            nn.init.normal_(self.ecg_mask_token, std=0.02)
+            nn.init.normal_(self.ppg_mask_token, std=0.02)
 
     # ── New: Statistics Prediction Head ──
         self.use_stats_loss = use_stats_loss
         self.stats_loss_weight = stats_loss_weight
-        self.use_token_align = use_token_align
+        # Phase 1 B2 deliberately excludes delay/transport alignment; that is
+        # introduced only in Phase 2 so its contribution remains measurable.
+        self.use_token_align = bool(use_token_align and self.pretrain_phase == 0)
         self.token_align_weight = token_align_weight
         self.align_window = int(token_align_window)
+        self.phase1_mask_ratio = float(phase1_mask_ratio)
+        self.phase1_mask_block_tokens = int(phase1_mask_block_tokens)
+        self.phase1_bidirectional = bool(phase1_bidirectional)
+        self.phase1_token_loss_weight = float(phase1_token_loss_weight)
         if use_stats_loss:
             self.stats_pred_head = StatsPredHead(
                 in_dim=transformer_dim, hidden_dim=transformer_dim, num_stats=16
@@ -309,6 +376,9 @@ class JEPA(nn.Module):
         """Teacher targets must not depend on dropout or batch statistics."""
         self.target_encoder.eval()
         self.target_proj.eval()
+        if self.pretrain_phase == 1:
+            self.context_teacher.eval()
+            self.ecg_teacher_proj.eval()
 
     def train(self, mode: bool = True):
         """Set online modules to ``mode`` while always keeping teachers in eval."""
@@ -317,25 +387,42 @@ class JEPA(nn.Module):
         return self
 
     def update_target_encoder(self, momentum: float):
-        """EMA update target encoder towards context encoder."""
-        ema_update(self.context_encoder, self.target_encoder, momentum)
-        ema_update(self.context_proj, self.target_proj, momentum)
+        """Update Phase 0 target or Phase 1 same-modality EMA teachers."""
+        if self.pretrain_phase == 0:
+            ema_update(self.context_encoder, self.target_encoder, momentum)
+            ema_update(self.context_proj, self.target_proj, momentum)
+        else:
+            ema_update(self.context_encoder, self.context_teacher, momentum)
+            ema_update(self.ppg_encoder, self.target_encoder, momentum)
+            ema_update(self.ecg_token_proj, self.ecg_teacher_proj, momentum)
+            ema_update(self.ppg_token_proj, self.target_proj, momentum)
         self._enforce_teacher_eval()
 
     def teacher_student_parameter_cosine(self) -> float:
-        """Cosine similarity between online and EMA encoder parameters."""
-        dot = torch.zeros((), device=next(self.parameters()).device)
-        student_norm = torch.zeros_like(dot)
-        teacher_norm = torch.zeros_like(dot)
+        """Mean same-modality cosine between online and EMA encoders."""
+        pairs = [(self.context_encoder, self.target_encoder)]
+        if self.pretrain_phase == 1:
+            pairs = [
+                (self.context_encoder, self.context_teacher),
+                (self.ppg_encoder, self.target_encoder),
+            ]
+        cosines = []
         with torch.no_grad():
-            teacher_params = dict(self.target_encoder.named_parameters())
-            for name, student in self.context_encoder.named_parameters():
-                teacher = teacher_params[name]
-                dot += (student.float() * teacher.float()).sum()
-                student_norm += student.float().square().sum()
-                teacher_norm += teacher.float().square().sum()
-            cosine = dot / (student_norm.sqrt() * teacher_norm.sqrt()).clamp_min(1e-12)
-        return cosine.item()
+            for student_module, teacher_module in pairs:
+                device = next(student_module.parameters()).device
+                dot = torch.zeros((), device=device)
+                student_norm = torch.zeros_like(dot)
+                teacher_norm = torch.zeros_like(dot)
+                teacher_params = dict(teacher_module.named_parameters())
+                for name, student in student_module.named_parameters():
+                    teacher = teacher_params[name]
+                    dot += (student.float() * teacher.float()).sum()
+                    student_norm += student.float().square().sum()
+                    teacher_norm += teacher.float().square().sum()
+                cosines.append(
+                    dot / (student_norm.sqrt() * teacher_norm.sqrt()).clamp_min(1e-12)
+                )
+        return torch.stack(cosines).mean().item()
 
     def forward_context(self, x: torch.Tensor, return_tokens: bool = False):
         """Encode context signal (ECG).
@@ -377,8 +464,13 @@ class JEPA(nn.Module):
         # Context
         context_embed = self.forward_context(ecg)
 
-        # Predict target embedding with latent variable
-        pred, z = self.predictor(context_embed, z)
+        if self.pretrain_phase == 0:
+            # Predict target embedding with latent variable.
+            pred, z = self.predictor(context_embed, z)
+        else:
+            pred = self.ecg_to_ppg_predictor(
+                self.ecg_token_proj(context_embed)
+            )
 
         # Target (no grad)
         target_embed = self.forward_target(ppg)
@@ -575,6 +667,177 @@ class JEPA(nn.Module):
         ).bool()
         return signal * mask_expanded, token_mask
 
+    def _make_token_block_mask(
+        self, batch_size: int, num_tokens: int, device: torch.device
+    ) -> torch.Tensor:
+        """Create exact-ratio masks as unions of contiguous token blocks.
+
+        The small mask is assembled on CPU and copied once. Reading a CUDA
+        mask count inside the placement loop would otherwise synchronize the
+        training stream repeatedly and leave avoidable gaps in GPU usage.
+        """
+        if num_tokens < 2:
+            raise ValueError("Phase 1 token JEPA requires at least two tokens")
+        target = int(round(num_tokens * self.phase1_mask_ratio))
+        target = min(max(target, 1), num_tokens - 1)
+        block = min(max(self.phase1_mask_block_tokens, 1), target)
+        mask = torch.zeros(batch_size, num_tokens, dtype=torch.bool)
+
+        for batch_idx in range(batch_size):
+            masked_count = 0
+            attempts = 0
+            while masked_count < target and attempts < num_tokens * 8:
+                remaining = target - masked_count
+                length = min(block, remaining)
+                start = int(torch.randint(0, num_tokens - length + 1, (1,)))
+                region = mask[batch_idx, start:start + length]
+                newly_masked = int((~region).sum())
+                region.fill_(True)
+                masked_count += newly_masked
+                attempts += 1
+
+            missing = target - masked_count
+            if missing > 0:
+                available = (~mask[batch_idx]).nonzero(as_tuple=False).flatten()
+                order = torch.randperm(available.numel())[:missing]
+                mask[batch_idx, available[order]] = True
+        return mask.to(device=device, non_blocking=True)
+
+    @staticmethod
+    def _masked_token_regression(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        token_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        prediction = F.normalize(prediction.float(), dim=-1)
+        target = F.normalize(target.detach().float(), dim=-1)
+        # Cosine distance is the dimension-independent form of normalized
+        # squared error: 1 - cos(a, b) = ||a-b||^2 / 2. A per-dimension MSE
+        # would shrink gradients in proportion to the latent width.
+        per_token = 1.0 - (prediction * target).sum(dim=-1)
+        return per_token[token_mask].mean()
+
+    @staticmethod
+    def _add_embedding_diagnostics(
+        info: dict,
+        embeddings,
+        collect_diagnostics: bool,
+    ) -> None:
+        for prefix, embedding in embeddings:
+            detached = embedding.detach().float()
+            variances = detached.var(dim=0, unbiased=False)
+            info[f"{prefix}_std"] = variances.sqrt().mean().item()
+            info[f"{prefix}_collapsed_fraction"] = (
+                variances < 1e-4
+            ).float().mean().item()
+            if collect_diagnostics and detached.size(0) > 1:
+                centered = detached - detached.mean(dim=0, keepdim=True)
+                covariance = centered.T @ centered / (detached.size(0) - 1)
+                off_diagonal = covariance - torch.diag_embed(
+                    torch.diagonal(covariance)
+                )
+                info[f"{prefix}_cov_offdiag_rms"] = (
+                    off_diagonal.square().mean().sqrt().item()
+                )
+
+    def _compute_phase1_loss(
+        self,
+        ecg: torch.Tensor,
+        ppg: torch.Tensor,
+        ecg_stats: Optional[torch.Tensor],
+        collect_diagnostics: bool,
+    ) -> Tuple[torch.Tensor, dict]:
+        """Bidirectional masked-token JEPA with same-modality EMA teachers."""
+        ecg_input_tokens = self.context_encoder.tokenize(ecg)
+        ppg_input_tokens = self.ppg_encoder.tokenize(ppg)
+        num_tokens = min(ecg_input_tokens.size(1), ppg_input_tokens.size(1))
+        ecg_input_tokens = ecg_input_tokens[:, :num_tokens]
+        ppg_input_tokens = ppg_input_tokens[:, :num_tokens]
+        token_mask = self._make_token_block_mask(
+            ecg.size(0), num_tokens, ecg.device
+        )
+
+        ecg_pooled, ecg_tokens = self.context_encoder.encode_tokens(
+            ecg_input_tokens,
+            return_all=True,
+            token_mask=token_mask,
+            mask_token=self.ecg_mask_token,
+        )
+        ppg_pooled, ppg_tokens = self.ppg_encoder.encode_tokens(
+            ppg_input_tokens,
+            return_all=True,
+            token_mask=token_mask,
+            mask_token=self.ppg_mask_token,
+        )
+
+        with torch.no_grad():
+            ecg_teacher_pooled, ecg_teacher_tokens = self.context_teacher(
+                ecg, return_all=True
+            )
+            ppg_teacher_pooled, ppg_teacher_tokens = self.target_encoder(
+                ppg, return_all=True
+            )
+            ecg_teacher_tokens = self.ecg_teacher_proj(
+                ecg_teacher_tokens[:, :num_tokens]
+            )
+            ppg_teacher_tokens = self.target_proj(
+                ppg_teacher_tokens[:, :num_tokens]
+            )
+
+        ecg_online_tokens = self.ecg_token_proj(ecg_tokens)
+        ppg_online_tokens = self.ppg_token_proj(ppg_tokens)
+        ppg_prediction = self.ecg_to_ppg_predictor(ecg_online_tokens)
+        ecg_to_ppg = self._masked_token_regression(
+            ppg_prediction, ppg_teacher_tokens, token_mask
+        )
+
+        if self.phase1_bidirectional:
+            ecg_prediction = self.ppg_to_ecg_predictor(ppg_online_tokens)
+            ppg_to_ecg = self._masked_token_regression(
+                ecg_prediction, ecg_teacher_tokens, token_mask
+            )
+            token_jepa = 0.5 * (ecg_to_ppg + ppg_to_ecg)
+            prediction_std = 0.5 * (
+                ppg_prediction[token_mask].detach().float().std(unbiased=False)
+                + ecg_prediction[token_mask].detach().float().std(unbiased=False)
+            )
+        else:
+            ppg_to_ecg = torch.zeros_like(ecg_to_ppg)
+            token_jepa = ecg_to_ppg
+            prediction_std = ppg_prediction[token_mask].detach().float().std(
+                unbiased=False
+            )
+
+        total_loss = self.phase1_token_loss_weight * token_jepa
+        info = {
+            "jepa": token_jepa.item(),
+            "ecg_to_ppg_token": ecg_to_ppg.item(),
+            "ppg_to_ecg_token": ppg_to_ecg.item(),
+            "masked_fraction": token_mask.float().mean().item(),
+            "prediction_std": prediction_std.item(),
+            "token_align": 0.0,
+        }
+        self._add_embedding_diagnostics(
+            info,
+            (
+                ("context", ecg_pooled),
+                ("target", ppg_pooled),
+                ("ecg_teacher", ecg_teacher_pooled),
+                ("ppg_teacher", ppg_teacher_pooled),
+            ),
+            collect_diagnostics,
+        )
+
+        if self.use_stats_loss and ecg_stats is not None:
+            stats_loss, stats_info = self._compute_stats_loss(
+                ecg_pooled, ecg_stats
+            )
+            total_loss = total_loss + self.stats_loss_weight * stats_loss
+            info.update(stats_info)
+
+        info["total_loss"] = total_loss.item()
+        return total_loss, info
+
     def compute_loss(
         self,
         ecg: torch.Tensor,
@@ -595,6 +858,11 @@ class JEPA(nn.Module):
             loss: scalar tensor
             info: dict with all sub-losses
         """
+        if self.pretrain_phase == 1:
+            return self._compute_phase1_loss(
+                ecg, ppg, ecg_stats, collect_diagnostics
+            )
+
         B = ecg.size(0)
 
         # ★ JETS 式掩码：随机丢弃 ~70% patch，强制编码器从局部学习全局表征
