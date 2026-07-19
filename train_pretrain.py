@@ -335,6 +335,14 @@ def _representation_is_healthy(metrics) -> bool:
     )
 
 
+def _checkpoint_is_eligible(
+    metrics, phase: int, transport_progress: float = 1.0
+) -> bool:
+    """Compare Phase 2 checkpoints only after the final objective is active."""
+    objective_ready = phase != 2 or transport_progress >= 1.0 - 1e-8
+    return objective_ready and _representation_is_healthy(metrics)
+
+
 def _save_checkpoint(payload, path):
     """Atomically replace a checkpoint so interruptions cannot corrupt it."""
     tmp_path = path + ".tmp"
@@ -779,12 +787,23 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
         current_val_loss = (
             _metric(val_metrics, "total_loss") if val_metrics is not None else None
         )
-        checkpoint_eligible = _representation_is_healthy(val_metrics)
+        transport_progress = (
+            float(model.phase2_progress) if phase == 2 else 1.0
+        )
+        checkpoint_eligible = _checkpoint_is_eligible(
+            val_metrics, phase, transport_progress
+        )
         if val_metrics is not None and not checkpoint_eligible:
-            print(
-                "[CheckpointSkip] Validation representation is collapsed; "
-                "not eligible for jepa_best.pt"
-            )
+            if phase == 2 and transport_progress < 1.0 - 1e-8:
+                print(
+                    "[CheckpointSkip] Phase 2 transport is still ramping; "
+                    "best-model comparison starts at full transport"
+                )
+            else:
+                print(
+                    "[CheckpointSkip] Validation representation is collapsed; "
+                    "not eligible for jepa_best.pt"
+                )
         if (
             current_val_loss is not None
             and checkpoint_eligible

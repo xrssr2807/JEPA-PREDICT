@@ -5,7 +5,11 @@ import torch
 
 from models.jepa import JEPA
 from train_downstream import _select_pretrained_encoder_state
-from train_pretrain import _encoder_checkpoint_payload, phase2_transport_progress
+from train_pretrain import (
+    _checkpoint_is_eligible,
+    _encoder_checkpoint_payload,
+    phase2_transport_progress,
+)
 
 
 class Phase2JEPATests(unittest.TestCase):
@@ -43,6 +47,17 @@ class Phase2JEPATests(unittest.TestCase):
         self.assertAlmostEqual(phase2_transport_progress(2, 2, 4), 0.25)
         self.assertAlmostEqual(phase2_transport_progress(5, 2, 4), 1.0)
         self.assertAlmostEqual(phase2_transport_progress(20, 2, 4), 1.0)
+
+    def test_best_checkpoint_waits_for_full_transport(self):
+        healthy = {
+            "context_std": 0.2,
+            "target_std": 0.2,
+            "context_collapsed_fraction": 0.0,
+            "target_collapsed_fraction": 0.0,
+        }
+        self.assertFalse(_checkpoint_is_eligible(healthy, 2, 0.95))
+        self.assertTrue(_checkpoint_is_eligible(healthy, 2, 1.0))
+        self.assertTrue(_checkpoint_is_eligible(healthy, 1, 0.0))
 
     def test_delay_bins_retain_physical_time_scale(self):
         model = self._tiny_model()
