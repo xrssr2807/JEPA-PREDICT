@@ -858,6 +858,14 @@ class JEPA(nn.Module):
         delay_probabilities = probabilities[..., :num_bins] * valid_delay
         unmatched_probability = probabilities[..., -1]
         match_mass = delay_probabilities.sum(dim=-1)
+        valid_rows = valid_delay.any(dim=-1).expand(batch_size, -1)
+
+        # Condition on a token being matched using a separate softmax. Dividing
+        # by match_mass is algebraically equivalent, but creates 1/mass
+        # gradients when the dustbin probability is close to one. Those
+        # gradients can overflow under AMP even while the forward loss is
+        # finite.
+        conditional_delay = F.softmax(delay_logits, dim=-1) * valid_delay
 
         target_indices = target.clamp(max=max(num_tokens - 1, 0)).expand(
             batch_size, -1, -1
@@ -866,20 +874,46 @@ class JEPA(nn.Module):
             batch_size, num_tokens, num_tokens
         )
         transport.scatter_add_(2, target_indices, delay_probabilities)
+        forward_transport = conditional_delay.new_zeros(
+            batch_size, num_tokens, num_tokens
+        )
+        forward_transport.scatter_add_(2, target_indices, conditional_delay)
+
+        # Normalize the reverse direction with a column-wise masked softmax,
+        # avoiding another division by a potentially tiny column mass.
+        dummy_target = torch.full_like(target, num_tokens)
+        dense_indices = torch.where(valid_delay, target, dummy_target).expand(
+            batch_size, -1, -1
+        )
+        reverse_logits = delay_logits.new_full(
+            (batch_size, num_tokens, num_tokens + 1), -1e4
+        ).scatter(2, dense_indices, delay_logits)
+        reverse_logits = reverse_logits[..., :num_tokens]
+        reverse_valid = torch.zeros(
+            (1, num_tokens, num_tokens + 1),
+            dtype=torch.bool,
+            device=ecg_tokens.device,
+        ).scatter(2, torch.where(valid_delay, target, dummy_target), valid_delay)
+        reverse_valid = reverse_valid[..., :num_tokens].expand(batch_size, -1, -1)
+        reverse_transport = F.softmax(reverse_logits, dim=1) * reverse_valid
+        valid_columns = reverse_valid.any(dim=1)
 
         offsets_float = offsets.to(dtype=delay_probabilities.dtype)
         expected_delay = (
-            delay_probabilities * offsets_float.view(1, 1, -1)
-        ).sum(dim=-1) / match_mass.clamp_min(1e-8)
-        valid_rows = valid_delay.any(dim=-1).expand(batch_size, -1)
+            conditional_delay * offsets_float.view(1, 1, -1)
+        ).sum(dim=-1)
         return {
             "transport": transport,
+            "forward_transport": forward_transport,
+            "reverse_transport": reverse_transport,
             "delay_probabilities": delay_probabilities,
+            "conditional_delay_probabilities": conditional_delay,
             "unmatched_probability": unmatched_probability,
             "match_mass": match_mass,
             "expected_delay": expected_delay,
             "valid_delay": valid_delay.expand(batch_size, -1, -1),
             "valid_rows": valid_rows,
+            "valid_columns": valid_columns,
         }
 
     def _phase2_transport_regularizers(self, state: dict) -> dict:
@@ -891,7 +925,7 @@ class JEPA(nn.Module):
         valid_rows = state["valid_rows"]
         offsets = self.phase2_delay_offsets.to(probabilities.dtype)
 
-        conditional = probabilities / match_mass.unsqueeze(-1).clamp_min(1e-8)
+        conditional = state["conditional_delay_probabilities"]
         prior_scale = max(float(offsets.numel()) / 3.0, 1.0)
         prior = torch.exp(
             -0.5 * ((offsets - self.phase2_delay_prior_tokens) / prior_scale).square()
@@ -951,6 +985,7 @@ class JEPA(nn.Module):
             "delay_std_ms": valid_expected.std(unbiased=False) * self.phase2_token_ms,
             "transport_entropy": conditional_entropy[valid_rows].mean(),
             "matched_mass": match_mass[valid_rows].mean(),
+            "minimum_matched_mass": match_mass[valid_rows].min(),
             "unmatched_mass": state["unmatched_probability"].mean(),
         }
 
@@ -1133,21 +1168,26 @@ class JEPA(nn.Module):
         direct_jepa = 0.5 * (direct_ecg_to_ppg + direct_ppg_to_ecg)
 
         transport_state = self._build_phase2_transport(ecg_online_tokens)
-        transport = transport_state["transport"]
-        row_mass = transport_state["match_mass"]
-        column_mass = transport.sum(dim=1)
+        forward_transport = transport_state["forward_transport"]
+        reverse_transport = transport_state["reverse_transport"]
         transported_ppg = torch.bmm(
-            transport, ppg_teacher_tokens.float()
-        ) / row_mass.unsqueeze(-1).clamp_min(1e-8)
+            forward_transport, ppg_teacher_tokens.float()
+        )
         transported_ecg = torch.bmm(
-            transport.transpose(1, 2), ecg_teacher_tokens.float()
-        ) / column_mass.unsqueeze(-1).clamp_min(1e-8)
+            reverse_transport.transpose(1, 2), ecg_teacher_tokens.float()
+        )
 
         transport_ecg_to_ppg = self._weighted_transport_regression(
-            ppg_prediction, transported_ppg, token_mask, row_mass
+            ppg_prediction,
+            transported_ppg,
+            token_mask,
+            transport_state["valid_rows"],
         )
         transport_ppg_to_ecg = self._weighted_transport_regression(
-            ecg_prediction, transported_ecg, token_mask, column_mass
+            ecg_prediction,
+            transported_ecg,
+            token_mask,
+            transport_state["valid_columns"],
         )
         transport_jepa = 0.5 * (
             transport_ecg_to_ppg + transport_ppg_to_ecg
@@ -1189,6 +1229,9 @@ class JEPA(nn.Module):
             "delay_std_ms": regularizers["delay_std_ms"].item(),
             "transport_entropy": regularizers["transport_entropy"].item(),
             "matched_mass": regularizers["matched_mass"].item(),
+            "minimum_matched_mass": regularizers[
+                "minimum_matched_mass"
+            ].item(),
             "unmatched_mass": regularizers["unmatched_mass"].item(),
             "token_align": 0.0,
         }

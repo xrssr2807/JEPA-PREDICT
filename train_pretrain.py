@@ -649,6 +649,21 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                     trainable_params, max_norm=1.0, error_if_nonfinite=False
                 )
                 if not torch.isfinite(grad_norm):
+                    if use_amp:
+                        scale_before = scaler.get_scale()
+                        # GradScaler recorded the overflow in unscale_ and
+                        # therefore skips this optimizer step. Updating it is
+                        # essential: the next batch retries with a lower scale.
+                        scaler.step(optimizer)
+                        scaler.update()
+                        scale_after = scaler.get_scale()
+                        optimizer.zero_grad(set_to_none=True)
+                        print(
+                            f"[AMPOverflow] epoch={epoch} batch={batch_idx}; "
+                            f"optimizer step skipped, scale "
+                            f"{scale_before:.0f}->{scale_after:.0f}"
+                        )
+                        continue
                     optimizer.zero_grad(set_to_none=True)
                     raise FloatingPointError(
                         f"Non-finite gradient norm at epoch={epoch}, "
@@ -674,6 +689,7 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                         f" Tr: {_metric(info, 'phase2_progress'):.2f} |"
                         f" Delay: {_metric(info, 'delay_mean_ms'):.0f}ms |"
                         f" Mass: {_metric(info, 'matched_mass'):.3f} |"
+                        f" MinMass: {_metric(info, 'minimum_matched_mass'):.2e} |"
                     )
                 log_msg = (
                     f"Epoch {epoch:3d} | Batch {batch_idx:4d}/{steps_per_epoch} | "
@@ -730,7 +746,8 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                 f"delay={_metric(train_metrics, 'delay_mean_ms'):.1f}ms "
                 f"delay_std={_metric(train_metrics, 'delay_std_ms'):.1f}ms "
                 f"mono={_metric(train_metrics, 'monotonic'):.6f} "
-                f"mass={_metric(train_metrics, 'matched_mass'):.3f}"
+                f"mass={_metric(train_metrics, 'matched_mass'):.3f} "
+                f"min_mass={_metric(train_metrics, 'minimum_matched_mass'):.2e}"
             )
         if val_metrics is not None:
             summary += (
@@ -757,7 +774,8 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                     f" val_transport={_metric(val_metrics, 'transport_token_jepa'):.6f} "
                     f"val_delay={_metric(val_metrics, 'delay_mean_ms'):.1f}ms "
                     f"val_mono={_metric(val_metrics, 'monotonic'):.6f} "
-                    f"val_mass={_metric(val_metrics, 'matched_mass'):.3f}"
+                    f"val_mass={_metric(val_metrics, 'matched_mass'):.3f} "
+                    f"val_min_mass={_metric(val_metrics, 'minimum_matched_mass'):.2e}"
                 )
             if (
                 _metric(val_metrics, "context_collapsed_fraction") > 0.90

@@ -76,6 +76,21 @@ class Phase2JEPATests(unittest.TestCase):
         self.assertEqual(torch.tril(transport).abs().max().item(), 0.0)
         self.assertGreater(state["unmatched_probability"][:, -1].min().item(), 0.99)
 
+        forward = state["forward_transport"]
+        reverse = state["reverse_transport"]
+        self.assertEqual(torch.tril(forward).abs().max().item(), 0.0)
+        self.assertEqual(torch.tril(reverse).abs().max().item(), 0.0)
+        self.assertTrue(torch.allclose(
+            forward.sum(dim=-1)[state["valid_rows"]],
+            torch.ones_like(forward.sum(dim=-1)[state["valid_rows"]]),
+            atol=1e-6,
+        ))
+        self.assertTrue(torch.allclose(
+            reverse.sum(dim=1)[state["valid_columns"]],
+            torch.ones_like(reverse.sum(dim=1)[state["valid_columns"]]),
+            atol=1e-6,
+        ))
+
     def test_regularizers_stay_finite_with_one_matchable_row(self):
         model = self._tiny_model()
         state = model._build_phase2_transport(torch.randn(2, 2, 8))
@@ -124,6 +139,30 @@ class Phase2JEPATests(unittest.TestCase):
         ):
             self.assertIn(key, info)
             self.assertTrue(torch.isfinite(torch.tensor(info[key])))
+
+    def test_low_match_mass_has_finite_amp_scaled_gradients(self):
+        """A confident dustbin prediction must not create 1/mass gradients."""
+        torch.manual_seed(3)
+        model = self._tiny_model()
+        model.train()
+        model.set_phase2_progress(0.25)
+        with torch.no_grad():
+            model.phase2_delay_head.output.weight.zero_()
+            model.phase2_delay_head.output.bias.zero_()
+            model.phase2_delay_head.output.bias[-1] = 5.0
+
+        ecg = torch.randn(3, 1, 64)
+        ppg = torch.randn(3, 1, 64)
+        with torch.autocast("cpu", dtype=torch.float16):
+            loss, info = model.compute_loss(ecg, ppg)
+        self.assertLess(info["matched_mass"], 1e-3)
+        (loss * 4096.0).backward()
+
+        self.assertTrue(all(
+            torch.isfinite(parameter.grad).all()
+            for parameter in model.parameters()
+            if parameter.grad is not None
+        ))
 
     def test_phase2_checkpoint_remains_downstream_compatible(self):
         model = self._tiny_model()
