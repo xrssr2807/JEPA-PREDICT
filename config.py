@@ -76,6 +76,22 @@ class ModelConfig:
     phase1_token_loss_weight: float = 1.0
     phase1_use_stats_loss: bool = False
 
+    # Phase 2: causal, positive-delay monotonic token transport (B3).
+    phase2_sample_rate_hz: float = 100.0
+    phase2_min_delay_ms: float = 80.0
+    phase2_max_delay_ms: float = 800.0
+    phase2_delay_prior_ms: float = 250.0
+    phase2_delay_head_hidden: int = 128
+    phase2_transport_temperature: float = 0.20
+    phase2_unmatched_bias: float = -2.0
+    phase2_transport_loss_weight: float = 1.0
+    phase2_delay_prior_weight: float = 0.02
+    phase2_monotonic_weight: float = 0.05
+    phase2_delay_smoothness_weight: float = 0.01
+    phase2_match_mass_weight: float = 0.01
+    phase2_target_match_mass: float = 0.95
+    phase2_use_stats_loss: bool = False
+
     # Input
     in_channels: int = 1  # single-channel (ECG or PPG separately)
     signal_length: int = 3000  # pre-training: 30s @ 100Hz
@@ -176,6 +192,15 @@ class TrainConfig:
     phase1_lr: float = 3e-4
     phase1_warmup_epochs: int = 10
     phase1_use_amp: bool = True
+    # Phase 2 uses the Phase 1 backbone from random initialization and ramps
+    # transport in only after token representations become meaningful.
+    phase2_batch_size: int = 128
+    phase2_accum_steps: int = 3
+    phase2_lr: float = 2e-4
+    phase2_warmup_epochs: int = 10
+    phase2_use_amp: bool = True
+    phase2_transport_start_epoch: int = 10
+    phase2_transport_ramp_epochs: int = 20
     pretrain_dataloader_workers: int = 8
     pretrain_prefetch_factor: int = 4
 

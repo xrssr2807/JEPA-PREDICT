@@ -207,7 +207,11 @@ def build_model(model_config: ModelConfig) -> JEPA:
         use_stats_loss=(
             model_config.use_stats_loss
             if model_config.pretrain_phase == 0
-            else model_config.phase1_use_stats_loss
+            else (
+                model_config.phase2_use_stats_loss
+                if model_config.pretrain_phase == 2
+                else model_config.phase1_use_stats_loss
+            )
         ),
         stats_loss_weight=model_config.stats_loss_weight,
         use_se=model_config.cnn_use_se,
@@ -220,6 +224,21 @@ def build_model(model_config: ModelConfig) -> JEPA:
         phase1_mask_block_tokens=model_config.phase1_mask_block_tokens,
         phase1_bidirectional=model_config.phase1_bidirectional,
         phase1_token_loss_weight=model_config.phase1_token_loss_weight,
+        phase2_sample_rate_hz=model_config.phase2_sample_rate_hz,
+        phase2_min_delay_ms=model_config.phase2_min_delay_ms,
+        phase2_max_delay_ms=model_config.phase2_max_delay_ms,
+        phase2_delay_prior_ms=model_config.phase2_delay_prior_ms,
+        phase2_delay_head_hidden=model_config.phase2_delay_head_hidden,
+        phase2_transport_temperature=model_config.phase2_transport_temperature,
+        phase2_unmatched_bias=model_config.phase2_unmatched_bias,
+        phase2_transport_loss_weight=model_config.phase2_transport_loss_weight,
+        phase2_delay_prior_weight=model_config.phase2_delay_prior_weight,
+        phase2_monotonic_weight=model_config.phase2_monotonic_weight,
+        phase2_delay_smoothness_weight=(
+            model_config.phase2_delay_smoothness_weight
+        ),
+        phase2_match_mass_weight=model_config.phase2_match_mass_weight,
+        phase2_target_match_mass=model_config.phase2_target_match_mass,
     )
 
 
@@ -286,6 +305,15 @@ def _metric(metrics, key: str) -> float:
     return float(metrics.get(key, 0.0))
 
 
+def phase2_transport_progress(
+    epoch: int, start_epoch: int, ramp_epochs: int
+) -> float:
+    """Keep transport off initially, then linearly ramp it to full weight."""
+    if epoch < start_epoch:
+        return 0.0
+    return min((epoch - start_epoch + 1) / max(1, ramp_epochs), 1.0)
+
+
 def _representation_is_healthy(metrics) -> bool:
     """Reject deceptively low validation losses caused by latent collapse."""
     if not metrics:
@@ -315,17 +343,40 @@ def _save_checkpoint(payload, path):
 
 
 def _encoder_checkpoint_payload(model) -> dict:
-    """Expose stable downstream keys plus Phase 1 online/teacher weights."""
+    """Expose stable downstream keys plus dual-online/teacher weights."""
     payload = {
         "context_encoder": model.context_encoder.state_dict(),
         "target_encoder": model.target_encoder.state_dict(),
     }
-    if model.pretrain_phase == 1:
+    if model.pretrain_phase >= 1:
         payload.update({
             "ppg_encoder": model.ppg_encoder.state_dict(),
             "context_teacher": model.context_teacher.state_dict(),
         })
     return payload
+
+
+def _phase_checkpoint_metadata(model, config: Config) -> dict:
+    """Persist the Phase 2 schedule and physical delay interpretation."""
+    if model.pretrain_phase != 2:
+        return {}
+    return {
+        "phase2_transport_progress": float(model.phase2_progress),
+        "phase2_config": {
+            "sample_rate_hz": float(config.model.phase2_sample_rate_hz),
+            "token_ms": float(model.phase2_token_ms),
+            "delay_offsets_tokens": model.phase2_delay_offsets.detach().cpu().tolist(),
+            "min_delay_ms": float(config.model.phase2_min_delay_ms),
+            "max_delay_ms": float(config.model.phase2_max_delay_ms),
+            "delay_prior_ms": float(config.model.phase2_delay_prior_ms),
+            "transport_start_epoch": int(
+                config.train.phase2_transport_start_epoch
+            ),
+            "transport_ramp_epochs": int(
+                config.train.phase2_transport_ramp_epochs
+            ),
+        },
+    }
 
 
 def _load_jepa_state_dict(model, state_dict):
@@ -356,7 +407,13 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
     )
 
     phase = int(config.model.pretrain_phase)
-    if phase == 1:
+    if phase == 2:
+        batch_size = int(config.train.phase2_batch_size)
+        accum_steps = max(1, int(config.train.phase2_accum_steps))
+        pretrain_lr = float(config.train.phase2_lr)
+        warmup_epochs = int(config.train.phase2_warmup_epochs)
+        use_amp = bool(config.train.phase2_use_amp and device.type == "cuda")
+    elif phase == 1:
         batch_size = int(config.train.phase1_batch_size)
         accum_steps = max(1, int(config.train.phase1_accum_steps))
         pretrain_lr = float(config.train.phase1_lr)
@@ -376,7 +433,11 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
     use_stats_targets = (
         config.model.use_stats_loss
         if phase == 0
-        else config.model.phase1_use_stats_loss
+        else (
+            config.model.phase2_use_stats_loss
+            if phase == 2
+            else config.model.phase1_use_stats_loss
+        )
     )
 
     # Data
@@ -394,6 +455,14 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
 
     model = build_model(config.model).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    if phase == 2:
+        delay_offsets = model.phase2_delay_offsets.detach().cpu().tolist()
+        delay_ms = [round(offset * model.phase2_token_ms) for offset in delay_offsets]
+        print(
+            f"[Phase2] causal delay bins={delay_offsets} tokens ({delay_ms} ms) | "
+            f"transport_start={config.train.phase2_transport_start_epoch} | "
+            f"ramp={config.train.phase2_transport_ramp_epochs} epochs"
+        )
 
     # Optimizer
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -417,19 +486,19 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
         if checkpoint_phase != phase:
             raise ValueError(
                 f"Cannot resume Phase {phase} from a Phase {checkpoint_phase} "
-                "checkpoint. Start Phase 1 from scratch or use a matching checkpoint."
+                "checkpoint. Start from scratch or use a matching-phase checkpoint."
             )
         # Load encoder weights
         if "context_encoder" in ckpt:
             model.context_encoder.load_state_dict(ckpt["context_encoder"])
             print("[Resume] Loaded context_encoder weights")
-        if phase == 1 and "ppg_encoder" in ckpt:
+        if phase >= 1 and "ppg_encoder" in ckpt:
             model.ppg_encoder.load_state_dict(ckpt["ppg_encoder"])
             print("[Resume] Loaded ppg_encoder weights")
         if "target_encoder" in ckpt:
             model.target_encoder.load_state_dict(ckpt["target_encoder"])
             print("[Resume] Loaded target_encoder weights")
-        if phase == 1 and "context_teacher" in ckpt:
+        if phase >= 1 and "context_teacher" in ckpt:
             model.context_teacher.load_state_dict(ckpt["context_teacher"])
             print("[Resume] Loaded context_teacher weights")
         if "model_state_dict" in ckpt:
@@ -506,6 +575,13 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
     optimizer_step = start_epoch * optimizer_steps_per_epoch
 
     for epoch in range(start_epoch, config.train.pretrain_epochs):
+        if phase == 2:
+            transport_progress = phase2_transport_progress(
+                epoch,
+                config.train.phase2_transport_start_epoch,
+                config.train.phase2_transport_ramp_epochs,
+            )
+            model.set_phase2_progress(transport_progress)
         model.train()
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
@@ -579,11 +655,17 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
 
             if batch_idx % 50 == 0:
                 phase_detail = ""
-                if phase == 1:
+                if phase >= 1:
                     phase_detail = (
                         f" E2P: {_metric(info, 'ecg_to_ppg_token'):.5f} |"
                         f" P2E: {_metric(info, 'ppg_to_ecg_token'):.5f} |"
                         f" Mask: {_metric(info, 'masked_fraction'):.3f} |"
+                    )
+                if phase == 2:
+                    phase_detail += (
+                        f" Tr: {_metric(info, 'phase2_progress'):.2f} |"
+                        f" Delay: {_metric(info, 'delay_mean_ms'):.0f}ms |"
+                        f" Mass: {_metric(info, 'matched_mass'):.3f} |"
                     )
                 log_msg = (
                     f"Epoch {epoch:3d} | Batch {batch_idx:4d}/{steps_per_epoch} | "
@@ -626,11 +708,21 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
             f"ctx_std={_metric(train_metrics, 'context_std'):.4f} "
             f"tgt_std={_metric(train_metrics, 'target_std'):.4f}"
         )
-        if phase == 1:
+        if phase >= 1:
             summary += (
                 f" e2p={_metric(train_metrics, 'ecg_to_ppg_token'):.6f} "
                 f"p2e={_metric(train_metrics, 'ppg_to_ecg_token'):.6f} "
                 f"mask={_metric(train_metrics, 'masked_fraction'):.3f}"
+            )
+        if phase == 2:
+            summary += (
+                f" direct={_metric(train_metrics, 'direct_token_jepa'):.6f} "
+                f"transport={_metric(train_metrics, 'transport_token_jepa'):.6f} "
+                f"tr_progress={_metric(train_metrics, 'phase2_progress'):.3f} "
+                f"delay={_metric(train_metrics, 'delay_mean_ms'):.1f}ms "
+                f"delay_std={_metric(train_metrics, 'delay_std_ms'):.1f}ms "
+                f"mono={_metric(train_metrics, 'monotonic'):.6f} "
+                f"mass={_metric(train_metrics, 'matched_mass'):.3f}"
             )
         if val_metrics is not None:
             summary += (
@@ -646,11 +738,18 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                 f"tgt_cov={_metric(val_metrics, 'target_cov_offdiag_rms'):.4f} "
                 f"teacher_cos={_metric(val_metrics, 'teacher_student_cosine'):.6f}"
             )
-            if phase == 1:
+            if phase >= 1:
                 summary += (
                     f" val_e2p={_metric(val_metrics, 'ecg_to_ppg_token'):.6f} "
                     f"val_p2e={_metric(val_metrics, 'ppg_to_ecg_token'):.6f} "
                     f"val_mask={_metric(val_metrics, 'masked_fraction'):.3f}"
+                )
+            if phase == 2:
+                summary += (
+                    f" val_transport={_metric(val_metrics, 'transport_token_jepa'):.6f} "
+                    f"val_delay={_metric(val_metrics, 'delay_mean_ms'):.1f}ms "
+                    f"val_mono={_metric(val_metrics, 'monotonic'):.6f} "
+                    f"val_mass={_metric(val_metrics, 'matched_mass'):.3f}"
                 )
             if (
                 _metric(val_metrics, "context_collapsed_fraction") > 0.90
@@ -699,6 +798,7 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                     "pretrain_phase": phase,
                     "model_state_dict": model.state_dict(),
                     **_encoder_checkpoint_payload(model),
+                    **_phase_checkpoint_metadata(model, config),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "loss": epoch_loss,
                     "train_metrics": train_metrics,
@@ -722,6 +822,7 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                 "pretrain_phase": phase,
                 "model_state_dict": model.state_dict(),
                 **_encoder_checkpoint_payload(model),
+                **_phase_checkpoint_metadata(model, config),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "loss": epoch_loss,
                 "train_metrics": train_metrics,
@@ -743,6 +844,7 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                     "pretrain_phase": phase,
                     "model_state_dict": model.state_dict(),
                     **_encoder_checkpoint_payload(model),
+                    **_phase_checkpoint_metadata(model, config),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "train_metrics": train_metrics,
                     "val_metrics": val_metrics,
@@ -919,12 +1021,16 @@ if __name__ == "__main__":
     parser.add_argument("--start_epoch", type=int, default=0,
                         help="Epoch to start/resume from")
     parser.add_argument(
-        "--phase", type=int, choices=[0, 1], default=None,
+        "--phase", type=int, choices=[0, 1, 2], default=None,
         help="Pre-training stage; default comes from config.py",
     )
     parser.add_argument(
         "--output_dir", type=str, default=None,
-        help="Checkpoint/log directory (Phase 1 defaults to outputs_phase1)",
+        help="Checkpoint/log directory (Phase 1/2 get phase-specific defaults)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Override the experiment seed",
     )
     parser.add_argument(
         "--batch_size", type=int, default=None,
@@ -950,6 +1056,14 @@ if __name__ == "__main__":
         "--performance_mode", action="store_true",
         help="Use benchmarked CUDA kernels instead of deterministic kernels",
     )
+    parser.add_argument(
+        "--transport_start_epoch", type=int, default=None,
+        help="Phase 2 epoch where transport blending starts",
+    )
+    parser.add_argument(
+        "--transport_ramp_epochs", type=int, default=None,
+        help="Phase 2 epochs used to ramp transport from 0 to 1",
+    )
     parser.add_argument("--token_align", type=str, default=None,
                         help="Token 对齐续训练: --token_align outputs/jepa_best.pt")
     args = parser.parse_args()
@@ -957,10 +1071,14 @@ if __name__ == "__main__":
     config = Config()
     if args.phase is not None:
         config.model.pretrain_phase = args.phase
+    if args.seed is not None:
+        config.seed = args.seed
     if args.output_dir is not None:
         config.output_dir = args.output_dir
     elif config.model.pretrain_phase == 1:
         config.output_dir = config.output_dir.rstrip("/\\") + "_phase1"
+    elif config.model.pretrain_phase == 2:
+        config.output_dir = config.output_dir.rstrip("/\\") + "_phase2"
 
     if args.performance_mode:
         config.deterministic = False
@@ -969,7 +1087,22 @@ if __name__ == "__main__":
     if args.prefetch_factor is not None:
         config.train.pretrain_prefetch_factor = args.prefetch_factor
 
-    if config.model.pretrain_phase == 1:
+    if config.model.pretrain_phase == 2:
+        if args.batch_size is not None:
+            config.train.phase2_batch_size = args.batch_size
+        if args.accum_steps is not None:
+            config.train.phase2_accum_steps = args.accum_steps
+        if args.lr is not None:
+            config.train.phase2_lr = args.lr
+        if args.transport_start_epoch is not None:
+            config.train.phase2_transport_start_epoch = args.transport_start_epoch
+        if args.transport_ramp_epochs is not None:
+            config.train.phase2_transport_ramp_epochs = args.transport_ramp_epochs
+        if config.train.phase2_transport_start_epoch < 0:
+            parser.error("--transport_start_epoch must be >= 0")
+        if config.train.phase2_transport_ramp_epochs < 1:
+            parser.error("--transport_ramp_epochs must be >= 1")
+    elif config.model.pretrain_phase == 1:
         if args.batch_size is not None:
             config.train.phase1_batch_size = args.batch_size
         if args.accum_steps is not None:

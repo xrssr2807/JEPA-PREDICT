@@ -14,6 +14,7 @@ Auxiliary objective:
   - StatsPredHead: predicts 16 physiological statistics saved by preprocessing
 """
 import copy
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -99,6 +100,32 @@ class TokenPredictor(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+
+class CausalDelayHead(nn.Module):
+    """Predict positive ECG-to-PPG delay bins plus unmatched mass per token."""
+
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        num_delay_bins: int,
+        unmatched_bias: float = -2.0,
+    ):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.hidden = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.output = nn.Linear(hidden_dim, num_delay_bins + 1)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+        with torch.no_grad():
+            self.output.bias[-1] = float(unmatched_bias)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self.output(self.hidden(self.norm(tokens)))
 
 
 class Predictor(nn.Module):
@@ -262,13 +289,28 @@ class JEPA(nn.Module):
         phase1_mask_block_tokens: int = 8,
         phase1_bidirectional: bool = True,
         phase1_token_loss_weight: float = 1.0,
+        phase2_sample_rate_hz: float = 100.0,
+        phase2_min_delay_ms: float = 80.0,
+        phase2_max_delay_ms: float = 800.0,
+        phase2_delay_prior_ms: float = 250.0,
+        phase2_delay_head_hidden: int = 128,
+        phase2_transport_temperature: float = 0.2,
+        phase2_unmatched_bias: float = -2.0,
+        phase2_transport_loss_weight: float = 1.0,
+        phase2_delay_prior_weight: float = 0.02,
+        phase2_monotonic_weight: float = 0.05,
+        phase2_delay_smoothness_weight: float = 0.01,
+        phase2_match_mass_weight: float = 0.01,
+        phase2_target_match_mass: float = 0.95,
         use_se: bool = False,
         use_inception: bool = False,
     ):
         super().__init__()
 
-        if pretrain_phase not in (0, 1):
-            raise ValueError(f"Unsupported pretrain_phase={pretrain_phase}; expected 0 or 1")
+        if pretrain_phase not in (0, 1, 2):
+            raise ValueError(
+                f"Unsupported pretrain_phase={pretrain_phase}; expected 0, 1, or 2"
+            )
         self.pretrain_phase = int(pretrain_phase)
 
         # Two encoders with identical architecture
@@ -343,6 +385,59 @@ class JEPA(nn.Module):
             nn.init.normal_(self.ecg_mask_token, std=0.02)
             nn.init.normal_(self.ppg_mask_token, std=0.02)
 
+            if self.pretrain_phase == 2:
+                if phase2_sample_rate_hz <= 0:
+                    raise ValueError("phase2_sample_rate_hz must be positive")
+                if phase2_min_delay_ms <= 0:
+                    raise ValueError("Phase 2 requires a strictly positive minimum delay")
+                if phase2_max_delay_ms < phase2_min_delay_ms:
+                    raise ValueError(
+                        "phase2_max_delay_ms must be >= phase2_min_delay_ms"
+                    )
+                if phase2_transport_temperature <= 0:
+                    raise ValueError("phase2_transport_temperature must be positive")
+                if not 0.0 < phase2_target_match_mass <= 1.0:
+                    raise ValueError(
+                        "phase2_target_match_mass must be in the interval (0, 1]"
+                    )
+                encoder_stride = math.prod(cnn_strides)
+                token_ms = 1000.0 * encoder_stride / phase2_sample_rate_hz
+                min_delay_tokens = max(
+                    1, int(math.ceil(phase2_min_delay_ms / token_ms))
+                )
+                max_delay_tokens = max(
+                    min_delay_tokens,
+                    int(math.ceil(phase2_max_delay_ms / token_ms)),
+                )
+                delay_offsets = torch.arange(
+                    min_delay_tokens, max_delay_tokens + 1, dtype=torch.long
+                )
+                self.register_buffer("phase2_delay_offsets", delay_offsets)
+                self.phase2_token_ms = float(token_ms)
+                self.phase2_delay_prior_tokens = float(
+                    phase2_delay_prior_ms / token_ms
+                )
+                self.phase2_delay_head = CausalDelayHead(
+                    embedding_dim,
+                    phase2_delay_head_hidden,
+                    delay_offsets.numel(),
+                    unmatched_bias=phase2_unmatched_bias,
+                )
+                self.phase2_transport_temperature = float(
+                    phase2_transport_temperature
+                )
+                self.phase2_transport_loss_weight = float(
+                    phase2_transport_loss_weight
+                )
+                self.phase2_delay_prior_weight = float(phase2_delay_prior_weight)
+                self.phase2_monotonic_weight = float(phase2_monotonic_weight)
+                self.phase2_delay_smoothness_weight = float(
+                    phase2_delay_smoothness_weight
+                )
+                self.phase2_match_mass_weight = float(phase2_match_mass_weight)
+                self.phase2_target_match_mass = float(phase2_target_match_mass)
+                self.phase2_progress = 0.0
+
     # ── New: Statistics Prediction Head ──
         self.use_stats_loss = use_stats_loss
         self.stats_loss_weight = stats_loss_weight
@@ -376,7 +471,7 @@ class JEPA(nn.Module):
         """Teacher targets must not depend on dropout or batch statistics."""
         self.target_encoder.eval()
         self.target_proj.eval()
-        if self.pretrain_phase == 1:
+        if self.pretrain_phase >= 1:
             self.context_teacher.eval()
             self.ecg_teacher_proj.eval()
 
@@ -401,7 +496,7 @@ class JEPA(nn.Module):
     def teacher_student_parameter_cosine(self) -> float:
         """Mean same-modality cosine between online and EMA encoders."""
         pairs = [(self.context_encoder, self.target_encoder)]
-        if self.pretrain_phase == 1:
+        if self.pretrain_phase >= 1:
             pairs = [
                 (self.context_encoder, self.context_teacher),
                 (self.ppg_encoder, self.target_encoder),
@@ -718,6 +813,148 @@ class JEPA(nn.Module):
         return per_token[token_mask].mean()
 
     @staticmethod
+    def _weighted_transport_regression(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        token_mask: torch.Tensor,
+        available_mass: torch.Tensor,
+    ) -> torch.Tensor:
+        """Cosine token regression where the transport has a valid match."""
+        prediction = F.normalize(prediction.float(), dim=-1)
+        target = F.normalize(target.float(), dim=-1)
+        per_token = 1.0 - (prediction * target).sum(dim=-1)
+        valid = token_mask & (available_mass > 1e-6)
+        if not valid.any():
+            return prediction.sum() * 0.0
+        return per_token[valid].mean()
+
+    def set_phase2_progress(self, progress: float) -> None:
+        """Set the transport blend in [0, 1] for the current epoch."""
+        if self.pretrain_phase != 2:
+            return
+        self.phase2_progress = min(max(float(progress), 0.0), 1.0)
+
+    def _build_phase2_transport(self, ecg_tokens: torch.Tensor) -> dict:
+        """Build a causal banded transport with an unmatched dustbin."""
+        if self.pretrain_phase != 2:
+            raise RuntimeError("Phase 2 transport requested outside Phase 2")
+        batch_size, num_tokens, _ = ecg_tokens.shape
+        offsets = self.phase2_delay_offsets
+        if num_tokens <= int(offsets.min().item()):
+            raise ValueError(
+                "Phase 2 token sequence is too short for the configured "
+                "positive delay"
+            )
+        num_bins = offsets.numel()
+        temperature = max(self.phase2_transport_temperature, 1e-4)
+        logits = self.phase2_delay_head(ecg_tokens).float() / temperature
+
+        source = torch.arange(num_tokens, device=ecg_tokens.device).view(1, num_tokens, 1)
+        target = source + offsets.view(1, 1, num_bins)
+        valid_delay = target < num_tokens
+        delay_logits = logits[..., :num_bins].masked_fill(~valid_delay, -1e4)
+        logits = torch.cat([delay_logits, logits[..., -1:]], dim=-1)
+        probabilities = F.softmax(logits, dim=-1)
+        delay_probabilities = probabilities[..., :num_bins] * valid_delay
+        unmatched_probability = probabilities[..., -1]
+        match_mass = delay_probabilities.sum(dim=-1)
+
+        target_indices = target.clamp(max=max(num_tokens - 1, 0)).expand(
+            batch_size, -1, -1
+        )
+        transport = delay_probabilities.new_zeros(
+            batch_size, num_tokens, num_tokens
+        )
+        transport.scatter_add_(2, target_indices, delay_probabilities)
+
+        offsets_float = offsets.to(dtype=delay_probabilities.dtype)
+        expected_delay = (
+            delay_probabilities * offsets_float.view(1, 1, -1)
+        ).sum(dim=-1) / match_mass.clamp_min(1e-8)
+        valid_rows = valid_delay.any(dim=-1).expand(batch_size, -1)
+        return {
+            "transport": transport,
+            "delay_probabilities": delay_probabilities,
+            "unmatched_probability": unmatched_probability,
+            "match_mass": match_mass,
+            "expected_delay": expected_delay,
+            "valid_delay": valid_delay.expand(batch_size, -1, -1),
+            "valid_rows": valid_rows,
+        }
+
+    def _phase2_transport_regularizers(self, state: dict) -> dict:
+        """Positive-delay prior, monotonicity, smoothness, and mass control."""
+        probabilities = state["delay_probabilities"]
+        match_mass = state["match_mass"]
+        expected_delay = state["expected_delay"]
+        valid_delay = state["valid_delay"]
+        valid_rows = state["valid_rows"]
+        offsets = self.phase2_delay_offsets.to(probabilities.dtype)
+
+        conditional = probabilities / match_mass.unsqueeze(-1).clamp_min(1e-8)
+        prior_scale = max(float(offsets.numel()) / 3.0, 1.0)
+        prior = torch.exp(
+            -0.5 * ((offsets - self.phase2_delay_prior_tokens) / prior_scale).square()
+        ).view(1, 1, -1)
+        prior = prior * valid_delay
+        prior = prior / prior.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        prior_kl_per_row = (
+            conditional
+            * (
+                conditional.clamp_min(1e-8).log()
+                - prior.clamp_min(1e-8).log()
+            )
+        ).sum(dim=-1)
+        delay_prior = prior_kl_per_row[valid_rows].mean()
+
+        positions = torch.arange(
+            expected_delay.size(1),
+            device=expected_delay.device,
+            dtype=expected_delay.dtype,
+        ).view(1, -1)
+        expected_target = positions + expected_delay
+        pair_valid = valid_rows[:, :-1] & valid_rows[:, 1:]
+        monotonic_per_pair = F.relu(
+            expected_target[:, :-1] - expected_target[:, 1:]
+        )
+        monotonic = (
+            monotonic_per_pair[pair_valid].mean()
+            if pair_valid.any()
+            else monotonic_per_pair.sum() * 0.0
+        )
+
+        normalized_delay = expected_delay / offsets.max().clamp_min(1.0)
+        smoothness_per_pair = F.smooth_l1_loss(
+            normalized_delay[:, 1:],
+            normalized_delay[:, :-1],
+            reduction="none",
+        )
+        smoothness = (
+            smoothness_per_pair[pair_valid].mean()
+            if pair_valid.any()
+            else smoothness_per_pair.sum() * 0.0
+        )
+        match_mass_loss = (
+            match_mass[valid_rows].mean() - self.phase2_target_match_mass
+        ).square()
+
+        conditional_entropy = -(
+            conditional * conditional.clamp_min(1e-8).log()
+        ).sum(dim=-1)
+        valid_expected = expected_delay[valid_rows]
+        return {
+            "delay_prior_loss": delay_prior,
+            "monotonic_loss": monotonic,
+            "delay_smoothness_loss": smoothness,
+            "match_mass_loss": match_mass_loss,
+            "delay_mean_ms": valid_expected.mean() * self.phase2_token_ms,
+            "delay_std_ms": valid_expected.std(unbiased=False) * self.phase2_token_ms,
+            "transport_entropy": conditional_entropy[valid_rows].mean(),
+            "matched_mass": match_mass[valid_rows].mean(),
+            "unmatched_mass": state["unmatched_probability"].mean(),
+        }
+
+    @staticmethod
     def _add_embedding_diagnostics(
         info: dict,
         embeddings,
@@ -838,6 +1075,144 @@ class JEPA(nn.Module):
         info["total_loss"] = total_loss.item()
         return total_loss, info
 
+    def _compute_phase2_loss(
+        self,
+        ecg: torch.Tensor,
+        ppg: torch.Tensor,
+        ecg_stats: Optional[torch.Tensor],
+        collect_diagnostics: bool,
+    ) -> Tuple[torch.Tensor, dict]:
+        """Phase 1 token JEPA extended with causal monotonic transport."""
+        ecg_input_tokens = self.context_encoder.tokenize(ecg)
+        ppg_input_tokens = self.ppg_encoder.tokenize(ppg)
+        num_tokens = min(ecg_input_tokens.size(1), ppg_input_tokens.size(1))
+        ecg_input_tokens = ecg_input_tokens[:, :num_tokens]
+        ppg_input_tokens = ppg_input_tokens[:, :num_tokens]
+        token_mask = self._make_token_block_mask(
+            ecg.size(0), num_tokens, ecg.device
+        )
+
+        ecg_pooled, ecg_tokens = self.context_encoder.encode_tokens(
+            ecg_input_tokens,
+            return_all=True,
+            token_mask=token_mask,
+            mask_token=self.ecg_mask_token,
+        )
+        ppg_pooled, ppg_tokens = self.ppg_encoder.encode_tokens(
+            ppg_input_tokens,
+            return_all=True,
+            token_mask=token_mask,
+            mask_token=self.ppg_mask_token,
+        )
+
+        with torch.no_grad():
+            ecg_teacher_pooled, ecg_teacher_tokens = self.context_teacher(
+                ecg, return_all=True
+            )
+            ppg_teacher_pooled, ppg_teacher_tokens = self.target_encoder(
+                ppg, return_all=True
+            )
+            ecg_teacher_tokens = self.ecg_teacher_proj(
+                ecg_teacher_tokens[:, :num_tokens]
+            )
+            ppg_teacher_tokens = self.target_proj(
+                ppg_teacher_tokens[:, :num_tokens]
+            )
+
+        ecg_online_tokens = self.ecg_token_proj(ecg_tokens)
+        ppg_online_tokens = self.ppg_token_proj(ppg_tokens)
+        ppg_prediction = self.ecg_to_ppg_predictor(ecg_online_tokens)
+        ecg_prediction = self.ppg_to_ecg_predictor(ppg_online_tokens)
+
+        direct_ecg_to_ppg = self._masked_token_regression(
+            ppg_prediction, ppg_teacher_tokens, token_mask
+        )
+        direct_ppg_to_ecg = self._masked_token_regression(
+            ecg_prediction, ecg_teacher_tokens, token_mask
+        )
+        direct_jepa = 0.5 * (direct_ecg_to_ppg + direct_ppg_to_ecg)
+
+        transport_state = self._build_phase2_transport(ecg_online_tokens)
+        transport = transport_state["transport"]
+        row_mass = transport_state["match_mass"]
+        column_mass = transport.sum(dim=1)
+        transported_ppg = torch.bmm(
+            transport, ppg_teacher_tokens.float()
+        ) / row_mass.unsqueeze(-1).clamp_min(1e-8)
+        transported_ecg = torch.bmm(
+            transport.transpose(1, 2), ecg_teacher_tokens.float()
+        ) / column_mass.unsqueeze(-1).clamp_min(1e-8)
+
+        transport_ecg_to_ppg = self._weighted_transport_regression(
+            ppg_prediction, transported_ppg, token_mask, row_mass
+        )
+        transport_ppg_to_ecg = self._weighted_transport_regression(
+            ecg_prediction, transported_ecg, token_mask, column_mass
+        )
+        transport_jepa = 0.5 * (
+            transport_ecg_to_ppg + transport_ppg_to_ecg
+        )
+
+        progress = self.phase2_progress
+        token_jepa = (
+            (1.0 - progress) * direct_jepa
+            + progress * self.phase2_transport_loss_weight * transport_jepa
+        )
+        regularizers = self._phase2_transport_regularizers(transport_state)
+        total_loss = self.phase1_token_loss_weight * token_jepa
+        total_loss = total_loss + progress * (
+            self.phase2_delay_prior_weight * regularizers["delay_prior_loss"]
+            + self.phase2_monotonic_weight * regularizers["monotonic_loss"]
+            + self.phase2_delay_smoothness_weight
+            * regularizers["delay_smoothness_loss"]
+            + self.phase2_match_mass_weight * regularizers["match_mass_loss"]
+        )
+
+        prediction_std = 0.5 * (
+            ppg_prediction[token_mask].detach().float().std(unbiased=False)
+            + ecg_prediction[token_mask].detach().float().std(unbiased=False)
+        )
+        info = {
+            "jepa": token_jepa.item(),
+            "direct_token_jepa": direct_jepa.item(),
+            "transport_token_jepa": transport_jepa.item(),
+            "ecg_to_ppg_token": transport_ecg_to_ppg.item(),
+            "ppg_to_ecg_token": transport_ppg_to_ecg.item(),
+            "masked_fraction": token_mask.float().mean().item(),
+            "prediction_std": prediction_std.item(),
+            "phase2_progress": progress,
+            "delay_prior": regularizers["delay_prior_loss"].item(),
+            "monotonic": regularizers["monotonic_loss"].item(),
+            "delay_smoothness": regularizers["delay_smoothness_loss"].item(),
+            "match_mass_loss": regularizers["match_mass_loss"].item(),
+            "delay_mean_ms": regularizers["delay_mean_ms"].item(),
+            "delay_std_ms": regularizers["delay_std_ms"].item(),
+            "transport_entropy": regularizers["transport_entropy"].item(),
+            "matched_mass": regularizers["matched_mass"].item(),
+            "unmatched_mass": regularizers["unmatched_mass"].item(),
+            "token_align": 0.0,
+        }
+        self._add_embedding_diagnostics(
+            info,
+            (
+                ("context", ecg_pooled),
+                ("target", ppg_pooled),
+                ("ecg_teacher", ecg_teacher_pooled),
+                ("ppg_teacher", ppg_teacher_pooled),
+            ),
+            collect_diagnostics,
+        )
+
+        if self.use_stats_loss and ecg_stats is not None:
+            stats_loss, stats_info = self._compute_stats_loss(
+                ecg_pooled, ecg_stats
+            )
+            total_loss = total_loss + self.stats_loss_weight * stats_loss
+            info.update(stats_info)
+
+        info["total_loss"] = total_loss.item()
+        return total_loss, info
+
     def compute_loss(
         self,
         ecg: torch.Tensor,
@@ -858,6 +1233,10 @@ class JEPA(nn.Module):
             loss: scalar tensor
             info: dict with all sub-losses
         """
+        if self.pretrain_phase == 2:
+            return self._compute_phase2_loss(
+                ecg, ppg, ecg_stats, collect_diagnostics
+            )
         if self.pretrain_phase == 1:
             return self._compute_phase1_loss(
                 ecg, ppg, ecg_stats, collect_diagnostics
