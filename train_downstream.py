@@ -713,7 +713,9 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                 focus_loss_weight: float = 0.0,
                 focus_pos_weight: Optional[torch.Tensor] = None,
                 focus_auc_loss_weight: float = 0.0,
-                focus_auc_margin: float = 0.2):
+                focus_auc_margin: float = 0.2,
+                use_amp: bool = False,
+                scaler=None):
     """Single training epoch with optional ECG distillation."""
     model.train()
     if distill_mode:
@@ -779,11 +781,16 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                 cls_loss_ecg = criterion(ecg_logits, elabels)
                 loss = cls_loss_ppg + cls_loss_ecg
             else:
-                logits = model(x)
-                loss = criterion(logits, labels)
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.float16,
+                    enabled=bool(use_amp and device.type == "cuda"),
+                ):
+                    logits = model(x)
+                    loss = criterion(logits, labels)
 
         if multilabel and focus_loss_weight > 0 and 0 <= focus_label_index < logits.size(1):
-            focus_logits = logits[:, focus_label_index]
+            focus_logits = logits[:, focus_label_index].float()
             focus_labels = labels[:, focus_label_index].float()
             focus_loss = F.binary_cross_entropy_with_logits(
                 focus_logits, focus_labels, pos_weight=focus_pos_weight
@@ -792,19 +799,26 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
 
         if multilabel and focus_auc_loss_weight > 0 and 0 <= focus_label_index < logits.size(1):
             auc_loss = pairwise_auc_margin_loss(
-                logits[:, focus_label_index], labels[:, focus_label_index].float(),
+                logits[:, focus_label_index].float(), labels[:, focus_label_index].float(),
                 margin=focus_auc_margin,
             )
             loss = loss + focus_auc_loss_weight * auc_loss
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         if not torch.isfinite(loss):
             print("[Warn] non-finite loss detected; skipping this batch")
             continue
-        loss.backward()
         all_params = list(model.parameters()) + (list(proj_ppg.parameters()) if distill_mode else [])
-        torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
-        optimizer.step()
+        if scaler is not None and scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+            optimizer.step()
 
         if scheduler is not None and sched_mode == "batch":
             scheduler.step()
@@ -971,7 +985,8 @@ def evaluate(model, dataloader, criterion, device, num_classes: int,
 @torch.no_grad()
 def evaluate_multilabel(model, dataloader, criterion, device,
                         label_names: List[str], aggregate_by_uid: bool = True,
-                        thresholds: Optional[np.ndarray] = None):
+                        thresholds: Optional[np.ndarray] = None,
+                        use_amp: bool = False):
     """Evaluate multi-label disease prediction with sigmoid probabilities."""
     model.eval()
     running_loss = 0.0
@@ -986,8 +1001,13 @@ def evaluate_multilabel(model, dataloader, criterion, device,
         x = x.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
-        logits = model(x)
-        loss = criterion(logits, labels)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=bool(use_amp and device.type == "cuda"),
+        ):
+            logits = model(x)
+            loss = criterion(logits, labels)
         running_loss += loss.item()
 
         if aggregate_by_uid and uids is not None:
@@ -1243,6 +1263,11 @@ def train_downstream(
     seed_everything(config.seed)
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     configure_cuda_performance(device, config.train)
+    use_amp = bool(
+        device.type == "cuda"
+        and getattr(config.train, "downstream_use_amp", True)
+    )
+    print(f"[AMP] downstream={'on' if use_amp else 'off'}")
     print(f"Device: {device} | Dataset: {dataset}")
 
     # ── Log file ──
@@ -1570,6 +1595,7 @@ def train_downstream(
         probe_steps = len(train_loader)
         probe_lr = config.train.downstream_lr * 4 if (use_distill or use_cotrain) else config.train.downstream_lr
         optimizer = AdamW(trainable, lr=probe_lr, weight_decay=1e-4)
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
         scheduler, sched_mode = build_scheduler(optimizer, config.train, probe_steps)
 
         for epoch in range(n_probe):
@@ -1588,12 +1614,15 @@ def train_downstream(
                 focus_pos_weight=focus_pos_weight,
                 focus_auc_loss_weight=config.train.chd_auc_loss_weight if multilabel else 0.0,
                 focus_auc_margin=config.train.chd_auc_margin,
+                use_amp=use_amp,
+                scaler=scaler,
             )
             eval_loader = val_loader if val_loader is not None else test_loader
             eval_name = "Val" if val_loader is not None else "Test"
             if multilabel:
                 test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate_multilabel(
                     model, eval_loader, criterion, device, config.data.multidisease_labels,
+                    use_amp=use_amp,
                 )
             else:
                 test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate(
@@ -1657,6 +1686,7 @@ def train_downstream(
     else:
         optimizer = AdamW(model.parameters(), lr=ft_lr, weight_decay=1e-4)
 
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     scheduler, sched_mode = build_scheduler(optimizer, config.train, ft_steps)
 
     best_score = float("-inf")
@@ -1674,12 +1704,15 @@ def train_downstream(
             focus_pos_weight=focus_pos_weight,
             focus_auc_loss_weight=config.train.chd_auc_loss_weight if multilabel else 0.0,
             focus_auc_margin=config.train.chd_auc_margin,
+            use_amp=use_amp,
+            scaler=scaler,
         )
         eval_loader = val_loader if val_loader is not None else test_loader
         eval_name = "Val" if val_loader is not None else "Test"
         if multilabel:
             test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate_multilabel(
                 model, eval_loader, criterion, device, config.data.multidisease_labels,
+                use_amp=use_amp,
             )
         else:
             test_loss, test_acc, auc, auc_list, prec, rec, f1, f05, report, _, _, _ = evaluate(
@@ -1738,6 +1771,7 @@ def train_downstream(
         if val_loader is not None:
             (_, _, _, _, _, _, _, _, _, _, val_labels, val_probs) = evaluate_multilabel(
                 model, val_loader, criterion, device, config.data.multidisease_labels,
+                use_amp=use_amp,
             )
             thresholds = tune_thresholds_from_config(val_labels, val_probs, config.train)
             threshold_msg = (
@@ -1755,6 +1789,7 @@ def train_downstream(
          prec, rec, f1, f05, report, test_preds, test_labels, test_probs) = evaluate_multilabel(
             model, test_loader, criterion, device, config.data.multidisease_labels,
             thresholds=thresholds,
+            use_amp=use_amp,
         )
         per_class_rows = multilabel_per_class_metrics(
             config.data.multidisease_labels, test_labels, test_preds, test_probs, auc_list
@@ -1849,6 +1884,22 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--mil_batch_size", type=int, default=None,
+        help="Patient-MIL patients per full fine-tune batch",
+    )
+    parser.add_argument(
+        "--mil_chunk_size", type=int, default=None,
+        help="Segments processed by each encoder call",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=None,
+        help="Override downstream DataLoader worker count",
+    )
+    parser.add_argument(
+        "--no_amp", action="store_true",
+        help="Disable downstream automatic mixed precision",
+    )
     args = parser.parse_args()
 
     config = Config()
@@ -1863,6 +1914,14 @@ if __name__ == "__main__":
         config.data.multidisease_dual_stream = args.multidisease_channel == "both"
     if args.multidisease_split is not None:
         config.data.multidisease_split_file = args.multidisease_split
+    if args.mil_batch_size is not None:
+        config.train.multidisease_mil_batch_size = args.mil_batch_size
+    if args.mil_chunk_size is not None:
+        config.data.multidisease_mil_encoder_chunk_size = args.mil_chunk_size
+    if args.workers is not None:
+        config.train.dataloader_workers = args.workers
+    if args.no_amp:
+        config.train.downstream_use_amp = False
     config.output_dir = args.output_dir
     os.makedirs(config.output_dir, exist_ok=True)
 

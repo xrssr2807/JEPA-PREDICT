@@ -43,7 +43,7 @@ class DataConfig:
     multidisease_use_multiscale: bool = True
     multidisease_patient_mil: bool = True
     multidisease_mil_segments: int = 8
-    multidisease_mil_encoder_chunk_size: int = 32  # larger kernels; batch 32 still fits a 24 GB GPU
+    multidisease_mil_encoder_chunk_size: int = 128
 
     # Augmentation (PhysioAugment — applied to ECG context signal)
     use_augment: bool = False
@@ -193,13 +193,14 @@ class TrainConfig:
     # Downstream
     downstream_epochs: int = 50
     downstream_batch_size: int = 256
-    multidisease_mil_batch_size: int = 32  # targets roughly 80% VRAM on a 24 GB GPU
-    multidisease_probe_batch_size: int = 64  # frozen encoders allow a much larger patient batch
+    multidisease_mil_batch_size: int = 64
+    multidisease_probe_batch_size: int = 96  # frozen encoders allow a much larger patient batch
     multidisease_probe_encoder_chunk_size: int = 128
     dataloader_workers: int = 8
     dataloader_prefetch_factor: int = 4
     dataloader_persistent_workers: bool = True
     enable_tf32: bool = True
+    downstream_use_amp: bool = True
     downstream_lr: float = 5e-4  # FT base=5e-5 (anti-overfit, 最优)
     downstream_min_lr: float = 1e-6
     downstream_warmup_epochs: int = 5
