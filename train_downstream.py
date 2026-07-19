@@ -267,9 +267,14 @@ def configure_cuda_performance(device: torch.device, train_config: TrainConfig):
     print(f"[CUDA] cuDNN benchmark=on TF32={'on' if enable_tf32 else 'off'}")
 
 
-def build_adamw(params, device: torch.device, **kwargs) -> AdamW:
-    """Use the fused CUDA optimizer when available to reduce step overhead."""
-    if device.type == "cuda":
+def build_adamw(
+    params,
+    device: torch.device,
+    use_fused: bool = False,
+    **kwargs,
+) -> AdamW:
+    """Optionally use the fused CUDA optimizer for throughput-focused runs."""
+    if device.type == "cuda" and use_fused:
         kwargs["fused"] = True
     return AdamW(params, **kwargs)
 
@@ -1274,7 +1279,12 @@ def train_downstream(
         device.type == "cuda"
         and getattr(config.train, "downstream_use_amp", True)
     )
+    use_fused_optimizer = bool(
+        device.type == "cuda"
+        and getattr(config.train, "downstream_fused_adamw", False)
+    )
     print(f"[AMP] downstream={'on' if use_amp else 'off'}")
+    print(f"[Optimizer] fused AdamW={'on' if use_fused_optimizer else 'off'}")
     print(f"Device: {device} | Dataset: {dataset}")
 
     # ── Log file ──
@@ -1602,7 +1612,8 @@ def train_downstream(
         probe_steps = len(train_loader)
         probe_lr = config.train.downstream_lr * 4 if (use_distill or use_cotrain) else config.train.downstream_lr
         optimizer = build_adamw(
-            trainable, device, lr=probe_lr, weight_decay=1e-4,
+            trainable, device, use_fused=use_fused_optimizer,
+            lr=probe_lr, weight_decay=1e-4,
         )
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
         scheduler, sched_mode = build_scheduler(optimizer, config.train, probe_steps)
@@ -1680,27 +1691,34 @@ def train_downstream(
     if use_dual:
         print(f"[Optimizer] Dual: uniform LR={ft_lr:.2e}")
         optimizer = build_adamw(
-            model.parameters(), device, lr=ft_lr, weight_decay=1e-4,
+            model.parameters(), device, use_fused=use_fused_optimizer,
+            lr=ft_lr, weight_decay=1e-4,
         )
     elif use_distill:
         print(f"[Optimizer] Distill: uniform LR={ft_lr:.2e}")
         all_params = list(model.parameters()) + list(proj_ppg.parameters())
         optimizer = build_adamw(
-            all_params, device, lr=ft_lr, weight_decay=1e-4,
+            all_params, device, use_fused=use_fused_optimizer,
+            lr=ft_lr, weight_decay=1e-4,
         )
     elif use_cotrain:
         print(f"[Optimizer] CoTrain: uniform LR={ft_lr:.2e} (PPG+ECG+classifier)")
         all_params = list(model.parameters()) + list(ecg_encoder.parameters())
         optimizer = build_adamw(
-            all_params, device, lr=ft_lr, weight_decay=1e-4,
+            all_params, device, use_fused=use_fused_optimizer,
+            lr=ft_lr, weight_decay=1e-4,
         )
     elif config.model.use_layerwise_lr:
         print(f"[Optimizer] Layer-wise LR (base={ft_lr}, decay={config.model.layer_decay})")
         param_groups = get_layerwise_param_groups(model, ft_lr, config.model.layer_decay)
-        optimizer = build_adamw(param_groups, device, weight_decay=1e-4)
+        optimizer = build_adamw(
+            param_groups, device, use_fused=use_fused_optimizer,
+            weight_decay=1e-4,
+        )
     else:
         optimizer = build_adamw(
-            model.parameters(), device, lr=ft_lr, weight_decay=1e-4,
+            model.parameters(), device, use_fused=use_fused_optimizer,
+            lr=ft_lr, weight_decay=1e-4,
         )
 
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -1943,6 +1961,7 @@ if __name__ == "__main__":
         config.train.multidisease_probe_batch_size = 128
         config.data.multidisease_mil_encoder_chunk_size = 512
         config.train.dataloader_workers = 16
+        config.train.downstream_fused_adamw = True
         print(
             "[ThroughputMode] MIL batch=128 probe batch=128 "
             "encoder chunk=512 workers=16 AMP=on fused AdamW=on"
