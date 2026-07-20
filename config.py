@@ -211,7 +211,8 @@ class TrainConfig:
     taskaware_feedback_batch_size: int = 8
     taskaware_feedback_segments: int = 4
     taskaware_feedback_encoder_chunk_size: int = 32
-    taskaware_head_warmup_steps: int = 500
+    taskaware_feedback_start_epoch: int = 5
+    taskaware_head_warmup_steps: int = 50
     taskaware_head_lr: float = 5e-4
     taskaware_feedback_encoder_grad_ratio: float = 0.20
     taskaware_feedback_grad_clip: float = 1.0

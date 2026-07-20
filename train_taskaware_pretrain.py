@@ -10,7 +10,7 @@ from typing import Dict, Iterable, List, Sequence
 import numpy as np
 import torch
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Sampler
 
 from config import Config
@@ -37,6 +37,7 @@ from train_pretrain import (
     build_model,
     build_pretrain_dataloaders,
     evaluate_pretrain,
+    phase2_transport_progress,
     seed_everything,
 )
 
@@ -358,6 +359,7 @@ def _checkpoint_payload(
     split_file,
     pretrain_metrics,
     feedback_metrics,
+    from_scratch,
 ):
     payload = {
         "taskaware_version": 1,
@@ -374,6 +376,7 @@ def _checkpoint_payload(
         "scheduler_state_dict": scheduler.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "taskaware_split_file": split_file,
+        "taskaware_from_scratch": bool(from_scratch),
         "pretrain_val_metrics": pretrain_metrics,
         "feedback_val_metrics": feedback_metrics,
     }
@@ -382,7 +385,13 @@ def _checkpoint_payload(
     return payload
 
 
-def train_taskaware(config: Config, checkpoint: str, split_file: str, resume=None):
+def train_taskaware(
+    config: Config,
+    checkpoint: str,
+    split_file: str,
+    resume=None,
+    from_scratch: bool = False,
+):
     config.model.pretrain_phase = 2
     seed_everything(
         config.seed,
@@ -393,6 +402,9 @@ def train_taskaware(config: Config, checkpoint: str, split_file: str, resume=Non
     use_amp = bool(config.train.phase2_use_amp and device.type == "cuda")
     os.makedirs(config.output_dir, exist_ok=True)
     print(f"Device: {device} | Phase 3A task-aware pre-training | AMP={use_amp}")
+    source_path = resume or checkpoint
+    if source_path and not os.path.isfile(source_path):
+        raise FileNotFoundError(f"Checkpoint does not exist: {source_path}")
 
     pretrain_loader, pretrain_val_loader = build_pretrain_dataloaders(
         config.data,
@@ -407,11 +419,28 @@ def train_taskaware(config: Config, checkpoint: str, split_file: str, resume=Non
     )
 
     model = build_model(config.model).to(device)
-    source = torch.load(resume or checkpoint, map_location=device, weights_only=False)
-    if int(source.get("pretrain_phase", -1)) != 2:
-        raise ValueError("Task-aware training requires a Phase 2 checkpoint")
-    _load_jepa_state_dict(model, source["model_state_dict"])
-    model.set_phase2_progress(1.0)
+    source = None
+    if source_path:
+        source = torch.load(source_path, map_location=device, weights_only=False)
+        if int(source.get("pretrain_phase", -1)) != 2:
+            raise ValueError("Task-aware training requires a Phase 2 checkpoint")
+        _load_jepa_state_dict(model, source["model_state_dict"])
+        print(f"[Init] Loaded Phase 2 checkpoint: {source_path}")
+    else:
+        if not from_scratch:
+            raise ValueError("Provide --checkpoint/--resume or select --from_scratch")
+        print("[Init] Random Phase 2 initialization; transport and feedback will warm up")
+    continuing_phase2 = source is not None and not bool(
+        source.get("taskaware_from_scratch", False)
+    )
+    if continuing_phase2:
+        checkpoint_transport = float(source.get("phase2_transport_progress", 1.0))
+        if checkpoint_transport < 1.0 - 1e-8:
+            raise ValueError(
+                "The Phase 2 checkpoint is still ramping transport; use a full-transport "
+                "checkpoint or start with --from_scratch"
+            )
+    model.set_phase2_progress(1.0 if continuing_phase2 else 0.0)
     model._enforce_teacher_eval()
 
     feedback_model = DualStreamPatientMILClassifier(
@@ -445,11 +474,34 @@ def train_taskaware(config: Config, checkpoint: str, split_file: str, resume=Non
     )
     accum_steps = max(1, config.train.phase2_accum_steps)
     optimizer_steps_per_epoch = math.ceil(len(pretrain_loader) / accum_steps)
-    scheduler = CosineAnnealingLR(
-        pretrain_optimizer,
-        T_max=max(1, optimizer_steps_per_epoch * config.train.taskaware_epochs),
-        eta_min=1e-6,
-    )
+    total_optimizer_steps = optimizer_steps_per_epoch * config.train.taskaware_epochs
+    if continuing_phase2:
+        scheduler = CosineAnnealingLR(
+            pretrain_optimizer,
+            T_max=max(1, total_optimizer_steps),
+            eta_min=1e-6,
+        )
+    else:
+        warmup_steps = min(
+            total_optimizer_steps - 1,
+            config.train.phase2_warmup_epochs * optimizer_steps_per_epoch,
+        )
+        warmup = LinearLR(
+            pretrain_optimizer,
+            start_factor=1e-3,
+            end_factor=1.0,
+            total_iters=max(1, warmup_steps),
+        )
+        cosine = CosineAnnealingLR(
+            pretrain_optimizer,
+            T_max=max(1, total_optimizer_steps - warmup_steps),
+            eta_min=1e-6,
+        )
+        scheduler = SequentialLR(
+            pretrain_optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[max(1, warmup_steps)],
+        )
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     start_epoch = 0
@@ -484,9 +536,26 @@ def train_taskaware(config: Config, checkpoint: str, split_file: str, resume=Non
     focus_pos_weight = pos_weight[config.train.chd_label_index]
     feedback_iterator = iter(feedback_loader)
     log_path = os.path.join(config.output_dir, "taskaware_pretrain_log.txt")
+    feedback_start_epoch = (
+        0 if continuing_phase2 else config.train.taskaware_feedback_start_epoch
+    )
+    print(
+        f"[Schedule] feedback_start_epoch={feedback_start_epoch} | "
+        f"head_warmup_steps={config.train.taskaware_head_warmup_steps} | "
+        f"feedback_interval={config.train.taskaware_feedback_interval}"
+    )
 
     for epoch in range(start_epoch, config.train.taskaware_epochs):
         epoch_start = time.time()
+        if continuing_phase2:
+            transport_progress = 1.0
+        else:
+            transport_progress = phase2_transport_progress(
+                epoch,
+                config.train.phase2_transport_start_epoch,
+                config.train.phase2_transport_ramp_epochs,
+            )
+        model.set_phase2_progress(transport_progress)
         model.train()
         feedback_model.train()
         model._enforce_teacher_eval()
@@ -563,7 +632,10 @@ def train_taskaware(config: Config, checkpoint: str, split_file: str, resume=Non
             model.update_target_encoder(ema_momentum)
             pretrain_optimizer.zero_grad(set_to_none=True)
 
-            if pretrain_step % config.train.taskaware_feedback_interval == 0:
+            if (
+                epoch >= feedback_start_epoch
+                and pretrain_step % config.train.taskaware_feedback_interval == 0
+            ):
                 feedback_batch, feedback_iterator = _next_batch(
                     feedback_iterator, feedback_loader
                 )
@@ -612,12 +684,26 @@ def train_taskaware(config: Config, checkpoint: str, split_file: str, resume=Non
             seed=config.seed + 1000,
             use_amp=use_amp,
         )
-        meta_metrics = _evaluate_feedback(
-            feedback_model, meta_loader, criterion, device, config, use_amp
-        )
-        val_metrics = _evaluate_feedback(
-            feedback_model, val_loader, criterion, device, config, use_amp
-        )
+        if epoch >= feedback_start_epoch:
+            meta_metrics = _evaluate_feedback(
+                feedback_model, meta_loader, criterion, device, config, use_amp
+            )
+            val_metrics = _evaluate_feedback(
+                feedback_model, val_loader, criterion, device, config, use_amp
+            )
+        else:
+            empty_auc = [0.5] * len(config.data.multidisease_labels)
+            meta_metrics = {
+                "loss": 0.0,
+                "accuracy": 0.0,
+                "macro_auc": 0.5,
+                "auc_list": empty_auc,
+                "focus_auc": 0.5,
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+            }
+            val_metrics = dict(meta_metrics)
         score = compute_best_metric(
             val_metrics["macro_auc"], val_metrics["focus_auc"], config.train
         )
@@ -625,6 +711,7 @@ def train_taskaware(config: Config, checkpoint: str, split_file: str, resume=Non
         summary = (
             f"Epoch {epoch:3d} | Train JEPA={train_metrics.get('total_loss', 0.0):.6f} "
             f"feedback={feedback_train_metrics.get('loss', 0.0):.6f} | "
+            f"transport={transport_progress:.3f} "
             f"PreVal={pretrain_metrics.get('total_loss', 0.0):.6f} "
             f"healthy={healthy} | Meta AUC={meta_metrics['macro_auc']:.4f} "
             f"CHD={meta_metrics['focus_auc']:.4f} | Val AUC={val_metrics['macro_auc']:.4f} "
@@ -635,6 +722,12 @@ def train_taskaware(config: Config, checkpoint: str, split_file: str, resume=Non
         with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(summary + "\n")
 
+        checkpoint_ready = (
+            healthy
+            and transport_progress >= 1.0 - 1e-8
+            and feedback_step > config.train.taskaware_head_warmup_steps
+            and config.train.taskaware_feedback_encoder_grad_ratio > 0.0
+        )
         payload = _checkpoint_payload(
             model,
             feedback_model,
@@ -651,9 +744,10 @@ def train_taskaware(config: Config, checkpoint: str, split_file: str, resume=Non
             resolved_split,
             pretrain_metrics,
             val_metrics,
+            not continuing_phase2,
         )
         _save_checkpoint(payload, os.path.join(config.output_dir, "jepa_taskaware_last.pt"))
-        if healthy and score > best_score:
+        if checkpoint_ready and score > best_score:
             best_score = score
             payload["best_taskaware_score"] = best_score
             _save_checkpoint(
@@ -664,14 +758,20 @@ def train_taskaware(config: Config, checkpoint: str, split_file: str, resume=Non
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--resume", default=None)
+    parser.add_argument(
+        "--from_scratch",
+        action="store_true",
+        help="Start Phase 2 + task-aware training from random initialization",
+    )
     parser.add_argument("--split", default=None)
     parser.add_argument("--output_dir", default="outputs_taskaware")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--pretrain_batch_size", type=int, default=None)
     parser.add_argument("--feedback_batch_size", type=int, default=None)
     parser.add_argument("--feedback_interval", type=int, default=None)
+    parser.add_argument("--feedback_start_epoch", type=int, default=None)
     parser.add_argument("--feedback_segments", type=int, default=None)
     parser.add_argument("--head_warmup_steps", type=int, default=None)
     parser.add_argument("--head_lr", type=float, default=None)
@@ -693,6 +793,10 @@ def main():
         config.train.taskaware_feedback_batch_size = max(2, args.feedback_batch_size)
     if args.feedback_interval is not None:
         config.train.taskaware_feedback_interval = max(1, args.feedback_interval)
+    if args.feedback_start_epoch is not None:
+        config.train.taskaware_feedback_start_epoch = max(
+            0, args.feedback_start_epoch
+        )
     if args.feedback_segments is not None:
         config.train.taskaware_feedback_segments = max(1, args.feedback_segments)
     if args.head_warmup_steps is not None:
@@ -709,7 +813,17 @@ def main():
     if args.no_amp:
         config.train.phase2_use_amp = False
     split_file = args.split or config.data.multidisease_taskaware_split_file
-    train_taskaware(config, args.checkpoint, split_file, resume=args.resume)
+    if args.from_scratch and (args.checkpoint or args.resume):
+        parser.error("--from_scratch cannot be combined with --checkpoint or --resume")
+    if not args.from_scratch and not (args.checkpoint or args.resume):
+        parser.error("provide --checkpoint/--resume or use --from_scratch")
+    train_taskaware(
+        config,
+        args.checkpoint,
+        split_file,
+        resume=args.resume,
+        from_scratch=args.from_scratch,
+    )
 
 
 if __name__ == "__main__":

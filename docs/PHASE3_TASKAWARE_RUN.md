@@ -1,6 +1,6 @@
 # Phase 3A 下游反馈预训练
 
-Phase 3A 在完整 Phase 2 权重上继续训练。ECG/PPG 双在线编码器同时被 JEPA 和患者级多疾病任务共享；EMA 教师仍只由动量更新。默认每 20 个 JEPA 优化步插入 1 个监督反馈步。
+Phase 3A 可从随机初始化开始，也可在完整 Phase 2 权重上继续训练。ECG/PPG 双在线编码器同时被 JEPA 和患者级多疾病任务共享；EMA 教师仍只由动量更新。默认从第 5 个 epoch 开始，每 20 个 JEPA 优化步插入 1 个监督反馈步。
 
 ## 1. 生成四路患者划分
 
@@ -27,7 +27,31 @@ python generate_multidisease_patient_split.py \
 - `val`：选择 `jepa_taskaware_best.pt`。
 - `test`：训练期间只验证清单完整性，不创建 DataLoader、不计算指标。
 
-## 2. 启动 Phase 3A
+## 2. 从头启动完整训练
+
+```bash
+mkdir -p outputs_taskaware_scratch
+
+python -u train_taskaware_pretrain.py \
+  --from_scratch \
+  --split splits/multidisease_taskaware_split.json \
+  --output_dir outputs_taskaware_scratch \
+  --epochs 80 \
+  --pretrain_batch_size 128 \
+  --feedback_batch_size 8 \
+  --feedback_segments 4 \
+  --feedback_start_epoch 5 \
+  --feedback_interval 20 \
+  --head_warmup_steps 50 \
+  --feedback_grad_ratio 0.20 \
+  --workers 8 \
+  --seed 42 \
+  2>&1 | tee outputs_taskaware_scratch/console.log
+```
+
+前 10 个 epoch 使用 direct token JEPA；随后 transport 在 20 个 epoch 内逐渐升至完整权重。下游反馈从第 5 个 epoch 开始，反馈头暖身 50 次后才允许监督梯度进入在线编码器。
+
+## 3. 从 Phase 2 权重继续
 
 ```bash
 mkdir -p outputs_taskaware
@@ -41,7 +65,7 @@ python -u train_taskaware_pretrain.py \
   --feedback_batch_size 8 \
   --feedback_segments 4 \
   --feedback_interval 20 \
-  --head_warmup_steps 500 \
+  --head_warmup_steps 50 \
   --feedback_grad_ratio 0.20 \
   --workers 8 \
   --seed 42 \
@@ -50,7 +74,7 @@ python -u train_taskaware_pretrain.py \
 
 24 GB 显存不足时，先将 `--pretrain_batch_size` 降到 96 或 64，再将 `--feedback_batch_size` 降到 4。不要先减少 `feedback_segments`，患者级多片段信息对 CHD 更重要。
 
-## 3. 恢复训练
+## 4. 恢复训练
 
 ```bash
 python -u train_taskaware_pretrain.py \
@@ -65,7 +89,7 @@ python -u train_taskaware_pretrain.py \
 
 `--epochs` 是总 epoch 数，不是额外 epoch 数。
 
-## 4. 用最佳权重做常规下游微调
+## 5. 用最佳权重做常规下游微调
 
 任务感知 checkpoint 保留 `context_encoder`、`ppg_encoder`、`target_encoder` 和 `model_state_dict`，兼容原下游入口：
 
