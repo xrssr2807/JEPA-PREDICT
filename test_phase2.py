@@ -140,6 +140,31 @@ class Phase2JEPATests(unittest.TestCase):
             self.assertIn(key, info)
             self.assertTrue(torch.isfinite(torch.tensor(info[key])))
 
+    def test_phase2_can_return_differentiable_components(self):
+        model = self._tiny_model()
+        model.set_phase2_progress(1.0)
+        result = model.compute_loss(
+            torch.randn(3, 1, 64),
+            torch.randn(3, 1, 64),
+            return_components=True,
+        )
+        self.assertEqual(len(result), 3)
+        loss, _, components = result
+        self.assertIs(components["total"], loss)
+        for key in (
+            "direct_token_jepa",
+            "transport_token_jepa",
+            "token_jepa",
+            "delay_prior",
+            "monotonic",
+            "delay_smoothness",
+            "match_mass",
+            "total",
+        ):
+            self.assertIn(key, components)
+            self.assertTrue(torch.is_tensor(components[key]))
+            self.assertTrue(torch.isfinite(components[key]))
+
     def test_low_match_mass_has_finite_amp_scaled_gradients(self):
         """A confident dustbin prediction must not create 1/mass gradients."""
         torch.manual_seed(3)

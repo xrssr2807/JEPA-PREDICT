@@ -23,6 +23,7 @@ class DataConfig:
     multidisease_dir: str = "/root/ppgchd/ppgchd/data_updated"
     multidisease_development_split: str = "splits/development_split.json"
     multidisease_split_file: str = "splits/multidisease_patient_split.json"
+    multidisease_taskaware_split_file: str = "splits/multidisease_taskaware_split.json"
 
     # Preprocessing
     normalize: str = "zscore"  # zscore / iqr / minmax / none
@@ -203,6 +204,17 @@ class TrainConfig:
     phase2_transport_ramp_epochs: int = 20
     pretrain_dataloader_workers: int = 8
     pretrain_prefetch_factor: int = 4
+
+    # Phase 3A: downstream-feedback-aware Phase 2 pre-training.
+    taskaware_epochs: int = 30
+    taskaware_feedback_interval: int = 20
+    taskaware_feedback_batch_size: int = 8
+    taskaware_feedback_segments: int = 4
+    taskaware_feedback_encoder_chunk_size: int = 32
+    taskaware_head_warmup_steps: int = 500
+    taskaware_head_lr: float = 5e-4
+    taskaware_feedback_encoder_grad_ratio: float = 0.20
+    taskaware_feedback_grad_clip: float = 1.0
 
     # Optimizer
     optimizer: str = "adamw"

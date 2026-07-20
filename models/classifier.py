@@ -704,6 +704,22 @@ class DualStreamPatientMILClassifier(nn.Module):
             for param in encoder.parameters():
                 param.requires_grad = True
 
+    def shared_encoder_parameters(self):
+        """Yield each shared online encoder parameter exactly once."""
+        seen = set()
+        for encoder in (self.ecg_encoder, self.ppg_encoder):
+            for param in encoder.parameters():
+                if id(param) not in seen:
+                    seen.add(id(param))
+                    yield param
+
+    def head_parameters(self):
+        """Yield task-head parameters without the shared JEPA encoders."""
+        encoder_ids = {id(param) for param in self.shared_encoder_parameters()}
+        for param in self.parameters():
+            if id(param) not in encoder_ids:
+                yield param
+
     def _encode_one(self, encoder, pyramid, signal):
         if self.use_multiscale:
             _, tokens = encoder(signal, return_all=True)

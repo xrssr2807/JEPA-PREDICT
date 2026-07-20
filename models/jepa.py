@@ -1116,7 +1116,8 @@ class JEPA(nn.Module):
         ppg: torch.Tensor,
         ecg_stats: Optional[torch.Tensor],
         collect_diagnostics: bool,
-    ) -> Tuple[torch.Tensor, dict]:
+        return_components: bool = False,
+    ):
         """Phase 1 token JEPA extended with causal monotonic transport."""
         ecg_input_tokens = self.context_encoder.tokenize(ecg)
         ppg_input_tokens = self.ppg_encoder.tokenize(ppg)
@@ -1246,6 +1247,7 @@ class JEPA(nn.Module):
             collect_diagnostics,
         )
 
+        stats_loss = total_loss.new_zeros(())
         if self.use_stats_loss and ecg_stats is not None:
             stats_loss, stats_info = self._compute_stats_loss(
                 ecg_pooled, ecg_stats
@@ -1254,7 +1256,20 @@ class JEPA(nn.Module):
             info.update(stats_info)
 
         info["total_loss"] = total_loss.item()
-        return total_loss, info
+        if not return_components:
+            return total_loss, info
+        components = {
+            "direct_token_jepa": direct_jepa,
+            "transport_token_jepa": transport_jepa,
+            "token_jepa": token_jepa,
+            "delay_prior": regularizers["delay_prior_loss"],
+            "monotonic": regularizers["monotonic_loss"],
+            "delay_smoothness": regularizers["delay_smoothness_loss"],
+            "match_mass": regularizers["match_mass_loss"],
+            "stats": stats_loss,
+            "total": total_loss,
+        }
+        return total_loss, info, components
 
     def compute_loss(
         self,
@@ -1262,7 +1277,8 @@ class JEPA(nn.Module):
         ppg: torch.Tensor,
         ecg_stats: Optional[torch.Tensor] = None,
         collect_diagnostics: bool = False,
-    ) -> Tuple[torch.Tensor, dict]:
+        return_components: bool = False,
+    ):
         """
         Compute total pre-training loss.
 
@@ -1278,8 +1294,10 @@ class JEPA(nn.Module):
         """
         if self.pretrain_phase == 2:
             return self._compute_phase2_loss(
-                ecg, ppg, ecg_stats, collect_diagnostics
+                ecg, ppg, ecg_stats, collect_diagnostics, return_components
             )
+        if return_components:
+            raise ValueError("return_components is currently supported only in Phase 2")
         if self.pretrain_phase == 1:
             return self._compute_phase1_loss(
                 ecg, ppg, ecg_stats, collect_diagnostics

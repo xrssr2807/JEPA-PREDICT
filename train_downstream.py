@@ -22,7 +22,7 @@ import copy
 import pickle
 import random
 from collections import defaultdict
-from typing import Optional, Tuple, List
+from typing import Dict, Optional, Sequence, Tuple, List
 
 import numpy as np
 import torch
@@ -141,12 +141,16 @@ def multidisease_split_provenance(split_file: str, data_dir: str) -> dict:
     }
 
 
-def load_multidisease_split_manifest(
+def load_multidisease_named_split_manifest(
     split_file: str,
     data_dir: str,
     available_files: List[str],
-) -> Tuple[List[str], List[str], List[str], str]:
-    """Load and validate an exact patient-disjoint train/val/test manifest."""
+    split_names: Sequence[str],
+) -> Tuple[Dict[str, List[str]], str]:
+    """Load and validate an exact patient-disjoint named split manifest."""
+    split_names = tuple(split_names)
+    if len(split_names) < 2 or len(set(split_names)) != len(split_names):
+        raise ValueError("split_names must contain at least two unique names")
     resolved = resolve_multidisease_split_file(split_file, data_dir)
     with open(resolved, "r", encoding="utf-8") as f:
         manifest = json.load(f)
@@ -155,7 +159,7 @@ def load_multidisease_split_manifest(
         raise ValueError("Multidisease split must be a JSON object")
 
     split_lists = {}
-    for split_name in ("train", "val", "test"):
+    for split_name in split_names:
         files = manifest.get(split_name)
         if not isinstance(files, list) or not files:
             raise ValueError(f"Multidisease split '{split_name}' must be a non-empty list")
@@ -179,31 +183,29 @@ def load_multidisease_split_manifest(
             )
         split_lists[split_name] = files
 
-    train_files = split_lists["train"]
-    val_files = split_lists["val"]
-    test_files = split_lists["test"]
     file_sets = {name: set(files) for name, files in split_lists.items()}
     uid_sets = {
         name: {uid_from_filename(filename) for filename in files}
         for name, files in split_lists.items()
     }
-    for left, right in (("train", "val"), ("train", "test"), ("val", "test")):
-        file_overlap = file_sets[left] & file_sets[right]
-        if file_overlap:
-            raise ValueError(
-                f"Multidisease {left}/{right} file leakage: "
-                f"{len(file_overlap)} overlapping files"
-            )
-        uid_overlap = uid_sets[left] & uid_sets[right]
-        if uid_overlap:
-            raise ValueError(
-                f"Multidisease {left}/{right} patient leakage: "
-                f"{len(uid_overlap)} overlapping UIDs; "
-                f"examples={sorted(uid_overlap)[:5]}"
-            )
+    for left_idx, left in enumerate(split_names):
+        for right in split_names[left_idx + 1:]:
+            file_overlap = file_sets[left] & file_sets[right]
+            if file_overlap:
+                raise ValueError(
+                    f"Multidisease {left}/{right} file leakage: "
+                    f"{len(file_overlap)} overlapping files"
+                )
+            uid_overlap = uid_sets[left] & uid_sets[right]
+            if uid_overlap:
+                raise ValueError(
+                    f"Multidisease {left}/{right} patient leakage: "
+                    f"{len(uid_overlap)} overlapping UIDs; "
+                    f"examples={sorted(uid_overlap)[:5]}"
+                )
 
     available = set(available_files)
-    requested = file_sets["train"] | file_sets["val"] | file_sets["test"]
+    requested = set().union(*file_sets.values())
     missing = requested - available
     if missing:
         raise FileNotFoundError(
@@ -212,14 +214,43 @@ def load_multidisease_split_manifest(
         )
 
     ignored = available - requested
-    print(
-        f"[DataSplit] manifest={resolved} | "
-        f"train={len(train_files)} files/{len(uid_sets['train'])} UIDs | "
-        f"val={len(val_files)} files/{len(uid_sets['val'])} UIDs | "
-        f"test={len(test_files)} files/{len(uid_sets['test'])} UIDs | "
-        f"ignored_files={len(ignored)}"
+    summary = " | ".join(
+        f"{name}={len(split_lists[name])} files/{len(uid_sets[name])} UIDs"
+        for name in split_names
     )
-    return sorted(train_files), sorted(val_files), sorted(test_files), resolved
+    print(f"[DataSplit] manifest={resolved} | {summary} | ignored_files={len(ignored)}")
+    return {name: sorted(split_lists[name]) for name in split_names}, resolved
+
+
+def load_multidisease_split_manifest(
+    split_file: str,
+    data_dir: str,
+    available_files: List[str],
+) -> Tuple[List[str], List[str], List[str], str]:
+    """Load and validate an exact patient-disjoint train/val/test manifest."""
+    splits, resolved = load_multidisease_named_split_manifest(
+        split_file, data_dir, available_files, ("train", "val", "test")
+    )
+    return splits["train"], splits["val"], splits["test"], resolved
+
+
+def load_taskaware_multidisease_split_manifest(
+    split_file: str,
+    data_dir: str,
+    available_files: List[str],
+) -> Tuple[List[str], List[str], List[str], List[str], str]:
+    """Load the four patient-disjoint splits used by task-aware pre-training."""
+    names = ("feedback_train", "feedback_meta", "val", "test")
+    splits, resolved = load_multidisease_named_split_manifest(
+        split_file, data_dir, available_files, names
+    )
+    return (
+        splits["feedback_train"],
+        splits["feedback_meta"],
+        splits["val"],
+        splits["test"],
+        resolved,
+    )
 
 
 # ── Data ────────────────────────────────────────────────────────
@@ -703,6 +734,52 @@ def pairwise_auc_margin_loss(logits: torch.Tensor, targets: torch.Tensor,
     return F.softplus(float(margin) - score_diff).mean()
 
 
+def compute_multidisease_objective(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    criterion,
+    focus_label_index: int = 4,
+    focus_loss_weight: float = 0.0,
+    focus_pos_weight: Optional[torch.Tensor] = None,
+    focus_auc_loss_weight: float = 0.0,
+    focus_auc_margin: float = 0.2,
+    base_loss: Optional[torch.Tensor] = None,
+    return_components: bool = False,
+):
+    """Compose the shared multi-disease objective used by fine-tuning and feedback."""
+    base = criterion(logits, targets) if base_loss is None else base_loss
+    total = base
+    zero = logits.sum() * 0.0
+    focus_bce = zero
+    focus_auc = zero
+    valid_focus = 0 <= int(focus_label_index) < logits.size(1)
+
+    if valid_focus and focus_loss_weight > 0:
+        focus_logits = logits[:, focus_label_index].float()
+        focus_targets = targets[:, focus_label_index].float()
+        focus_bce = F.binary_cross_entropy_with_logits(
+            focus_logits, focus_targets, pos_weight=focus_pos_weight
+        )
+        total = total + float(focus_loss_weight) * focus_bce
+
+    if valid_focus and focus_auc_loss_weight > 0:
+        focus_auc = pairwise_auc_margin_loss(
+            logits[:, focus_label_index].float(),
+            targets[:, focus_label_index].float(),
+            margin=focus_auc_margin,
+        )
+        total = total + float(focus_auc_loss_weight) * focus_auc
+
+    if not return_components:
+        return total
+    return total, {
+        "base": base,
+        "focus_bce": focus_bce,
+        "focus_auc": focus_auc,
+        "total": total,
+    }
+
+
 def train_epoch(model, dataloader, optimizer, criterion, device,
                 scheduler=None, sched_mode="epoch", is_dual=False,
                 distill_mode=False, ecg_encoder=None,
@@ -789,20 +866,18 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                     logits = model(x)
                     loss = criterion(logits, labels)
 
-        if multilabel and focus_loss_weight > 0 and 0 <= focus_label_index < logits.size(1):
-            focus_logits = logits[:, focus_label_index].float()
-            focus_labels = labels[:, focus_label_index].float()
-            focus_loss = F.binary_cross_entropy_with_logits(
-                focus_logits, focus_labels, pos_weight=focus_pos_weight
+        if multilabel:
+            loss = compute_multidisease_objective(
+                logits,
+                labels,
+                criterion,
+                focus_label_index=focus_label_index,
+                focus_loss_weight=focus_loss_weight,
+                focus_pos_weight=focus_pos_weight,
+                focus_auc_loss_weight=focus_auc_loss_weight,
+                focus_auc_margin=focus_auc_margin,
+                base_loss=loss,
             )
-            loss = loss + focus_loss_weight * focus_loss
-
-        if multilabel and focus_auc_loss_weight > 0 and 0 <= focus_label_index < logits.size(1):
-            auc_loss = pairwise_auc_margin_loss(
-                logits[:, focus_label_index].float(), labels[:, focus_label_index].float(),
-                margin=focus_auc_margin,
-            )
-            loss = loss + focus_auc_loss_weight * auc_loss
 
         optimizer.zero_grad(set_to_none=True)
         if not torch.isfinite(loss):

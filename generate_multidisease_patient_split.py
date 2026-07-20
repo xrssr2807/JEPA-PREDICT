@@ -13,6 +13,7 @@ from config import Config
 
 
 SPLIT_NAMES = ("train", "val", "test")
+TASKAWARE_SPLIT_NAMES = ("feedback_train", "feedback_meta", "val", "test")
 
 
 def uid_from_filename(filename: str) -> str:
@@ -24,8 +25,8 @@ def uid_from_filename(filename: str) -> str:
 
 def target_split_sizes(num_patients: int, ratios: Sequence[float]) -> np.ndarray:
     ratios = np.asarray(ratios, dtype=np.float64)
-    if ratios.shape != (3,) or np.any(ratios <= 0):
-        raise ValueError("ratios must contain three positive values")
+    if ratios.ndim != 1 or ratios.size < 2 or np.any(ratios <= 0):
+        raise ValueError("ratios must contain at least two positive values")
     ratios = ratios / ratios.sum()
     raw = ratios * num_patients
     sizes = np.floor(raw).astype(np.int64)
@@ -185,11 +186,15 @@ def build_manifest(
     ratios: Sequence[float],
     seed: int,
     label_validation: str,
+    split_names: Sequence[str] = SPLIT_NAMES,
 ) -> dict:
-    split_files = {name: [] for name in SPLIT_NAMES}
+    split_names = tuple(split_names)
+    if len(split_names) != len(ratios):
+        raise ValueError("split_names and ratios must have the same length")
+    split_files = {name: [] for name in split_names}
     split_patient_counts = {}
     split_label_counts = {}
-    for split_idx, split_name in enumerate(SPLIT_NAMES):
+    for split_idx, split_name in enumerate(split_names):
         patient_indices = np.flatnonzero(assignments == split_idx)
         split_patient_counts[split_name] = int(patient_indices.size)
         split_label_counts[split_name] = {
@@ -206,7 +211,7 @@ def build_manifest(
         "seed": int(seed),
         "label_validation": label_validation,
         "ratios": {
-            name: float(ratio) for name, ratio in zip(SPLIT_NAMES, ratios)
+            name: float(ratio) for name, ratio in zip(split_names, ratios)
         },
         "num_patients": len(uids),
         "num_files": int(sum(len(files) for files in patient_files.values())),
@@ -221,12 +226,17 @@ def build_manifest(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default=Config().data.multidisease_dir)
-    parser.add_argument(
-        "--output", default="splits/multidisease_patient_split.json"
-    )
+    parser.add_argument("--output", default=None)
     parser.add_argument("--train_ratio", type=float, default=0.70)
+    parser.add_argument("--feedback_train_ratio", type=float, default=0.55)
+    parser.add_argument("--feedback_meta_ratio", type=float, default=0.15)
     parser.add_argument("--val_ratio", type=float, default=0.15)
     parser.add_argument("--test_ratio", type=float, default=0.15)
+    parser.add_argument(
+        "--taskaware",
+        action="store_true",
+        help="Create feedback_train/feedback_meta/val/test patient splits",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument(
@@ -237,7 +247,19 @@ def main():
     args = parser.parse_args()
 
     config = Config()
-    ratios = (args.train_ratio, args.val_ratio, args.test_ratio)
+    if args.taskaware:
+        split_names = TASKAWARE_SPLIT_NAMES
+        ratios = (
+            args.feedback_train_ratio,
+            args.feedback_meta_ratio,
+            args.val_ratio,
+            args.test_ratio,
+        )
+        default_output = "splits/multidisease_taskaware_split.json"
+    else:
+        split_names = SPLIT_NAMES
+        ratios = (args.train_ratio, args.val_ratio, args.test_ratio)
+        default_output = "splits/multidisease_patient_split.json"
     patient_files = discover_patient_files(args.data_dir)
     uids, labels = load_patient_labels(
         args.data_dir,
@@ -256,9 +278,10 @@ def main():
         ratios,
         args.seed,
         "representative_segment" if args.representative_only else "all_segments",
+        split_names=split_names,
     )
 
-    output_path = os.path.abspath(args.output)
+    output_path = os.path.abspath(args.output or default_output)
     output_dir = os.path.dirname(output_path)
     os.makedirs(output_dir, exist_ok=True)
     temporary_path = f"{output_path}.tmp.{os.getpid()}"
