@@ -547,6 +547,8 @@ def train_taskaware(
 
     for epoch in range(start_epoch, config.train.taskaware_epochs):
         epoch_start = time.time()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         if continuing_phase2:
             transport_progress = 1.0
         else:
@@ -718,6 +720,16 @@ def train_taskaware(
             f"CHD={val_metrics['focus_auc']:.4f} score={score:.4f} | "
             f"Time={time.time() - epoch_start:.1f}s"
         )
+        if device.type == "cuda":
+            total_vram = torch.cuda.get_device_properties(device).total_memory
+            peak_allocated = torch.cuda.max_memory_allocated(device)
+            peak_reserved = torch.cuda.max_memory_reserved(device)
+            summary += (
+                f" | peak_alloc={peak_allocated / 2**30:.2f}GB"
+                f"({100.0 * peak_allocated / total_vram:.1f}%)"
+                f" peak_reserved={peak_reserved / 2**30:.2f}GB"
+                f"({100.0 * peak_reserved / total_vram:.1f}%)"
+            )
         print(summary)
         with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(summary + "\n")
@@ -769,6 +781,7 @@ def main():
     parser.add_argument("--output_dir", default="outputs_taskaware")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--pretrain_batch_size", type=int, default=None)
+    parser.add_argument("--accum_steps", type=int, default=None)
     parser.add_argument("--feedback_batch_size", type=int, default=None)
     parser.add_argument("--feedback_interval", type=int, default=None)
     parser.add_argument("--feedback_start_epoch", type=int, default=None)
@@ -789,6 +802,8 @@ def main():
         config.train.taskaware_epochs = max(1, args.epochs)
     if args.pretrain_batch_size is not None:
         config.train.phase2_batch_size = max(1, args.pretrain_batch_size)
+    if args.accum_steps is not None:
+        config.train.phase2_accum_steps = max(1, args.accum_steps)
     if args.feedback_batch_size is not None:
         config.train.taskaware_feedback_batch_size = max(2, args.feedback_batch_size)
     if args.feedback_interval is not None:

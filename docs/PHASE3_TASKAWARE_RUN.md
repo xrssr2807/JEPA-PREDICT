@@ -37,7 +37,8 @@ python -u train_taskaware_pretrain.py \
   --split splits/multidisease_taskaware_split.json \
   --output_dir outputs_taskaware_scratch \
   --epochs 80 \
-  --pretrain_batch_size 128 \
+  --pretrain_batch_size 192 \
+  --accum_steps 2 \
   --feedback_batch_size 8 \
   --feedback_segments 4 \
   --feedback_start_epoch 5 \
@@ -72,7 +73,7 @@ python -u train_taskaware_pretrain.py \
   2>&1 | tee outputs_taskaware/console.log
 ```
 
-24 GB 显存不足时，先将 `--pretrain_batch_size` 降到 96 或 64，再将 `--feedback_batch_size` 降到 4。不要先减少 `feedback_segments`，患者级多片段信息对 CHD 更重要。
+24 GB GPU 建议从 `--pretrain_batch_size 192 --accum_steps 2` 开始，有效 batch 仍为 384。若发生 OOM，依次将微批次降到 176、160；不要用无效占位张量制造显存利用率，也不要先减少 `feedback_segments`，患者级多片段信息对 CHD 更重要。每个 epoch 日志会输出 `peak_alloc` 和 `peak_reserved` 的真实峰值及比例。
 
 ## 4. 恢复训练
 
