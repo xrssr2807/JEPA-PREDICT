@@ -159,11 +159,24 @@ class Phase2JEPATests(unittest.TestCase):
             "monotonic",
             "delay_smoothness",
             "match_mass",
+            "variance",
+            "covariance",
             "total",
         ):
             self.assertIn(key, components)
             self.assertTrue(torch.is_tensor(components[key]))
             self.assertTrue(torch.isfinite(components[key]))
+
+    def test_variance_regularizer_penalizes_collapsed_embeddings(self):
+        collapsed = torch.zeros(8, 16)
+        diverse = torch.randn(8, 16)
+        collapsed_loss, _ = self._tiny_model()._variance_covariance_regularization(
+            (collapsed,), target_std=0.1
+        )
+        diverse_loss, _ = self._tiny_model()._variance_covariance_regularization(
+            (diverse,), target_std=0.1
+        )
+        self.assertGreater(collapsed_loss.item(), diverse_loss.item())
 
     def test_low_match_mass_has_finite_amp_scaled_gradients(self):
         """A confident dustbin prediction must not create 1/mass gradients."""

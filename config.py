@@ -91,6 +91,9 @@ class ModelConfig:
     phase2_delay_smoothness_weight: float = 0.01
     phase2_match_mass_weight: float = 0.01
     phase2_target_match_mass: float = 0.95
+    phase2_variance_weight: float = 0.10
+    phase2_covariance_weight: float = 0.01
+    phase2_target_std: float = 0.10
     phase2_use_stats_loss: bool = False
 
     # Input

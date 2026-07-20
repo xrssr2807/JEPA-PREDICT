@@ -239,6 +239,9 @@ def build_model(model_config: ModelConfig) -> JEPA:
         ),
         phase2_match_mass_weight=model_config.phase2_match_mass_weight,
         phase2_target_match_mass=model_config.phase2_target_match_mass,
+        phase2_variance_weight=model_config.phase2_variance_weight,
+        phase2_covariance_weight=model_config.phase2_covariance_weight,
+        phase2_target_std=model_config.phase2_target_std,
     )
 
 
@@ -377,6 +380,9 @@ def _phase_checkpoint_metadata(model, config: Config) -> dict:
             "min_delay_ms": float(config.model.phase2_min_delay_ms),
             "max_delay_ms": float(config.model.phase2_max_delay_ms),
             "delay_prior_ms": float(config.model.phase2_delay_prior_ms),
+            "variance_weight": float(config.model.phase2_variance_weight),
+            "covariance_weight": float(config.model.phase2_covariance_weight),
+            "target_std": float(config.model.phase2_target_std),
             "transport_start_epoch": int(
                 config.train.phase2_transport_start_epoch
             ),

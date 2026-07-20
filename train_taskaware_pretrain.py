@@ -261,19 +261,27 @@ def _feedback_step(
         enabled=bool(use_amp and device.type == "cuda"),
     ):
         logits = feedback_model(signals)
-        loss, components = compute_multidisease_objective(
-            logits,
-            labels,
-            criterion,
-            focus_label_index=config.train.chd_label_index,
-            focus_loss_weight=config.train.chd_focus_loss_weight,
-            focus_pos_weight=focus_pos_weight,
-            focus_auc_loss_weight=config.train.chd_auc_loss_weight,
-            focus_auc_margin=config.train.chd_auc_margin,
-            return_components=True,
-        )
+    loss, components = compute_multidisease_objective(
+        logits.float(),
+        labels.float(),
+        criterion,
+        focus_label_index=config.train.chd_label_index,
+        focus_loss_weight=config.train.chd_focus_loss_weight,
+        focus_pos_weight=focus_pos_weight,
+        focus_auc_loss_weight=config.train.chd_auc_loss_weight,
+        focus_auc_margin=config.train.chd_auc_margin,
+        return_components=True,
+    )
     if not torch.isfinite(loss):
-        raise FloatingPointError(f"Non-finite feedback loss at step {feedback_step}")
+        old_scale = float(scaler.get_scale())
+        scaler.update(new_scale=max(1.0, old_scale / 2.0))
+        pretrain_optimizer.zero_grad(set_to_none=True)
+        head_optimizer.zero_grad(set_to_none=True)
+        print(
+            f"[FeedbackSkip] non-finite loss at step={feedback_step}; "
+            f"scale={old_scale:.0f}->{scaler.get_scale():.0f}"
+        )
+        return {"loss": 0.0, "skipped": 1.0}
     scaler.scale(loss).backward()
     scaler.unscale_(head_optimizer)
 
@@ -291,17 +299,36 @@ def _feedback_step(
         budget = config.train.taskaware_feedback_encoder_grad_ratio * reference
         applied_scale = min(1.0, budget / max(encoder_grad_norm, 1e-8))
         _scale_gradients(shared_parameters, applied_scale)
-        torch.nn.utils.clip_grad_norm_(
-            shared_parameters,
-            config.train.taskaware_feedback_grad_clip,
-            error_if_nonfinite=True,
-        )
-
-    torch.nn.utils.clip_grad_norm_(
+    head_grad_norm = torch.nn.utils.clip_grad_norm_(
         head_parameters,
         config.train.taskaware_feedback_grad_clip,
-        error_if_nonfinite=True,
+        error_if_nonfinite=False,
     )
+    if not warmup:
+        encoder_grad_after_scale = torch.nn.utils.clip_grad_norm_(
+            shared_parameters,
+            config.train.taskaware_feedback_grad_clip,
+            error_if_nonfinite=False,
+        )
+    else:
+        encoder_grad_after_scale = torch.zeros((), device=device)
+    gradients_finite = bool(
+        torch.isfinite(head_grad_norm) and torch.isfinite(encoder_grad_after_scale)
+    )
+    if not gradients_finite:
+        old_scale = float(scaler.get_scale())
+        scaler.update(new_scale=max(1.0, old_scale / 2.0))
+        pretrain_optimizer.zero_grad(set_to_none=True)
+        head_optimizer.zero_grad(set_to_none=True)
+        print(
+            f"[FeedbackSkip] non-finite gradient at step={feedback_step}; "
+            f"scale={old_scale:.0f}->{scaler.get_scale():.0f}"
+        )
+        return {
+            "loss": float(loss.item()),
+            "skipped": 1.0,
+            "head_warmup": float(warmup),
+        }
     if not warmup:
         scaler.step(pretrain_optimizer)
     scaler.step(head_optimizer)
@@ -318,6 +345,7 @@ def _feedback_step(
         "encoder_grad_norm": encoder_grad_norm,
         "encoder_grad_scale": applied_scale,
         "head_warmup": float(warmup),
+        "skipped": 0.0,
     }
 
 
@@ -657,7 +685,8 @@ def train_taskaware(
                     ema_momentum,
                     use_amp,
                 )
-                feedback_step += 1
+                if values.get("skipped", 0.0) < 0.5:
+                    feedback_step += 1
                 feedback_updates += 1
                 for key, value in values.items():
                     feedback_totals[key] += float(value)
@@ -665,7 +694,9 @@ def train_taskaware(
             if batch_index % 100 == 0:
                 print(
                     f"Epoch {epoch:3d} | Batch {batch_index:4d}/{len(pretrain_loader)} | "
-                    f"JEPA={loss.item():.6f} | feedback_steps={feedback_step} | "
+                    f"Total={loss.item():.6f} token={info.get('jepa', 0.0):.6f} "
+                    f"var={info.get('variance', 0.0):.5f} | "
+                    f"feedback_steps={feedback_step} | "
                     f"pre_grad_ema={pretrain_grad_ema:.4f} | "
                     f"lr={scheduler.get_last_lr()[0]:.2e}"
                 )
@@ -711,7 +742,9 @@ def train_taskaware(
         )
         healthy = _representation_is_healthy(pretrain_metrics)
         summary = (
-            f"Epoch {epoch:3d} | Train JEPA={train_metrics.get('total_loss', 0.0):.6f} "
+            f"Epoch {epoch:3d} | Train total={train_metrics.get('total_loss', 0.0):.6f} "
+            f"token={train_metrics.get('jepa', 0.0):.6f} "
+            f"var={train_metrics.get('variance', 0.0):.5f} "
             f"feedback={feedback_train_metrics.get('loss', 0.0):.6f} | "
             f"transport={transport_progress:.3f} "
             f"PreVal={pretrain_metrics.get('total_loss', 0.0):.6f} "

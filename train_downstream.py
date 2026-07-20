@@ -864,7 +864,10 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                     enabled=bool(use_amp and device.type == "cuda"),
                 ):
                     logits = model(x)
-                    loss = criterion(logits, labels)
+                loss = criterion(
+                    logits.float() if multilabel else logits,
+                    labels.float() if multilabel else labels,
+                )
 
         if multilabel:
             loss = compute_multidisease_objective(
@@ -1082,7 +1085,7 @@ def evaluate_multilabel(model, dataloader, criterion, device,
             enabled=bool(use_amp and device.type == "cuda"),
         ):
             logits = model(x)
-            loss = criterion(logits, labels)
+        loss = criterion(logits.float(), labels.float())
         running_loss += loss.item()
 
         if aggregate_by_uid and uids is not None:

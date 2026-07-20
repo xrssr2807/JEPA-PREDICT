@@ -302,6 +302,9 @@ class JEPA(nn.Module):
         phase2_delay_smoothness_weight: float = 0.01,
         phase2_match_mass_weight: float = 0.01,
         phase2_target_match_mass: float = 0.95,
+        phase2_variance_weight: float = 0.10,
+        phase2_covariance_weight: float = 0.01,
+        phase2_target_std: float = 0.10,
         use_se: bool = False,
         use_inception: bool = False,
     ):
@@ -400,6 +403,8 @@ class JEPA(nn.Module):
                     raise ValueError(
                         "phase2_target_match_mass must be in the interval (0, 1]"
                     )
+                if phase2_target_std <= 0:
+                    raise ValueError("phase2_target_std must be positive")
                 encoder_stride = math.prod(cnn_strides)
                 token_ms = 1000.0 * encoder_stride / phase2_sample_rate_hz
                 min_delay_tokens = max(
@@ -436,6 +441,9 @@ class JEPA(nn.Module):
                 )
                 self.phase2_match_mass_weight = float(phase2_match_mass_weight)
                 self.phase2_target_match_mass = float(phase2_target_match_mass)
+                self.phase2_variance_weight = float(phase2_variance_weight)
+                self.phase2_covariance_weight = float(phase2_covariance_weight)
+                self.phase2_target_std = float(phase2_target_std)
                 self.phase2_progress = 0.0
 
     # ── New: Statistics Prediction Head ──
@@ -990,6 +998,32 @@ class JEPA(nn.Module):
         }
 
     @staticmethod
+    def _variance_covariance_regularization(embeddings, target_std: float):
+        """VICReg-style anti-collapse regularization across independent samples."""
+        variance_losses = []
+        covariance_losses = []
+        for embedding in embeddings:
+            values = embedding.float()
+            std = torch.sqrt(values.var(dim=0, unbiased=False) + 1e-4)
+            variance_losses.append(F.relu(float(target_std) - std).mean())
+            if values.size(0) > 1:
+                centered = values - values.mean(dim=0, keepdim=True)
+                covariance = centered.T @ centered / (values.size(0) - 1)
+                off_diagonal = covariance - torch.diag_embed(
+                    torch.diagonal(covariance)
+                )
+                covariance_losses.append(
+                    off_diagonal.square().sum() / max(1, values.size(1))
+                )
+        variance_loss = torch.stack(variance_losses).mean()
+        covariance_loss = (
+            torch.stack(covariance_losses).mean()
+            if covariance_losses
+            else variance_loss * 0.0
+        )
+        return variance_loss, covariance_loss
+
+    @staticmethod
     def _add_embedding_diagnostics(
         info: dict,
         embeddings,
@@ -1200,7 +1234,18 @@ class JEPA(nn.Module):
             + progress * self.phase2_transport_loss_weight * transport_jepa
         )
         regularizers = self._phase2_transport_regularizers(transport_state)
+        variance_loss, covariance_loss = self._variance_covariance_regularization(
+            (
+                ecg_pooled,
+                ppg_pooled,
+                ecg_online_tokens.mean(dim=1),
+                ppg_online_tokens.mean(dim=1),
+            ),
+            self.phase2_target_std,
+        )
         total_loss = self.phase1_token_loss_weight * token_jepa
+        total_loss = total_loss + self.phase2_variance_weight * variance_loss
+        total_loss = total_loss + self.phase2_covariance_weight * covariance_loss
         total_loss = total_loss + progress * (
             self.phase2_delay_prior_weight * regularizers["delay_prior_loss"]
             + self.phase2_monotonic_weight * regularizers["monotonic_loss"]
@@ -1226,6 +1271,8 @@ class JEPA(nn.Module):
             "monotonic": regularizers["monotonic_loss"].item(),
             "delay_smoothness": regularizers["delay_smoothness_loss"].item(),
             "match_mass_loss": regularizers["match_mass_loss"].item(),
+            "variance": variance_loss.item(),
+            "covariance": covariance_loss.item(),
             "delay_mean_ms": regularizers["delay_mean_ms"].item(),
             "delay_std_ms": regularizers["delay_std_ms"].item(),
             "transport_entropy": regularizers["transport_entropy"].item(),
@@ -1266,6 +1313,8 @@ class JEPA(nn.Module):
             "monotonic": regularizers["monotonic_loss"],
             "delay_smoothness": regularizers["delay_smoothness_loss"],
             "match_mass": regularizers["match_mass_loss"],
+            "variance": variance_loss,
+            "covariance": covariance_loss,
             "stats": stats_loss,
             "total": total_loss,
         }
