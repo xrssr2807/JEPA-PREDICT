@@ -205,6 +205,10 @@ class TrainConfig:
     phase2_use_amp: bool = True
     phase2_transport_start_epoch: int = 10
     phase2_transport_ramp_epochs: int = 20
+    # Count only full-transport, healthy validation epochs. A decrease smaller
+    # than min_delta is treated as a plateau rather than a meaningful gain.
+    phase2_early_stop_patience: int = 15
+    phase2_early_stop_min_delta: float = 1e-4
     pretrain_dataloader_workers: int = 8
     pretrain_prefetch_factor: int = 4
 

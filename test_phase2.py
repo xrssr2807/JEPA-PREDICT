@@ -7,6 +7,7 @@ from models.jepa import JEPA
 from train_downstream import _select_pretrained_encoder_state
 from train_pretrain import (
     _checkpoint_is_eligible,
+    _early_stopping_step,
     _encoder_checkpoint_payload,
     phase2_transport_progress,
 )
@@ -58,6 +59,21 @@ class Phase2JEPATests(unittest.TestCase):
         self.assertFalse(_checkpoint_is_eligible(healthy, 2, 0.95))
         self.assertTrue(_checkpoint_is_eligible(healthy, 2, 1.0))
         self.assertTrue(_checkpoint_is_eligible(healthy, 1, 0.0))
+
+    def test_early_stopping_requires_meaningful_validation_decrease(self):
+        best, bad_epochs, improved = _early_stopping_step(
+            0.0300, 4, 0.02995, 1e-4
+        )
+        self.assertFalse(improved)
+        self.assertEqual(best, 0.0300)
+        self.assertEqual(bad_epochs, 5)
+
+        best, bad_epochs, improved = _early_stopping_step(
+            best, bad_epochs, 0.0298, 1e-4
+        )
+        self.assertTrue(improved)
+        self.assertEqual(best, 0.0298)
+        self.assertEqual(bad_epochs, 0)
 
     def test_delay_bins_retain_physical_time_scale(self):
         model = self._tiny_model()

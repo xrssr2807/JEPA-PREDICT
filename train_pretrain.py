@@ -346,6 +346,18 @@ def _checkpoint_is_eligible(
     return objective_ready and _representation_is_healthy(metrics)
 
 
+def _early_stopping_step(
+    best_loss: float,
+    bad_epochs: int,
+    current_loss: float,
+    min_delta: float,
+):
+    """Update validation plateau state using an absolute improvement margin."""
+    if current_loss < best_loss - min_delta:
+        return current_loss, 0, True
+    return best_loss, bad_epochs + 1, False
+
+
 def _save_checkpoint(payload, path):
     """Atomically replace a checkpoint so interruptions cannot corrupt it."""
     tmp_path = path + ".tmp"
@@ -493,6 +505,8 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
 
     # ── Resume logic ──
     resume_best_loss = float("inf")
+    early_stop_best_loss = float("inf")
+    early_stop_bad_epochs = 0
     if resume_from is not None:
         print(f"[Resume] Loading checkpoint: {resume_from}")
         ckpt = torch.load(resume_from, map_location=device, weights_only=False)
@@ -534,6 +548,10 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                 "[Resume] Reset best validation loss because this checkpoint "
                 "predates collapse-aware selection"
             )
+        early_stop_best_loss = float(
+            ckpt.get("early_stop_best_loss", resume_best_loss)
+        )
+        early_stop_bad_epochs = int(ckpt.get("early_stop_bad_epochs", 0))
         model._enforce_teacher_eval()
         print(f"[Resume] Continuing from epoch {start_epoch}")
 
@@ -817,6 +835,7 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
         checkpoint_eligible = _checkpoint_is_eligible(
             val_metrics, phase, transport_progress
         )
+        should_early_stop = False
         if val_metrics is not None and not checkpoint_eligible:
             if phase == 2 and transport_progress < 1.0 - 1e-8:
                 print(
@@ -828,6 +847,41 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                     "[CheckpointSkip] Validation representation is collapsed; "
                     "not eligible for jepa_best.pt"
                 )
+        if (
+            phase == 2
+            and current_val_loss is not None
+            and checkpoint_eligible
+            and config.train.phase2_early_stop_patience > 0
+        ):
+            (
+                early_stop_best_loss,
+                early_stop_bad_epochs,
+                meaningful_improvement,
+            ) = _early_stopping_step(
+                early_stop_best_loss,
+                early_stop_bad_epochs,
+                current_val_loss,
+                config.train.phase2_early_stop_min_delta,
+            )
+            if meaningful_improvement:
+                print(
+                    "[EarlyStop] Meaningful validation improvement: "
+                    f"best={early_stop_best_loss:.6f} "
+                    f"min_delta={config.train.phase2_early_stop_min_delta:.1e}"
+                )
+            else:
+                print(
+                    "[EarlyStop] No meaningful validation improvement: "
+                    f"{early_stop_bad_epochs}/"
+                    f"{config.train.phase2_early_stop_patience} "
+                    f"(best={early_stop_best_loss:.6f}, "
+                    f"current={current_val_loss:.6f}, "
+                    f"min_delta={config.train.phase2_early_stop_min_delta:.1e})"
+                )
+            should_early_stop = (
+                early_stop_bad_epochs
+                >= config.train.phase2_early_stop_patience
+            )
         if (
             current_val_loss is not None
             and checkpoint_eligible
@@ -849,6 +903,8 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                     "val_metrics": val_metrics,
                     "best_val_loss": best_loss,
                     "best_checkpoint_eligible": True,
+                    "early_stop_best_loss": early_stop_best_loss,
+                    "early_stop_bad_epochs": early_stop_bad_epochs,
                     "seed": config.seed,
                     "train_segments": len(train_loader.dataset),
                     "val_segments": len(val_loader.dataset),
@@ -873,6 +929,8 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                 "val_metrics": val_metrics,
                 "best_val_loss": best_loss,
                 "best_checkpoint_eligible": checkpoint_eligible,
+                "early_stop_best_loss": early_stop_best_loss,
+                "early_stop_bad_epochs": early_stop_bad_epochs,
                 "seed": config.seed,
             },
             last_path,
@@ -893,10 +951,26 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                     "val_metrics": val_metrics,
                     "best_val_loss": best_loss,
                     "best_checkpoint_eligible": checkpoint_eligible,
+                    "early_stop_best_loss": early_stop_best_loss,
+                    "early_stop_bad_epochs": early_stop_bad_epochs,
                     "seed": config.seed,
                 },
                 ckpt_path,
             )
+
+        if should_early_stop:
+            stop_message = (
+                "[EarlyStop] Phase 2 stopped after "
+                f"{early_stop_bad_epochs} consecutive eligible validation epochs "
+                "without a meaningful loss decrease. "
+                f"Best={early_stop_best_loss:.6f}, "
+                f"min_delta={config.train.phase2_early_stop_min_delta:.1e}. "
+                f"Last checkpoint: {last_path}"
+            )
+            print(stop_message)
+            with open(log_file, "a") as f:
+                f.write(stop_message + "\n")
+            break
 
     print("Pre-training complete.")
     return model
@@ -1107,6 +1181,14 @@ if __name__ == "__main__":
         "--transport_ramp_epochs", type=int, default=None,
         help="Phase 2 epochs used to ramp transport from 0 to 1",
     )
+    parser.add_argument(
+        "--early_stop_patience", type=int, default=None,
+        help="Phase 2 eligible validation epochs without meaningful improvement",
+    )
+    parser.add_argument(
+        "--early_stop_min_delta", type=float, default=None,
+        help="Minimum absolute Phase 2 validation-loss decrease",
+    )
     parser.add_argument("--token_align", type=str, default=None,
                         help="Token 对齐续训练: --token_align outputs/jepa_best.pt")
     args = parser.parse_args()
@@ -1141,10 +1223,18 @@ if __name__ == "__main__":
             config.train.phase2_transport_start_epoch = args.transport_start_epoch
         if args.transport_ramp_epochs is not None:
             config.train.phase2_transport_ramp_epochs = args.transport_ramp_epochs
+        if args.early_stop_patience is not None:
+            config.train.phase2_early_stop_patience = args.early_stop_patience
+        if args.early_stop_min_delta is not None:
+            config.train.phase2_early_stop_min_delta = args.early_stop_min_delta
         if config.train.phase2_transport_start_epoch < 0:
             parser.error("--transport_start_epoch must be >= 0")
         if config.train.phase2_transport_ramp_epochs < 1:
             parser.error("--transport_ramp_epochs must be >= 1")
+        if config.train.phase2_early_stop_patience < 0:
+            parser.error("--early_stop_patience must be >= 0")
+        if config.train.phase2_early_stop_min_delta < 0:
+            parser.error("--early_stop_min_delta must be >= 0")
     elif config.model.pretrain_phase == 1:
         if args.batch_size is not None:
             config.train.phase1_batch_size = args.batch_size
