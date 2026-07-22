@@ -709,6 +709,7 @@ class MultiDiseasePatientMILDataset(Dataset):
         segments: (S, C, L)
         labels:   (num_labels,)
         uid:      str
+        mask:     (S,), True for real segments and False for padding
     """
 
     def __init__(
@@ -762,7 +763,7 @@ class MultiDiseasePatientMILDataset(Dataset):
     def __len__(self) -> int:
         return len(self.uids)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str, torch.Tensor]:
         uid = self.uids[idx]
         indices = self.uid_to_indices[uid]
         if len(indices) >= self.max_segments:
@@ -771,12 +772,15 @@ class MultiDiseasePatientMILDataset(Dataset):
             else:
                 chosen = np.linspace(0, len(indices) - 1, self.max_segments).round().astype(int)
                 chosen = [indices[i] for i in chosen]
+            valid_count = self.max_segments
         else:
+            # Repeating a short patient's segments makes MIL attention treat
+            # duplicated evidence as independent observations. Keep each real
+            # segment once and pad the rest; the returned mask excludes padding.
+            chosen = list(indices)
             if self.train:
-                chosen = np.random.choice(indices, self.max_segments, replace=True)
-            else:
-                repeats = int(np.ceil(self.max_segments / len(indices)))
-                chosen = (indices * repeats)[:self.max_segments]
+                chosen = list(np.random.permutation(chosen))
+            valid_count = len(chosen)
 
         segments = []
         label = None
@@ -785,4 +789,11 @@ class MultiDiseasePatientMILDataset(Dataset):
             segments.append(x)
             if label is None:
                 label = y
-        return torch.stack(segments, dim=0), label, uid
+
+        if valid_count < self.max_segments:
+            padding = [torch.zeros_like(segments[0]) for _ in range(self.max_segments - valid_count)]
+            segments.extend(padding)
+
+        segment_mask = torch.zeros(self.max_segments, dtype=torch.bool)
+        segment_mask[:valid_count] = True
+        return torch.stack(segments, dim=0), label, uid, segment_mask

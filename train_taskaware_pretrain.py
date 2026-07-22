@@ -250,7 +250,10 @@ def _feedback_step(
         feedback_model.ppg_encoder.eval()
     pretrain_optimizer.zero_grad(set_to_none=True)
     head_optimizer.zero_grad(set_to_none=True)
-    signals, labels, *_ = batch
+    signals, labels, *rest = batch
+    segment_mask = None
+    if len(rest) >= 2 and torch.is_tensor(rest[1]):
+        segment_mask = rest[1].to(device, non_blocking=True, dtype=torch.bool)
     signals = torch.nan_to_num(
         signals.to(device, non_blocking=True), nan=0.0, posinf=10.0, neginf=-10.0
     )
@@ -260,7 +263,7 @@ def _feedback_step(
         dtype=torch.float16,
         enabled=bool(use_amp and device.type == "cuda"),
     ):
-        logits = feedback_model(signals)
+        logits = feedback_model(signals, segment_mask=segment_mask)
     loss, components = compute_multidisease_objective(
         logits.float(),
         labels.float(),

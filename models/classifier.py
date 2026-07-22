@@ -580,12 +580,82 @@ class DiseaseConditionedMILHead(nn.Module):
         self.bias = nn.Parameter(torch.zeros(num_classes))
         nn.init.xavier_uniform_(self.weight)
 
-    def forward(self, segment_repr: torch.Tensor):
-        attention = torch.softmax(self.attention(segment_repr), dim=1)
+    @staticmethod
+    def _masked_attention(scores: torch.Tensor, segment_mask: torch.Tensor = None):
+        if segment_mask is not None:
+            if segment_mask.shape != scores.shape[:2]:
+                raise ValueError(
+                    f"segment_mask must have shape {tuple(scores.shape[:2])}, "
+                    f"got {tuple(segment_mask.shape)}"
+                )
+            mask = segment_mask.to(device=scores.device, dtype=torch.bool).unsqueeze(-1)
+            if not torch.all(mask.any(dim=1)):
+                raise ValueError("Every patient bag must contain at least one valid segment")
+            scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+        return torch.softmax(scores, dim=1)
+
+    def forward(self, segment_repr: torch.Tensor, segment_mask: torch.Tensor = None):
+        attention = self._masked_attention(self.attention(segment_repr), segment_mask)
         patient_repr = torch.einsum("bsk,bsd->bkd", attention, segment_repr)
         patient_repr = self.dropout(self.norm(patient_repr))
         logits = torch.einsum("bkd,kd->bk", patient_repr, self.weight) + self.bias
         return logits, patient_repr, attention
+
+
+class DiseaseConditionedModalityMILHead(nn.Module):
+    """Per-disease temporal attention followed by per-disease ECG/PPG fusion."""
+
+    def __init__(self, dim: int, num_classes: int, dropout: float):
+        super().__init__()
+        hidden = max(dim // 2, 1)
+        self.ecg_attention = nn.Sequential(
+            nn.Linear(dim, hidden), nn.Tanh(), nn.Linear(hidden, num_classes),
+        )
+        self.ppg_attention = nn.Sequential(
+            nn.Linear(dim, hidden), nn.Tanh(), nn.Linear(hidden, num_classes),
+        )
+        self.disease_embedding = nn.Parameter(torch.empty(num_classes, dim))
+        self.modality_gate = nn.Sequential(
+            nn.Linear(dim * 3, dim), nn.GELU(), nn.Linear(dim, dim),
+        )
+        self.interaction = nn.Sequential(
+            nn.Linear(dim * 2, dim), nn.GELU(), nn.Dropout(dropout),
+        )
+        self.norm = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(dropout)
+        self.weight = nn.Parameter(torch.empty(num_classes, dim))
+        self.bias = nn.Parameter(torch.zeros(num_classes))
+        nn.init.normal_(self.disease_embedding, std=0.02)
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(
+        self,
+        ecg_segment_repr: torch.Tensor,
+        ppg_segment_repr: torch.Tensor,
+        segment_mask: torch.Tensor = None,
+    ):
+        ecg_attention = DiseaseConditionedMILHead._masked_attention(
+            self.ecg_attention(ecg_segment_repr), segment_mask,
+        )
+        ppg_attention = DiseaseConditionedMILHead._masked_attention(
+            self.ppg_attention(ppg_segment_repr), segment_mask,
+        )
+        ecg_patient = torch.einsum("bsk,bsd->bkd", ecg_attention, ecg_segment_repr)
+        ppg_patient = torch.einsum("bsk,bsd->bkd", ppg_attention, ppg_segment_repr)
+
+        disease = self.disease_embedding.unsqueeze(0).expand(ecg_patient.size(0), -1, -1)
+        gate = torch.sigmoid(self.modality_gate(torch.cat([
+            ecg_patient, ppg_patient, disease,
+        ], dim=-1)))
+        cross = self.interaction(torch.cat([
+            torch.abs(ecg_patient - ppg_patient), ecg_patient * ppg_patient,
+        ], dim=-1))
+        patient_repr = self.dropout(self.norm(
+            gate * ecg_patient + (1.0 - gate) * ppg_patient + cross
+        ))
+        logits = torch.einsum("bkd,kd->bk", patient_repr, self.weight) + self.bias
+        attention = 0.5 * (ecg_attention + ppg_attention)
+        return logits, patient_repr, attention, gate
 
 
 class PatientMILClassifier(nn.Module):
@@ -605,11 +675,13 @@ class PatientMILClassifier(nn.Module):
         use_multiscale: bool = True,
         dropout: float = 0.3,
         encoder_chunk_size: int = 0,
+        input_channel: int = None,
     ):
         super().__init__()
         self.encoder = encoder
         self.use_multiscale = use_multiscale
         self.encoder_chunk_size = int(encoder_chunk_size or 0)
+        self.input_channel = None if input_channel is None else int(input_channel)
 
         rep_dim = encoder_dim * 3 if use_multiscale else encoder_dim
         self.temporal_pyramid = TemporalPyramidPool(encoder_dim) if use_multiscale else None
@@ -649,15 +721,27 @@ class PatientMILClassifier(nn.Module):
                 reps.append(segment_repr)
         return torch.cat(reps, dim=0)
 
-    def forward(self, x: torch.Tensor, return_embedding: bool = False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_embedding: bool = False,
+        segment_mask: torch.Tensor = None,
+    ):
         if x.dim() != 4:
             raise ValueError(f"PatientMILClassifier expects (B,S,C,L), got {tuple(x.shape)}")
         B, S, C, L = x.shape
+        if self.input_channel is not None:
+            if not 0 <= self.input_channel < C:
+                raise ValueError(
+                    f"input_channel={self.input_channel} is invalid for {C} input channels"
+                )
+            x = x[:, :, self.input_channel:self.input_channel + 1]
+            C = 1
         flat = x.reshape(B * S, C, L)
         segment_repr = self._encode_flat(flat)
 
         segment_repr = self.segment_proj(segment_repr).reshape(B, S, -1)
-        logits, patient_repr, _ = self.mil_head(segment_repr)
+        logits, patient_repr, _ = self.mil_head(segment_repr, segment_mask=segment_mask)
 
         if return_embedding:
             return logits, patient_repr.mean(dim=1)
@@ -671,7 +755,8 @@ class DualStreamPatientMILClassifier(nn.Module):
                  encoder_dim: int = 512, num_classes: int = 9,
                  use_multiscale: bool = True, dropout: float = 0.3,
                  encoder_chunk_size: int = 0, ppg_channel: int = 0,
-                 ecg_channel: int = 1):
+                 ecg_channel: int = 1,
+                 disease_conditioned_fusion: bool = True):
         super().__init__()
         self.ecg_encoder = ecg_encoder
         self.ppg_encoder = ppg_encoder
@@ -679,20 +764,27 @@ class DualStreamPatientMILClassifier(nn.Module):
         self.encoder_chunk_size = int(encoder_chunk_size or 0)
         self.ppg_channel = int(ppg_channel)
         self.ecg_channel = int(ecg_channel)
+        self.disease_conditioned_fusion = bool(disease_conditioned_fusion)
 
         rep_dim = encoder_dim * 3 if use_multiscale else encoder_dim
         self.ecg_pyramid = TemporalPyramidPool(encoder_dim) if use_multiscale else None
         self.ppg_pyramid = TemporalPyramidPool(encoder_dim) if use_multiscale else None
         self.ecg_proj = nn.Sequential(nn.Linear(rep_dim, encoder_dim), nn.LayerNorm(encoder_dim))
         self.ppg_proj = nn.Sequential(nn.Linear(rep_dim, encoder_dim), nn.LayerNorm(encoder_dim))
-        self.modality_gate = nn.Linear(encoder_dim * 2, encoder_dim)
-        self.interaction = nn.Sequential(
-            nn.Linear(encoder_dim * 2, encoder_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-        self.segment_norm = nn.LayerNorm(encoder_dim)
-        self.mil_head = DiseaseConditionedMILHead(encoder_dim, num_classes, dropout)
+        if self.disease_conditioned_fusion:
+            self.modality_mil_head = DiseaseConditionedModalityMILHead(
+                encoder_dim, num_classes, dropout,
+            )
+        else:
+            # Legacy branch retained so historical downstream teachers remain loadable.
+            self.modality_gate = nn.Linear(encoder_dim * 2, encoder_dim)
+            self.interaction = nn.Sequential(
+                nn.Linear(encoder_dim * 2, encoder_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            self.segment_norm = nn.LayerNorm(encoder_dim)
+            self.mil_head = DiseaseConditionedMILHead(encoder_dim, num_classes, dropout)
 
     def freeze_encoder(self):
         for encoder in (self.ecg_encoder, self.ppg_encoder):
@@ -738,7 +830,12 @@ class DualStreamPatientMILClassifier(nn.Module):
             ppg_reps.append(self._encode_one(self.ppg_encoder, self.ppg_pyramid, ppg))
         return torch.cat(ecg_reps, dim=0), torch.cat(ppg_reps, dim=0)
 
-    def forward(self, x: torch.Tensor, return_embedding: bool = False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_embedding: bool = False,
+        segment_mask: torch.Tensor = None,
+    ):
         if x.dim() != 4:
             raise ValueError(
                 f"DualStreamPatientMILClassifier expects (B,S,C,L), got {tuple(x.shape)}"
@@ -749,15 +846,25 @@ class DualStreamPatientMILClassifier(nn.Module):
             raise ValueError(f"Expected at least {required_channels} channels, got {C}")
 
         ecg_repr, ppg_repr = self._encode_flat(x.reshape(B * S, C, L))
-        ecg_repr = self.ecg_proj(ecg_repr)
-        ppg_repr = self.ppg_proj(ppg_repr)
-        gate = torch.sigmoid(self.modality_gate(torch.cat([ecg_repr, ppg_repr], dim=-1)))
-        cross = self.interaction(torch.cat([
-            torch.abs(ecg_repr - ppg_repr), ecg_repr * ppg_repr,
-        ], dim=-1))
-        segment_repr = self.segment_norm(gate * ecg_repr + (1.0 - gate) * ppg_repr + cross)
-        segment_repr = segment_repr.reshape(B, S, -1)
-        logits, patient_repr, _ = self.mil_head(segment_repr)
+        ecg_repr = self.ecg_proj(ecg_repr).reshape(B, S, -1)
+        ppg_repr = self.ppg_proj(ppg_repr).reshape(B, S, -1)
+        if self.disease_conditioned_fusion:
+            logits, patient_repr, _, _ = self.modality_mil_head(
+                ecg_repr, ppg_repr, segment_mask=segment_mask,
+            )
+        else:
+            flat_ecg = ecg_repr.reshape(B * S, -1)
+            flat_ppg = ppg_repr.reshape(B * S, -1)
+            gate = torch.sigmoid(self.modality_gate(torch.cat([flat_ecg, flat_ppg], dim=-1)))
+            cross = self.interaction(torch.cat([
+                torch.abs(flat_ecg - flat_ppg), flat_ecg * flat_ppg,
+            ], dim=-1))
+            segment_repr = self.segment_norm(
+                gate * flat_ecg + (1.0 - gate) * flat_ppg + cross
+            ).reshape(B, S, -1)
+            logits, patient_repr, _ = self.mil_head(
+                segment_repr, segment_mask=segment_mask,
+            )
         if return_embedding:
             return logits, patient_repr.mean(dim=1)
         return logits

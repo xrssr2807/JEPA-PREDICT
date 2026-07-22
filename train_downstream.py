@@ -317,6 +317,7 @@ def build_downstream_dataloaders(
     train_config: TrainConfig,
     dataset: str = "chd",
     use_dual: bool = False,
+    multidisease_data_channel=None,
 ) -> tuple:
     """Build train and test dataloaders for downstream fine-tuning."""
     binary_abnormal = (dataset == "arrhythmia_binary")
@@ -331,13 +332,18 @@ def build_downstream_dataloaders(
         ecg_dir = os.path.join(data_config.chd_ecg_dir, data_config.chd_ecg_subdir)
     elif dataset in ("multidisease", "multilabel"):
         target_len = data_config.signal_align_to if data_config.signal_align_to > 0 else None
+        data_channel = (
+            data_config.multidisease_channel
+            if multidisease_data_channel is None
+            else multidisease_data_channel
+        )
         train_dataset = MultiDiseaseDataset(
             data_dir=data_config.multidisease_dir,
             split="train",
             disease_labels=data_config.multidisease_labels,
             normalize=data_config.normalize,
             normalize_clip=data_config.normalize_clip,
-            channel=data_config.multidisease_channel,
+            channel=data_channel,
             target_length=target_len,
         )
         test_dataset = MultiDiseaseDataset(
@@ -346,7 +352,7 @@ def build_downstream_dataloaders(
             disease_labels=data_config.multidisease_labels,
             normalize=data_config.normalize,
             normalize_clip=data_config.normalize_clip,
-            channel=data_config.multidisease_channel,
+            channel=data_channel,
             target_length=target_len,
         )
         val_dataset = None
@@ -389,7 +395,7 @@ def build_downstream_dataloaders(
                 disease_labels=data_config.multidisease_labels,
                 normalize=data_config.normalize,
                 normalize_clip=data_config.normalize_clip,
-                channel=data_config.multidisease_channel,
+                channel=data_channel,
                 target_length=target_len,
                 max_segments=data_config.multidisease_mil_segments,
                 files=train_dataset.files,
@@ -402,7 +408,7 @@ def build_downstream_dataloaders(
                     disease_labels=data_config.multidisease_labels,
                     normalize=data_config.normalize,
                     normalize_clip=data_config.normalize_clip,
-                    channel=data_config.multidisease_channel,
+                    channel=data_channel,
                     target_length=target_len,
                     max_segments=data_config.multidisease_mil_segments,
                     files=val_dataset.files,
@@ -414,7 +420,7 @@ def build_downstream_dataloaders(
                 disease_labels=data_config.multidisease_labels,
                 normalize=data_config.normalize,
                 normalize_clip=data_config.normalize_clip,
-                channel=data_config.multidisease_channel,
+                channel=data_channel,
                 target_length=target_len,
                 max_segments=data_config.multidisease_mil_segments,
                 files=test_dataset.files,
@@ -625,6 +631,55 @@ def load_pretrained_encoder(
     return encoder
 
 
+def load_multidisease_dual_teacher(
+    teacher_checkpoint: str,
+    pretrain_checkpoint: str,
+    config: Config,
+    num_classes: int,
+    device: torch.device,
+):
+    """Load a frozen dual-stream downstream teacher, including legacy heads."""
+    payload = torch.load(teacher_checkpoint, map_location="cpu", weights_only=False)
+    state_dict = payload.get("model_state_dict", payload)
+    if not isinstance(state_dict, dict):
+        raise ValueError(
+            f"Teacher checkpoint {teacher_checkpoint} does not contain a model state dict"
+        )
+    if any(key.startswith("module.") for key in state_dict):
+        state_dict = {
+            key.removeprefix("module."): value for key, value in state_dict.items()
+        }
+    uses_new_fusion = any(
+        key.startswith("modality_mil_head.") for key in state_dict
+    )
+    ecg_encoder = load_pretrained_encoder(
+        pretrain_checkpoint, config.model, "context", device, in_channels=1,
+    )
+    ppg_encoder = load_pretrained_encoder(
+        pretrain_checkpoint, config.model, "target", device, in_channels=1,
+    )
+    teacher = DualStreamPatientMILClassifier(
+        ecg_encoder=ecg_encoder,
+        ppg_encoder=ppg_encoder,
+        encoder_dim=config.model.transformer_dim,
+        num_classes=num_classes,
+        use_multiscale=(
+            config.data.multidisease_use_multiscale or config.model.use_multiscale
+        ),
+        encoder_chunk_size=config.data.multidisease_mil_encoder_chunk_size,
+        ppg_channel=config.data.multidisease_ppg_channel,
+        ecg_channel=config.data.multidisease_ecg_channel,
+        disease_conditioned_fusion=uses_new_fusion,
+    ).to(device)
+    teacher.load_state_dict(state_dict, strict=True)
+    teacher.eval()
+    for parameter in teacher.parameters():
+        parameter.requires_grad = False
+    architecture = "disease-conditioned" if uses_new_fusion else "legacy shared-gate"
+    print(f"[Teacher] Loaded frozen {architecture} dual model from {teacher_checkpoint}")
+    return teacher
+
+
 # ── Layer-wise LR ───────────────────────────────────────────────
 
 def get_layerwise_param_groups(model, base_lr: float, layer_decay: float,
@@ -780,6 +835,30 @@ def compute_multidisease_objective(
     }
 
 
+def _patient_batch_parts(batch, device):
+    """Return tensors plus optional UID list and valid-segment mask."""
+    x, labels, *rest = batch
+    uids = rest[0] if rest else None
+    segment_mask = None
+    if len(rest) >= 2 and torch.is_tensor(rest[1]):
+        candidate = rest[1]
+        if x.dim() == 4 and candidate.shape == x.shape[:2]:
+            segment_mask = candidate.to(device, non_blocking=True, dtype=torch.bool)
+    return x, labels, uids, segment_mask
+
+
+def _forward_with_segment_mask(
+    model, x: torch.Tensor, segment_mask: Optional[torch.Tensor] = None,
+    return_embedding: bool = False,
+):
+    kwargs = {}
+    if segment_mask is not None:
+        kwargs["segment_mask"] = segment_mask
+    if return_embedding:
+        kwargs["return_embedding"] = True
+    return model(x, **kwargs)
+
+
 def train_epoch(model, dataloader, optimizer, criterion, device,
                 scheduler=None, sched_mode="epoch", is_dual=False,
                 distill_mode=False, ecg_encoder=None,
@@ -792,9 +871,15 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                 focus_auc_loss_weight: float = 0.0,
                 focus_auc_margin: float = 0.2,
                 use_amp: bool = False,
-                scaler=None):
+                scaler=None,
+                teacher_model=None,
+                teacher_logit_weight: float = 0.0,
+                teacher_embedding_weight: float = 0.0,
+                teacher_temperature: float = 2.0):
     """Single training epoch with optional ECG distillation."""
     model.train()
+    if teacher_model is not None:
+        teacher_model.eval()
     if distill_mode:
         proj_ppg.train()
     running_loss = 0.0
@@ -813,10 +898,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
             logits = model(ecg, ppg)
             loss = criterion(logits, labels)
         else:
-            if len(batch) >= 3:
-                x, labels, *_ = batch
-            else:
-                x, labels = batch
+            x, labels, _, segment_mask = _patient_batch_parts(batch, device)
             x = x.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
@@ -863,11 +945,47 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                     dtype=torch.float16,
                     enabled=bool(use_amp and device.type == "cuda"),
                 ):
-                    logits = model(x)
+                    if teacher_model is None:
+                        logits = _forward_with_segment_mask(
+                            model, x, segment_mask=segment_mask,
+                        )
+                        student_embedding = None
+                    else:
+                        logits, student_embedding = _forward_with_segment_mask(
+                            model, x, segment_mask=segment_mask,
+                            return_embedding=True,
+                        )
                 loss = criterion(
                     logits.float() if multilabel else logits,
                     labels.float() if multilabel else labels,
                 )
+                if teacher_model is not None:
+                    temperature = max(float(teacher_temperature), 1e-6)
+                    with torch.no_grad(), torch.autocast(
+                        device_type=device.type,
+                        dtype=torch.float16,
+                        enabled=bool(use_amp and device.type == "cuda"),
+                    ):
+                        teacher_logits, teacher_embedding = _forward_with_segment_mask(
+                            teacher_model, x, segment_mask=segment_mask,
+                            return_embedding=True,
+                        )
+                    soft_targets = torch.sigmoid(teacher_logits.float() / temperature)
+                    logit_distill = F.binary_cross_entropy_with_logits(
+                        logits.float() / temperature, soft_targets,
+                    ) * (temperature ** 2)
+                    embedding_distill = (
+                        1.0 - F.cosine_similarity(
+                            student_embedding.float(),
+                            teacher_embedding.float(),
+                            dim=-1,
+                        )
+                    ).mean()
+                    loss = (
+                        loss
+                        + float(teacher_logit_weight) * logit_distill
+                        + float(teacher_embedding_weight) * embedding_distill
+                    )
 
         if multilabel:
             loss = compute_multidisease_objective(
@@ -1074,8 +1192,7 @@ def evaluate_multilabel(model, dataloader, criterion, device,
     all_labels = []
 
     for batch in dataloader:
-        x, labels, *rest = batch
-        uids = rest[0] if rest else None
+        x, labels, uids, segment_mask = _patient_batch_parts(batch, device)
         x = x.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
@@ -1084,7 +1201,9 @@ def evaluate_multilabel(model, dataloader, criterion, device,
             dtype=torch.float16,
             enabled=bool(use_amp and device.type == "cuda"),
         ):
-            logits = model(x)
+            logits = _forward_with_segment_mask(
+                model, x, segment_mask=segment_mask,
+            )
         loss = criterion(logits.float(), labels.float())
         running_loss += loss.item()
 
@@ -1367,6 +1486,20 @@ def train_downstream(
     else:
         num_classes = config.data.num_classes
     print(f"Num classes: {num_classes}")
+    dual_teacher_checkpoint = str(getattr(
+        config.train, "multidisease_dual_teacher_checkpoint", ""
+    ) or "")
+    use_multidisease_teacher = bool(multilabel and dual_teacher_checkpoint)
+    if use_multidisease_teacher and not os.path.isfile(dual_teacher_checkpoint):
+        raise FileNotFoundError(
+            f"Dual teacher checkpoint was not found: {dual_teacher_checkpoint}"
+        )
+    if use_multidisease_teacher and str(config.data.multidisease_channel) != str(
+        config.data.multidisease_ppg_channel
+    ):
+        raise ValueError(
+            "Dual-to-PPG distillation requires --multidisease_channel ppg"
+        )
     downstream_in_channels = (
         2 if multilabel and config.data.multidisease_channel == "both"
         else config.model.in_channels
@@ -1383,6 +1516,7 @@ def train_downstream(
         and config.data.multidisease_patient_mil
         and config.data.multidisease_channel == "both"
         and config.data.multidisease_dual_stream
+        and not use_multidisease_teacher
     )
 
     # ── Check for ECG modes ──
@@ -1398,12 +1532,18 @@ def train_downstream(
         print(f"[Distill] ★ ECG data at {ecg_data_dir} → ECG蒸馏模式 (部署仅需PPG)")
     elif use_cotrain:
         print(f"[CoTrain] ★ ECG data at {ecg_data_dir} → ECG+PPG协同训练")
+    elif use_multidisease_teacher:
+        print(
+            "[Distill] Multidisease dual-stream teacher -> PPG-only student "
+            f"from {dual_teacher_checkpoint}"
+        )
     else:
         print(f"[SingleChannel] No ECG data at {ecg_data_dir} → PPG only")
 
     # Data
     train_loader, val_loader, test_loader, train_ds, test_ds = build_downstream_dataloaders(
         config.data, config.train, dataset, use_dual=use_dual,
+        multidisease_data_channel=("both" if use_multidisease_teacher else None),
     )
     split_provenance = None
     if multilabel:
@@ -1550,6 +1690,10 @@ def train_downstream(
                 num_classes=num_classes,
                 use_multiscale=use_multiscale_head,
                 encoder_chunk_size=config.data.multidisease_mil_encoder_chunk_size,
+                input_channel=(
+                    config.data.multidisease_ppg_channel
+                    if use_multidisease_teacher else None
+                ),
             ).to(device)
         elif use_multiscale_head:
             print("[Model] MultiScale classification head")
@@ -1590,6 +1734,22 @@ def train_downstream(
                 num_classes=num_classes,
             ).to(device)
     # else: use_dual=True — model already created as DualChannelClassifier above
+
+    teacher_model = None
+    if use_multidisease_teacher:
+        teacher_model = load_multidisease_dual_teacher(
+            dual_teacher_checkpoint,
+            checkpoint_path,
+            config,
+            num_classes,
+            device,
+        )
+        print(
+            "[Distill] weights: "
+            f"logit={config.train.multidisease_distill_logit_weight:.3f} "
+            f"embedding={config.train.multidisease_distill_embedding_weight:.3f} "
+            f"temperature={config.train.multidisease_distill_temperature:.2f}"
+        )
 
     # ── Auto pos_weight ──
     pos_weight = None
@@ -1694,6 +1854,10 @@ def train_downstream(
                 focus_auc_margin=config.train.chd_auc_margin,
                 use_amp=use_amp,
                 scaler=scaler,
+                teacher_model=teacher_model,
+                teacher_logit_weight=config.train.multidisease_distill_logit_weight,
+                teacher_embedding_weight=config.train.multidisease_distill_embedding_weight,
+                teacher_temperature=config.train.multidisease_distill_temperature,
             )
             eval_loader = val_loader if val_loader is not None else test_loader
             eval_name = "Val" if val_loader is not None else "Test"
@@ -1784,6 +1948,10 @@ def train_downstream(
             focus_auc_margin=config.train.chd_auc_margin,
             use_amp=use_amp,
             scaler=scaler,
+            teacher_model=teacher_model,
+            teacher_logit_weight=config.train.multidisease_distill_logit_weight,
+            teacher_embedding_weight=config.train.multidisease_distill_embedding_weight,
+            teacher_temperature=config.train.multidisease_distill_temperature,
         )
         eval_loader = val_loader if val_loader is not None else test_loader
         eval_name = "Val" if val_loader is not None else "Test"
@@ -1826,6 +1994,21 @@ def train_downstream(
                 "multidisease_channel": (
                     config.data.multidisease_channel if multilabel else None
                 ),
+                "model_architecture": (
+                    "dual_disease_conditioned_modality_mil"
+                    if use_multidisease_dual_stream
+                    else "ppg_patient_mil"
+                    if multilabel and config.data.multidisease_patient_mil
+                    else type(model).__name__
+                ),
+                "dual_teacher_checkpoint": (
+                    dual_teacher_checkpoint if use_multidisease_teacher else None
+                ),
+                "distillation": ({
+                    "logit_weight": config.train.multidisease_distill_logit_weight,
+                    "embedding_weight": config.train.multidisease_distill_embedding_weight,
+                    "temperature": config.train.multidisease_distill_temperature,
+                } if use_multidisease_teacher else None),
                 "data_split": split_provenance,
             }
             no_improve = 0
@@ -1978,6 +2161,25 @@ if __name__ == "__main__":
         "--no_amp", action="store_true",
         help="Disable downstream automatic mixed precision",
     )
+    parser.add_argument(
+        "--dual_teacher_checkpoint", type=str, default=None,
+        help=(
+            "Frozen dual-stream downstream checkpoint used to distill a "
+            "multidisease PPG-only student"
+        ),
+    )
+    parser.add_argument(
+        "--distill_logit_weight", type=float, default=None,
+        help="Dual-teacher binary logit distillation weight",
+    )
+    parser.add_argument(
+        "--distill_embedding_weight", type=float, default=None,
+        help="Dual-teacher patient-embedding cosine loss weight",
+    )
+    parser.add_argument(
+        "--distill_temperature", type=float, default=None,
+        help="Dual-teacher logit temperature",
+    )
     args = parser.parse_args()
 
     config = Config()
@@ -2000,6 +2202,20 @@ if __name__ == "__main__":
         config.train.dataloader_workers = args.workers
     if args.no_amp:
         config.train.downstream_use_amp = False
+    if args.dual_teacher_checkpoint is not None:
+        config.train.multidisease_dual_teacher_checkpoint = args.dual_teacher_checkpoint
+    if args.distill_logit_weight is not None:
+        config.train.multidisease_distill_logit_weight = max(
+            0.0, args.distill_logit_weight
+        )
+    if args.distill_embedding_weight is not None:
+        config.train.multidisease_distill_embedding_weight = max(
+            0.0, args.distill_embedding_weight
+        )
+    if args.distill_temperature is not None:
+        config.train.multidisease_distill_temperature = max(
+            1e-6, args.distill_temperature
+        )
     config.output_dir = args.output_dir
     os.makedirs(config.output_dir, exist_ok=True)
 

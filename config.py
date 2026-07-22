@@ -169,10 +169,9 @@ class ModelConfig:
     # ★ HiMAE 多尺度分类头 (不同疾病依赖不同时间尺度)
     use_multiscale: bool = False       # True=使用MultiScaleClassifier
     # ★ ECG+PPG 双通道融合 (CSFM: 多模态融合持续带来稳健提升)
-    use_dual_channel: bool = False     # 单通道 PPG only
-    use_ecg_distill: bool = False      # ECG蒸馏 (关闭, 先测纯PPG)
-    use_cotrain: bool = True           # ★ ECG+PPG协同训练 (共享分类头, 部署仅需PPG)
-    use_dual_channel: bool = True      # ★ ECG+PPG concat融合 (AUC 0.79)
+    use_dual_channel: bool = True      # ECG+PPG fusion for the legacy CHD task
+    use_ecg_distill: bool = False      # Legacy paired-ECG distillation for CHD
+    use_cotrain: bool = True           # Legacy ECG+PPG co-training for CHD
     distill_lambda: float = 0.3
 
 
@@ -251,6 +250,10 @@ class TrainConfig:
     downstream_warmup_epochs: int = 5
     downstream_probe_epochs: int = 20  # AUC在E20后不再提升
     downstream_scheduler: str = "step"  # "epoch" or "step" (step-based for warmup+cosine)
+    multidisease_dual_teacher_checkpoint: str = ""
+    multidisease_distill_logit_weight: float = 0.3
+    multidisease_distill_embedding_weight: float = 0.1
+    multidisease_distill_temperature: float = 2.0
 
     # ★ Token 对齐续训练 (冻结 target, 训练 context 对齐到 target)
     token_align_epochs: int = 50       # 续训练epoch
