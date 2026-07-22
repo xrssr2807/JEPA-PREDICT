@@ -242,6 +242,17 @@ def build_model(model_config: ModelConfig) -> JEPA:
         phase2_variance_weight=model_config.phase2_variance_weight,
         phase2_covariance_weight=model_config.phase2_covariance_weight,
         phase2_target_std=model_config.phase2_target_std,
+        phase2_shared_private_enabled=(
+            model_config.phase2_shared_private_enabled
+        ),
+        phase2_private_dim=model_config.phase2_private_dim,
+        phase2_shared_private_hidden=(
+            model_config.phase2_shared_private_hidden
+        ),
+        phase2_private_loss_weight=model_config.phase2_private_loss_weight,
+        phase2_orthogonality_weight=(
+            model_config.phase2_orthogonality_weight
+        ),
     )
 
 
@@ -328,21 +339,42 @@ def _representation_is_healthy(metrics) -> bool:
         _metric(metrics, "context_collapsed_fraction"),
         _metric(metrics, "target_collapsed_fraction"),
     )
+    if "ecg_private_std" in metrics or "ppg_private_std" in metrics:
+        values = values + (
+            _metric(metrics, "ecg_private_std"),
+            _metric(metrics, "ppg_private_std"),
+            _metric(metrics, "ecg_private_collapsed_fraction"),
+            _metric(metrics, "ppg_private_collapsed_fraction"),
+        )
     if not all(math.isfinite(value) for value in values):
         return False
-    return (
+    healthy = (
         _metric(metrics, "context_std") >= 0.01
         and _metric(metrics, "target_std") >= 0.01
         and _metric(metrics, "context_collapsed_fraction") <= 0.10
         and _metric(metrics, "target_collapsed_fraction") <= 0.10
     )
+    if "ecg_private_std" in metrics or "ppg_private_std" in metrics:
+        healthy = healthy and (
+            _metric(metrics, "ecg_private_std") >= 0.01
+            and _metric(metrics, "ppg_private_std") >= 0.01
+            and _metric(metrics, "ecg_private_collapsed_fraction") <= 0.10
+            and _metric(metrics, "ppg_private_collapsed_fraction") <= 0.10
+        )
+    return healthy
 
 
 def _checkpoint_is_eligible(
-    metrics, phase: int, transport_progress: float = 1.0
+    metrics,
+    phase: int,
+    transport_progress: float = 1.0,
+    shared_private_progress: float = 1.0,
 ) -> bool:
-    """Compare Phase 2 checkpoints only after the final objective is active."""
-    objective_ready = phase != 2 or transport_progress >= 1.0 - 1e-8
+    """Compare checkpoints only after every scheduled objective is active."""
+    objective_ready = phase != 2 or (
+        transport_progress >= 1.0 - 1e-8
+        and shared_private_progress >= 1.0 - 1e-8
+    )
     return objective_ready and _representation_is_healthy(metrics)
 
 
@@ -395,11 +427,33 @@ def _phase_checkpoint_metadata(model, config: Config) -> dict:
             "variance_weight": float(config.model.phase2_variance_weight),
             "covariance_weight": float(config.model.phase2_covariance_weight),
             "target_std": float(config.model.phase2_target_std),
+            "shared_private_enabled": bool(
+                config.model.phase2_shared_private_enabled
+            ),
+            "private_dim": int(config.model.phase2_private_dim),
+            "shared_private_hidden": int(
+                config.model.phase2_shared_private_hidden
+            ),
+            "private_loss_weight": float(
+                config.model.phase2_private_loss_weight
+            ),
+            "orthogonality_weight": float(
+                config.model.phase2_orthogonality_weight
+            ),
+            "shared_private_progress": float(
+                getattr(model, "phase2_shared_private_progress", 0.0)
+            ),
             "transport_start_epoch": int(
                 config.train.phase2_transport_start_epoch
             ),
             "transport_ramp_epochs": int(
                 config.train.phase2_transport_ramp_epochs
+            ),
+            "shared_private_start_epoch": int(
+                config.train.phase2_shared_private_start_epoch
+            ),
+            "shared_private_ramp_epochs": int(
+                config.train.phase2_shared_private_ramp_epochs
             ),
         },
     }
@@ -420,7 +474,69 @@ def _load_jepa_state_dict(model, state_dict):
         print(f"[Resume] Initialized new buffers: {result.missing_keys}")
 
 
-def train(config: Config, resume_from: str = None, start_epoch: int = 0):
+_SHARED_PRIVATE_PREFIXES = (
+    "ecg_shared_private.",
+    "ppg_shared_private.",
+    "ecg_teacher_shared_private.",
+    "ppg_teacher_shared_private.",
+    "ecg_private_predictor.",
+    "ppg_private_predictor.",
+)
+
+
+def _checkpoint_uses_shared_private(checkpoint: dict) -> bool:
+    phase2_config = checkpoint.get("phase2_config", {})
+    if "shared_private_enabled" in phase2_config:
+        return bool(phase2_config["shared_private_enabled"])
+    state_dict = checkpoint.get("model_state_dict", {})
+    return any(
+        key.startswith(_SHARED_PRIVATE_PREFIXES) for key in state_dict
+    )
+
+
+def _initialize_shared_private_from_phase2(model, checkpoint: dict) -> list:
+    """Load a legacy Phase 2 model and leave only new P2 modules initialized."""
+    if model.pretrain_phase != 2 or not model.phase2_shared_private_enabled:
+        raise ValueError(
+            "--init_checkpoint requires Phase 2 with --shared_private"
+        )
+    if int(checkpoint.get("pretrain_phase", 0)) != 2:
+        raise ValueError("Shared-private initialization requires a Phase 2 checkpoint")
+    if "model_state_dict" not in checkpoint:
+        raise ValueError(
+            "Initialization checkpoint must contain model_state_dict"
+        )
+
+    result = model.load_state_dict(
+        checkpoint["model_state_dict"], strict=False
+    )
+    unexpected_missing = [
+        key for key in result.missing_keys
+        if not key.startswith(_SHARED_PRIVATE_PREFIXES)
+    ]
+    if unexpected_missing or result.unexpected_keys:
+        raise RuntimeError(
+            "Phase 2 initialization structure mismatch: "
+            f"missing={sorted(unexpected_missing)}, "
+            f"unexpected={sorted(result.unexpected_keys)}"
+        )
+    if not result.missing_keys:
+        print(
+            "[Init] Source already contains shared-private modules; "
+            "optimizer and validation state will still restart"
+        )
+    model._enforce_teacher_eval()
+    return list(result.missing_keys)
+
+
+def train(
+    config: Config,
+    resume_from: str = None,
+    start_epoch: int = 0,
+    init_from: str = None,
+):
+    if resume_from is not None and init_from is not None:
+        raise ValueError("Use only one of resume_from and init_from")
     seed_everything(
         config.seed,
         config.deterministic,
@@ -489,6 +605,29 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
             f"transport_start={config.train.phase2_transport_start_epoch} | "
             f"ramp={config.train.phase2_transport_ramp_epochs} epochs"
         )
+        if config.model.phase2_shared_private_enabled:
+            print(
+                "[Priority2] Shared-Private JEPA enabled | "
+                f"private_dim={config.model.phase2_private_dim} | "
+                f"private_weight={config.model.phase2_private_loss_weight:.3f} | "
+                f"orthogonality_weight="
+                f"{config.model.phase2_orthogonality_weight:.3f} | "
+                f"start={config.train.phase2_shared_private_start_epoch} | "
+                f"ramp={config.train.phase2_shared_private_ramp_epochs}"
+            )
+
+    if init_from is not None:
+        print(f"[Init] Loading Phase 2 initialization checkpoint: {init_from}")
+        init_checkpoint = torch.load(
+            init_from, map_location="cpu", weights_only=False
+        )
+        initialized_keys = _initialize_shared_private_from_phase2(
+            model, init_checkpoint
+        )
+        print(
+            "[Init] Loaded existing Phase 2 weights; initialized "
+            f"{len(initialized_keys)} new shared-private tensors"
+        )
 
     # Optimizer
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -515,6 +654,15 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
             raise ValueError(
                 f"Cannot resume Phase {phase} from a Phase {checkpoint_phase} "
                 "checkpoint. Start from scratch or use a matching-phase checkpoint."
+            )
+        checkpoint_shared_private = _checkpoint_uses_shared_private(ckpt)
+        if checkpoint_shared_private != bool(
+            config.model.phase2_shared_private_enabled
+        ):
+            raise ValueError(
+                "Resume checkpoint shared-private mode does not match the model. "
+                "Use --init_checkpoint to initialize Shared-Private JEPA from "
+                "a standard Phase 2 checkpoint."
             )
         # Load encoder weights
         if "context_encoder" in ckpt:
@@ -589,6 +737,9 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
     log_file = os.path.join(config.output_dir, "pretrain_log.txt")
     split_manifest = {
         "pretrain_phase": phase,
+        "shared_private_enabled": bool(
+            config.model.phase2_shared_private_enabled
+        ),
         "seed": config.seed,
         "val_ratio": config.data.pretrain_val_split,
         "train_files": list(train_loader.dataset.files),
@@ -614,6 +765,13 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                 config.train.phase2_transport_ramp_epochs,
             )
             model.set_phase2_progress(transport_progress)
+            if config.model.phase2_shared_private_enabled:
+                shared_private_progress = phase2_transport_progress(
+                    epoch,
+                    config.train.phase2_shared_private_start_epoch,
+                    config.train.phase2_shared_private_ramp_epochs,
+                )
+                model.set_shared_private_progress(shared_private_progress)
         model.train()
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
@@ -715,6 +873,12 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                         f" Mass: {_metric(info, 'matched_mass'):.3f} |"
                         f" MinMass: {_metric(info, 'minimum_matched_mass'):.2e} |"
                     )
+                    if config.model.phase2_shared_private_enabled:
+                        phase_detail += (
+                            f" SP: {_metric(info, 'shared_private_progress'):.2f} |"
+                            f" Priv: {_metric(info, 'private_reconstruction'):.5f} |"
+                            f" Orth: {_metric(info, 'shared_private_orthogonality'):.5f} |"
+                        )
                 log_msg = (
                     f"Epoch {epoch:3d} | Batch {batch_idx:4d}/{steps_per_epoch} | "
                     f"Loss: {loss.item():.6f} | JEPA: {_metric(info, 'jepa'):.5f} | "
@@ -773,6 +937,17 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                 f"mass={_metric(train_metrics, 'matched_mass'):.3f} "
                 f"min_mass={_metric(train_metrics, 'minimum_matched_mass'):.2e}"
             )
+            if config.model.phase2_shared_private_enabled:
+                summary += (
+                    f" sp_progress="
+                    f"{_metric(train_metrics, 'shared_private_progress'):.3f} "
+                    f"private="
+                    f"{_metric(train_metrics, 'private_reconstruction'):.6f} "
+                    f"orth="
+                    f"{_metric(train_metrics, 'shared_private_orthogonality'):.6f} "
+                    f"ppg_private_std="
+                    f"{_metric(train_metrics, 'ppg_private_std'):.4f}"
+                )
         if val_metrics is not None:
             summary += (
                 f" | Val total={_metric(val_metrics, 'total_loss'):.6f} "
@@ -801,9 +976,26 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
                     f"val_mass={_metric(val_metrics, 'matched_mass'):.3f} "
                     f"val_min_mass={_metric(val_metrics, 'minimum_matched_mass'):.2e}"
                 )
+                if config.model.phase2_shared_private_enabled:
+                    summary += (
+                        f" val_private="
+                        f"{_metric(val_metrics, 'private_reconstruction'):.6f} "
+                        f"val_orth="
+                        f"{_metric(val_metrics, 'shared_private_orthogonality'):.6f} "
+                        f"val_ppg_private_std="
+                        f"{_metric(val_metrics, 'ppg_private_std'):.4f} "
+                        f"val_ppg_private_collapse="
+                        f"{_metric(val_metrics, 'ppg_private_collapsed_fraction'):.3f}"
+                    )
             if (
                 _metric(val_metrics, "context_collapsed_fraction") > 0.90
                 or _metric(val_metrics, "target_collapsed_fraction") > 0.90
+                or _metric(
+                    val_metrics, "ecg_private_collapsed_fraction"
+                ) > 0.90
+                or _metric(
+                    val_metrics, "ppg_private_collapsed_fraction"
+                ) > 0.90
             ):
                 print("[CollapseWarning] More than 90% of embedding dimensions have near-zero variance")
         summary += f" | Time: {epoch_time:.1f}s"
@@ -832,15 +1024,26 @@ def train(config: Config, resume_from: str = None, start_epoch: int = 0):
         transport_progress = (
             float(model.phase2_progress) if phase == 2 else 1.0
         )
+        shared_private_progress = (
+            float(model.phase2_shared_private_progress)
+            if phase == 2 and config.model.phase2_shared_private_enabled
+            else 1.0
+        )
         checkpoint_eligible = _checkpoint_is_eligible(
-            val_metrics, phase, transport_progress
+            val_metrics,
+            phase,
+            transport_progress,
+            shared_private_progress,
         )
         should_early_stop = False
         if val_metrics is not None and not checkpoint_eligible:
-            if phase == 2 and transport_progress < 1.0 - 1e-8:
+            if phase == 2 and (
+                transport_progress < 1.0 - 1e-8
+                or shared_private_progress < 1.0 - 1e-8
+            ):
                 print(
-                    "[CheckpointSkip] Phase 2 transport is still ramping; "
-                    "best-model comparison starts at full transport"
+                    "[CheckpointSkip] Phase 2 objectives are still ramping; "
+                    "best-model comparison starts when all objectives are active"
                 )
             else:
                 print(
@@ -1135,6 +1338,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="JEPA Pre-training")
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume from checkpoint path")
+    parser.add_argument(
+        "--init_checkpoint", type=str, default=None,
+        help=(
+            "Initialize new Shared-Private modules from an existing Phase 2 "
+            "checkpoint while restarting optimizer and validation state"
+        ),
+    )
     parser.add_argument("--start_epoch", type=int, default=0,
                         help="Epoch to start/resume from")
     parser.add_argument(
@@ -1144,6 +1354,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir", type=str, default=None,
         help="Checkpoint/log directory (Phase 1/2 get phase-specific defaults)",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=None,
+        help="Override the total number of pre-training epochs",
     )
     parser.add_argument(
         "--seed", type=int, default=None,
@@ -1189,6 +1403,33 @@ if __name__ == "__main__":
         "--early_stop_min_delta", type=float, default=None,
         help="Minimum absolute Phase 2 validation-loss decrease",
     )
+    parser.add_argument(
+        "--shared_private", action="store_true",
+        help=(
+            "Enable Priority-2 Shared-Private JEPA in Phase 2; causal "
+            "transport is applied only to shared tokens"
+        ),
+    )
+    parser.add_argument(
+        "--private_dim", type=int, default=None,
+        help="Modality-private token dimension",
+    )
+    parser.add_argument(
+        "--private_loss_weight", type=float, default=None,
+        help="Weight of same-modality private masked prediction",
+    )
+    parser.add_argument(
+        "--orthogonality_weight", type=float, default=None,
+        help="Weight of shared-private cross-correlation penalty",
+    )
+    parser.add_argument(
+        "--shared_private_start_epoch", type=int, default=None,
+        help="Epoch where Shared-Private auxiliary losses begin",
+    )
+    parser.add_argument(
+        "--shared_private_ramp_epochs", type=int, default=None,
+        help="Epochs used to ramp Shared-Private auxiliary losses to full weight",
+    )
     parser.add_argument("--token_align", type=str, default=None,
                         help="Token 对齐续训练: --token_align outputs/jepa_best.pt")
     args = parser.parse_args()
@@ -1196,14 +1437,29 @@ if __name__ == "__main__":
     config = Config()
     if args.phase is not None:
         config.model.pretrain_phase = args.phase
+    if args.shared_private:
+        config.model.phase2_shared_private_enabled = True
+    if args.private_dim is not None:
+        config.model.phase2_private_dim = args.private_dim
+    if args.private_loss_weight is not None:
+        config.model.phase2_private_loss_weight = args.private_loss_weight
+    if args.orthogonality_weight is not None:
+        config.model.phase2_orthogonality_weight = args.orthogonality_weight
     if args.seed is not None:
         config.seed = args.seed
+    if args.epochs is not None:
+        config.train.pretrain_epochs = args.epochs
     if args.output_dir is not None:
         config.output_dir = args.output_dir
     elif config.model.pretrain_phase == 1:
         config.output_dir = config.output_dir.rstrip("/\\") + "_phase1"
     elif config.model.pretrain_phase == 2:
-        config.output_dir = config.output_dir.rstrip("/\\") + "_phase2"
+        suffix = (
+            "_phase2_shared_private"
+            if config.model.phase2_shared_private_enabled
+            else "_phase2"
+        )
+        config.output_dir = config.output_dir.rstrip("/\\") + suffix
 
     if args.performance_mode:
         config.deterministic = False
@@ -1227,6 +1483,14 @@ if __name__ == "__main__":
             config.train.phase2_early_stop_patience = args.early_stop_patience
         if args.early_stop_min_delta is not None:
             config.train.phase2_early_stop_min_delta = args.early_stop_min_delta
+        if args.shared_private_start_epoch is not None:
+            config.train.phase2_shared_private_start_epoch = (
+                args.shared_private_start_epoch
+            )
+        if args.shared_private_ramp_epochs is not None:
+            config.train.phase2_shared_private_ramp_epochs = (
+                args.shared_private_ramp_epochs
+            )
         if config.train.phase2_transport_start_epoch < 0:
             parser.error("--transport_start_epoch must be >= 0")
         if config.train.phase2_transport_ramp_epochs < 1:
@@ -1235,6 +1499,16 @@ if __name__ == "__main__":
             parser.error("--early_stop_patience must be >= 0")
         if config.train.phase2_early_stop_min_delta < 0:
             parser.error("--early_stop_min_delta must be >= 0")
+        if config.train.phase2_shared_private_start_epoch < 0:
+            parser.error("--shared_private_start_epoch must be >= 0")
+        if config.train.phase2_shared_private_ramp_epochs < 1:
+            parser.error("--shared_private_ramp_epochs must be >= 1")
+        if config.model.phase2_private_dim < 1:
+            parser.error("--private_dim must be >= 1")
+        if config.model.phase2_private_loss_weight < 0:
+            parser.error("--private_loss_weight must be >= 0")
+        if config.model.phase2_orthogonality_weight < 0:
+            parser.error("--orthogonality_weight must be >= 0")
     elif config.model.pretrain_phase == 1:
         if args.batch_size is not None:
             config.train.phase1_batch_size = args.batch_size
@@ -1250,9 +1524,25 @@ if __name__ == "__main__":
         if args.lr is not None:
             config.train.pretrain_lr = args.lr
 
+    if args.shared_private and config.model.pretrain_phase != 2:
+        parser.error("--shared_private requires --phase 2")
+    if args.init_checkpoint is not None and not args.shared_private:
+        parser.error("--init_checkpoint requires --shared_private")
+    if args.init_checkpoint is not None and args.resume is not None:
+        parser.error("--init_checkpoint cannot be combined with --resume")
+    if args.init_checkpoint is not None and args.start_epoch != 0:
+        parser.error("--init_checkpoint starts a new run; keep --start_epoch 0")
+    if args.epochs is not None and args.epochs < 1:
+        parser.error("--epochs must be >= 1")
+
     if args.token_align is not None:
         # ★ Token 对齐续训练模式
         train_token_align(config, args.token_align)
     else:
         # 正常预训练
-        train(config, resume_from=args.resume, start_epoch=args.start_epoch)
+        train(
+            config,
+            resume_from=args.resume,
+            start_epoch=args.start_epoch,
+            init_from=args.init_checkpoint,
+        )

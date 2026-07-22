@@ -96,6 +96,14 @@ class ModelConfig:
     phase2_target_std: float = 0.10
     phase2_use_stats_loss: bool = False
 
+    # Priority 2: preserve modality-private morphology while causal transport
+    # acts only on a shared ECG/PPG representation.
+    phase2_shared_private_enabled: bool = False
+    phase2_private_dim: int = 128
+    phase2_shared_private_hidden: int = 256
+    phase2_private_loss_weight: float = 0.50
+    phase2_orthogonality_weight: float = 0.05
+
     # Input
     in_channels: int = 1  # single-channel (ECG or PPG separately)
     signal_length: int = 3000  # pre-training: 30s @ 100Hz
@@ -204,6 +212,8 @@ class TrainConfig:
     phase2_use_amp: bool = True
     phase2_transport_start_epoch: int = 10
     phase2_transport_ramp_epochs: int = 20
+    phase2_shared_private_start_epoch: int = 0
+    phase2_shared_private_ramp_epochs: int = 5
     # Count only full-transport, healthy validation epochs. A decrease smaller
     # than min_delta is treated as a plateau rather than a meaningful gain.
     phase2_early_stop_patience: int = 15

@@ -102,6 +102,38 @@ class TokenPredictor(nn.Module):
         return self.net(x)
 
 
+class SharedPrivateTokenProjector(nn.Module):
+    """Split a modality token into transport-shared and modality-private views.
+
+    The shared branch is a zero-initialized residual adapter. A Phase 2 model
+    can therefore initialize this module without immediately changing the
+    latent seen by the existing predictors and causal delay head.
+    """
+
+    def __init__(self, dim: int, private_dim: int, hidden_dim: int):
+        super().__init__()
+        self.shared_adapter = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim),
+        )
+        nn.init.zeros_(self.shared_adapter[-1].weight)
+        nn.init.zeros_(self.shared_adapter[-1].bias)
+        self.private_projector = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, private_dim),
+            nn.LayerNorm(private_dim),
+        )
+
+    def forward(self, tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        shared = tokens + self.shared_adapter(tokens)
+        private = self.private_projector(tokens)
+        return shared, private
+
+
 class CausalDelayHead(nn.Module):
     """Predict positive ECG-to-PPG delay bins plus unmatched mass per token."""
 
@@ -305,6 +337,11 @@ class JEPA(nn.Module):
         phase2_variance_weight: float = 0.10,
         phase2_covariance_weight: float = 0.01,
         phase2_target_std: float = 0.10,
+        phase2_shared_private_enabled: bool = False,
+        phase2_private_dim: int = 128,
+        phase2_shared_private_hidden: int = 256,
+        phase2_private_loss_weight: float = 0.50,
+        phase2_orthogonality_weight: float = 0.05,
         use_se: bool = False,
         use_inception: bool = False,
     ):
@@ -446,6 +483,69 @@ class JEPA(nn.Module):
                 self.phase2_target_std = float(phase2_target_std)
                 self.phase2_progress = 0.0
 
+                self.phase2_shared_private_enabled = bool(
+                    phase2_shared_private_enabled
+                )
+                self.phase2_private_loss_weight = float(
+                    phase2_private_loss_weight
+                )
+                self.phase2_orthogonality_weight = float(
+                    phase2_orthogonality_weight
+                )
+                self.phase2_shared_private_progress = (
+                    1.0 if self.phase2_shared_private_enabled else 0.0
+                )
+                if self.phase2_shared_private_enabled:
+                    if phase2_private_dim <= 0:
+                        raise ValueError("phase2_private_dim must be positive")
+                    if phase2_shared_private_hidden <= 0:
+                        raise ValueError(
+                            "phase2_shared_private_hidden must be positive"
+                        )
+                    if phase2_private_loss_weight < 0:
+                        raise ValueError(
+                            "phase2_private_loss_weight must be non-negative"
+                        )
+                    if phase2_orthogonality_weight < 0:
+                        raise ValueError(
+                            "phase2_orthogonality_weight must be non-negative"
+                        )
+
+                    projector_kwargs = dict(
+                        dim=embedding_dim,
+                        private_dim=int(phase2_private_dim),
+                        hidden_dim=int(phase2_shared_private_hidden),
+                    )
+                    self.ecg_shared_private = SharedPrivateTokenProjector(
+                        **projector_kwargs
+                    )
+                    self.ppg_shared_private = SharedPrivateTokenProjector(
+                        **projector_kwargs
+                    )
+                    self.ecg_teacher_shared_private = copy.deepcopy(
+                        self.ecg_shared_private
+                    )
+                    self.ppg_teacher_shared_private = copy.deepcopy(
+                        self.ppg_shared_private
+                    )
+                    for module in (
+                        self.ecg_teacher_shared_private,
+                        self.ppg_teacher_shared_private,
+                    ):
+                        for param in module.parameters():
+                            param.requires_grad = False
+
+                    self.ecg_private_predictor = TokenPredictor(
+                        int(phase2_private_dim), predictor_hidden
+                    )
+                    self.ppg_private_predictor = TokenPredictor(
+                        int(phase2_private_dim), predictor_hidden
+                    )
+        if self.pretrain_phase != 2 and phase2_shared_private_enabled:
+            raise ValueError(
+                "Shared-private decomposition is currently supported only in Phase 2"
+            )
+
     # ── New: Statistics Prediction Head ──
         self.use_stats_loss = use_stats_loss
         self.stats_loss_weight = stats_loss_weight
@@ -482,6 +582,12 @@ class JEPA(nn.Module):
         if self.pretrain_phase >= 1:
             self.context_teacher.eval()
             self.ecg_teacher_proj.eval()
+        if (
+            self.pretrain_phase == 2
+            and getattr(self, "phase2_shared_private_enabled", False)
+        ):
+            self.ecg_teacher_shared_private.eval()
+            self.ppg_teacher_shared_private.eval()
 
     def train(self, mode: bool = True):
         """Set online modules to ``mode`` while always keeping teachers in eval."""
@@ -499,6 +605,20 @@ class JEPA(nn.Module):
             ema_update(self.ppg_encoder, self.target_encoder, momentum)
             ema_update(self.ecg_token_proj, self.ecg_teacher_proj, momentum)
             ema_update(self.ppg_token_proj, self.target_proj, momentum)
+            if (
+                self.pretrain_phase == 2
+                and getattr(self, "phase2_shared_private_enabled", False)
+            ):
+                ema_update(
+                    self.ecg_shared_private,
+                    self.ecg_teacher_shared_private,
+                    momentum,
+                )
+                ema_update(
+                    self.ppg_shared_private,
+                    self.ppg_teacher_shared_private,
+                    momentum,
+                )
         self._enforce_teacher_eval()
 
     def teacher_student_parameter_cosine(self) -> float:
@@ -842,6 +962,19 @@ class JEPA(nn.Module):
             return
         self.phase2_progress = min(max(float(progress), 0.0), 1.0)
 
+    def set_shared_private_progress(self, progress: float) -> None:
+        """Ramp new private objectives independently from causal transport."""
+        if (
+            self.pretrain_phase != 2
+            or not self.phase2_shared_private_enabled
+        ):
+            raise RuntimeError(
+                "Shared-private progress requires an enabled Phase 2 model"
+            )
+        self.phase2_shared_private_progress = min(
+            max(float(progress), 0.0), 1.0
+        )
+
     def _build_phase2_transport(self, ecg_tokens: torch.Tensor) -> dict:
         """Build a causal banded transport with an unmatched dustbin."""
         if self.pretrain_phase != 2:
@@ -1024,6 +1157,29 @@ class JEPA(nn.Module):
         return variance_loss, covariance_loss
 
     @staticmethod
+    def _shared_private_orthogonality(
+        shared_tokens: torch.Tensor,
+        private_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Penalize sample-level cross-correlation between the two views."""
+        shared = shared_tokens.float().mean(dim=1)
+        private = private_tokens.float().mean(dim=1)
+        if shared.size(0) < 2:
+            return shared.sum() * 0.0
+
+        shared = shared - shared.mean(dim=0, keepdim=True)
+        private = private - private.mean(dim=0, keepdim=True)
+        shared = shared / torch.sqrt(
+            shared.var(dim=0, unbiased=False, keepdim=True) + 1e-4
+        )
+        private = private / torch.sqrt(
+            private.var(dim=0, unbiased=False, keepdim=True) + 1e-4
+        )
+        cross_correlation = shared.transpose(0, 1) @ private
+        cross_correlation = cross_correlation / max(1, shared.size(0) - 1)
+        return cross_correlation.square().mean()
+
+    @staticmethod
     def _add_embedding_diagnostics(
         info: dict,
         embeddings,
@@ -1191,25 +1347,52 @@ class JEPA(nn.Module):
 
         ecg_online_tokens = self.ecg_token_proj(ecg_tokens)
         ppg_online_tokens = self.ppg_token_proj(ppg_tokens)
-        ppg_prediction = self.ecg_to_ppg_predictor(ecg_online_tokens)
-        ecg_prediction = self.ppg_to_ecg_predictor(ppg_online_tokens)
+        ecg_shared_tokens = ecg_online_tokens
+        ppg_shared_tokens = ppg_online_tokens
+        ecg_teacher_shared = ecg_teacher_tokens
+        ppg_teacher_shared = ppg_teacher_tokens
+        ecg_private_tokens = None
+        ppg_private_tokens = None
+        ecg_teacher_private = None
+        ppg_teacher_private = None
+        if self.phase2_shared_private_enabled:
+            ecg_shared_tokens, ecg_private_tokens = self.ecg_shared_private(
+                ecg_online_tokens
+            )
+            ppg_shared_tokens, ppg_private_tokens = self.ppg_shared_private(
+                ppg_online_tokens
+            )
+            with torch.no_grad():
+                (
+                    ecg_teacher_shared,
+                    ecg_teacher_private,
+                ) = self.ecg_teacher_shared_private(ecg_teacher_tokens)
+                (
+                    ppg_teacher_shared,
+                    ppg_teacher_private,
+                ) = self.ppg_teacher_shared_private(ppg_teacher_tokens)
+
+        # Cross-modal prediction and causal transport are deliberately
+        # restricted to the shared representation.
+        ppg_prediction = self.ecg_to_ppg_predictor(ecg_shared_tokens)
+        ecg_prediction = self.ppg_to_ecg_predictor(ppg_shared_tokens)
 
         direct_ecg_to_ppg = self._masked_token_regression(
-            ppg_prediction, ppg_teacher_tokens, token_mask
+            ppg_prediction, ppg_teacher_shared, token_mask
         )
         direct_ppg_to_ecg = self._masked_token_regression(
-            ecg_prediction, ecg_teacher_tokens, token_mask
+            ecg_prediction, ecg_teacher_shared, token_mask
         )
         direct_jepa = 0.5 * (direct_ecg_to_ppg + direct_ppg_to_ecg)
 
-        transport_state = self._build_phase2_transport(ecg_online_tokens)
+        transport_state = self._build_phase2_transport(ecg_shared_tokens)
         forward_transport = transport_state["forward_transport"]
         reverse_transport = transport_state["reverse_transport"]
         transported_ppg = torch.bmm(
-            forward_transport, ppg_teacher_tokens.float()
+            forward_transport, ppg_teacher_shared.float()
         )
         transported_ecg = torch.bmm(
-            reverse_transport.transpose(1, 2), ecg_teacher_tokens.float()
+            reverse_transport.transpose(1, 2), ecg_teacher_shared.float()
         )
 
         transport_ecg_to_ppg = self._weighted_transport_regression(
@@ -1234,13 +1417,54 @@ class JEPA(nn.Module):
             + progress * self.phase2_transport_loss_weight * transport_jepa
         )
         regularizers = self._phase2_transport_regularizers(transport_state)
+
+        private_reconstruction = token_jepa.new_zeros(())
+        ecg_private_reconstruction = token_jepa.new_zeros(())
+        ppg_private_reconstruction = token_jepa.new_zeros(())
+        shared_private_orthogonality = token_jepa.new_zeros(())
+        regularization_embeddings = [
+            ecg_pooled,
+            ppg_pooled,
+            ecg_shared_tokens.mean(dim=1),
+            ppg_shared_tokens.mean(dim=1),
+        ]
+        if self.phase2_shared_private_enabled:
+            ecg_private_prediction = self.ecg_private_predictor(
+                ecg_private_tokens
+            )
+            ppg_private_prediction = self.ppg_private_predictor(
+                ppg_private_tokens
+            )
+            ecg_private_reconstruction = self._masked_token_regression(
+                ecg_private_prediction,
+                ecg_teacher_private,
+                token_mask,
+            )
+            ppg_private_reconstruction = self._masked_token_regression(
+                ppg_private_prediction,
+                ppg_teacher_private,
+                token_mask,
+            )
+            private_reconstruction = 0.5 * (
+                ecg_private_reconstruction + ppg_private_reconstruction
+            )
+            shared_private_orthogonality = 0.5 * (
+                self._shared_private_orthogonality(
+                    ecg_shared_tokens, ecg_private_tokens
+                )
+                + self._shared_private_orthogonality(
+                    ppg_shared_tokens, ppg_private_tokens
+                )
+            )
+            regularization_embeddings.extend(
+                (
+                    ecg_private_tokens.mean(dim=1),
+                    ppg_private_tokens.mean(dim=1),
+                )
+            )
+
         variance_loss, covariance_loss = self._variance_covariance_regularization(
-            (
-                ecg_pooled,
-                ppg_pooled,
-                ecg_online_tokens.mean(dim=1),
-                ppg_online_tokens.mean(dim=1),
-            ),
+            regularization_embeddings,
             self.phase2_target_std,
         )
         total_loss = self.phase1_token_loss_weight * token_jepa
@@ -1252,6 +1476,15 @@ class JEPA(nn.Module):
             + self.phase2_delay_smoothness_weight
             * regularizers["delay_smoothness_loss"]
             + self.phase2_match_mass_weight * regularizers["match_mass_loss"]
+        )
+        shared_private_progress = (
+            self.phase2_shared_private_progress
+            if self.phase2_shared_private_enabled
+            else 0.0
+        )
+        total_loss = total_loss + shared_private_progress * (
+            self.phase2_private_loss_weight * private_reconstruction
+            + self.phase2_orthogonality_weight * shared_private_orthogonality
         )
 
         prediction_std = 0.5 * (
@@ -1267,6 +1500,13 @@ class JEPA(nn.Module):
             "masked_fraction": token_mask.float().mean().item(),
             "prediction_std": prediction_std.item(),
             "phase2_progress": progress,
+            "shared_private_progress": shared_private_progress,
+            "private_reconstruction": private_reconstruction.item(),
+            "ecg_private_reconstruction": ecg_private_reconstruction.item(),
+            "ppg_private_reconstruction": ppg_private_reconstruction.item(),
+            "shared_private_orthogonality": (
+                shared_private_orthogonality.item()
+            ),
             "delay_prior": regularizers["delay_prior_loss"].item(),
             "monotonic": regularizers["monotonic_loss"].item(),
             "delay_smoothness": regularizers["delay_smoothness_loss"].item(),
@@ -1293,6 +1533,17 @@ class JEPA(nn.Module):
             ),
             collect_diagnostics,
         )
+        if self.phase2_shared_private_enabled:
+            self._add_embedding_diagnostics(
+                info,
+                (
+                    ("ecg_shared", ecg_shared_tokens.mean(dim=1)),
+                    ("ppg_shared", ppg_shared_tokens.mean(dim=1)),
+                    ("ecg_private", ecg_private_tokens.mean(dim=1)),
+                    ("ppg_private", ppg_private_tokens.mean(dim=1)),
+                ),
+                collect_diagnostics,
+            )
 
         stats_loss = total_loss.new_zeros(())
         if self.use_stats_loss and ecg_stats is not None:
@@ -1315,6 +1566,8 @@ class JEPA(nn.Module):
             "match_mass": regularizers["match_mass_loss"],
             "variance": variance_loss,
             "covariance": covariance_loss,
+            "private_reconstruction": private_reconstruction,
+            "shared_private_orthogonality": shared_private_orthogonality,
             "stats": stats_loss,
             "total": total_loss,
         }
