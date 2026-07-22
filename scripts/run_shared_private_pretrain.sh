@@ -11,12 +11,15 @@ INIT_CHECKPOINT="${INIT_CHECKPOINT:-outputs_phase2_seed42_bs192/jepa_epoch_80.pt
 OUTPUT_DIR="${OUTPUT_DIR:-outputs_phase2_shared_private_seed42}"
 SEED="${SEED:-42}"
 EPOCHS="${EPOCHS:-40}"
-BATCH_SIZE="${BATCH_SIZE:-128}"
-ACCUM_STEPS="${ACCUM_STEPS:-3}"
+# RTX 4090 high-utilization profile. 192 x 2 keeps the original effective
+# batch of 384 used by the safer 128 x 3 profile while filling more VRAM and
+# doing fewer small forward/backward passes.
+BATCH_SIZE="${BATCH_SIZE:-192}"
+ACCUM_STEPS="${ACCUM_STEPS:-2}"
 LR="${LR:-1e-4}"
-WORKERS="${WORKERS:-8}"
-PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
-OMP_THREADS="${OMP_THREADS:-8}"
+WORKERS="${WORKERS:-12}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-6}"
+OMP_THREADS="${OMP_THREADS:-4}"
 
 PRIVATE_DIM="${PRIVATE_DIM:-128}"
 PRIVATE_LOSS_WEIGHT="${PRIVATE_LOSS_WEIGHT:-0.50}"
@@ -29,6 +32,7 @@ export OPENBLAS_NUM_THREADS="$OMP_THREADS"
 export NUMEXPR_NUM_THREADS="$OMP_THREADS"
 export PYTHONHASHSEED="$SEED"
 export PYTHONIOENCODING="utf-8"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 die() {
   echo "[ERROR] $*" >&2
@@ -54,6 +58,9 @@ mkdir -p "$OUTPUT_DIR"
   echo "private_loss_weight=$PRIVATE_LOSS_WEIGHT"
   echo "orthogonality_weight=$ORTHOGONALITY_WEIGHT"
   echo "shared_private_ramp_epochs=$SHARED_PRIVATE_RAMP_EPOCHS"
+  echo "workers=$WORKERS"
+  echo "prefetch_factor=$PREFETCH_FACTOR"
+  echo "pytorch_cuda_alloc_conf=$PYTORCH_CUDA_ALLOC_CONF"
 } | tee "$OUTPUT_DIR/run_manifest.txt"
 
 "$PYTHON_BIN" -u train_pretrain.py \
@@ -81,4 +88,3 @@ mkdir -p "$OUTPUT_DIR"
   2>&1 | tee "$OUTPUT_DIR/console.log"
 
 echo "[Done] Best checkpoint: $OUTPUT_DIR/jepa_best.pt"
-
