@@ -658,6 +658,71 @@ class DiseaseConditionedModalityMILHead(nn.Module):
         return logits, patient_repr, attention, gate
 
 
+class SharedPrivateSegmentAdapter(nn.Module):
+    """Convert pretrained shared/private token views into one segment vector.
+
+    The token projector and shared/private projector come from pretraining.
+    Pooling, projection, and the private residual gate are downstream modules.
+    """
+
+    def __init__(
+        self,
+        token_projector: nn.Module,
+        shared_private_projector: nn.Module,
+        shared_dim: int,
+        private_dim: int,
+        output_dim: int,
+        use_multiscale: bool = True,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.token_projector = token_projector
+        self.shared_private_projector = shared_private_projector
+        self.use_multiscale = bool(use_multiscale)
+        self.shared_pool = (
+            TemporalPyramidPool(shared_dim) if self.use_multiscale else None
+        )
+        self.private_pool = (
+            TemporalPyramidPool(private_dim) if self.use_multiscale else None
+        )
+        shared_in = shared_dim * (3 if self.use_multiscale else 1)
+        private_in = private_dim * (3 if self.use_multiscale else 1)
+        self.shared_proj = nn.Linear(shared_in, output_dim)
+        self.private_proj = nn.Linear(private_in, output_dim)
+        self.private_gate = nn.Sequential(
+            nn.Linear(output_dim * 2, output_dim),
+            nn.Sigmoid(),
+        )
+        self.norm = nn.LayerNorm(output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def freeze_pretrained(self):
+        for module in (self.token_projector, self.shared_private_projector):
+            for parameter in module.parameters():
+                parameter.requires_grad = False
+
+    def unfreeze_pretrained(self):
+        for module in (self.token_projector, self.shared_private_projector):
+            for parameter in module.parameters():
+                parameter.requires_grad = True
+
+    def forward(self, encoder_tokens: torch.Tensor) -> torch.Tensor:
+        projected_tokens = self.token_projector(encoder_tokens)
+        shared_tokens, private_tokens = self.shared_private_projector(
+            projected_tokens
+        )
+        if self.use_multiscale:
+            shared = self.shared_pool(shared_tokens)
+            private = self.private_pool(private_tokens)
+        else:
+            shared = shared_tokens.mean(dim=1)
+            private = private_tokens.mean(dim=1)
+        shared = self.shared_proj(shared)
+        private = self.private_proj(private)
+        gate = self.private_gate(torch.cat([shared, private], dim=-1))
+        return self.dropout(self.norm(shared + gate * private))
+
+
 class PatientMILClassifier(nn.Module):
     """
     Patient-level multi-instance classifier.
@@ -676,15 +741,23 @@ class PatientMILClassifier(nn.Module):
         dropout: float = 0.3,
         encoder_chunk_size: int = 0,
         input_channel: int = None,
+        shared_private_adapter: Optional[SharedPrivateSegmentAdapter] = None,
     ):
         super().__init__()
         self.encoder = encoder
         self.use_multiscale = use_multiscale
         self.encoder_chunk_size = int(encoder_chunk_size or 0)
         self.input_channel = None if input_channel is None else int(input_channel)
+        self.shared_private_adapter = shared_private_adapter
 
-        rep_dim = encoder_dim * 3 if use_multiscale else encoder_dim
-        self.temporal_pyramid = TemporalPyramidPool(encoder_dim) if use_multiscale else None
+        if self.shared_private_adapter is not None:
+            rep_dim = encoder_dim
+            self.temporal_pyramid = None
+        else:
+            rep_dim = encoder_dim * 3 if use_multiscale else encoder_dim
+            self.temporal_pyramid = (
+                TemporalPyramidPool(encoder_dim) if use_multiscale else None
+            )
         self.segment_proj = nn.Sequential(
             nn.Linear(rep_dim, encoder_dim),
             nn.BatchNorm1d(encoder_dim),
@@ -696,14 +769,21 @@ class PatientMILClassifier(nn.Module):
     def freeze_encoder(self):
         for param in self.encoder.parameters():
             param.requires_grad = False
+        if self.shared_private_adapter is not None:
+            self.shared_private_adapter.freeze_pretrained()
 
     def unfreeze_encoder(self):
         for param in self.encoder.parameters():
             param.requires_grad = True
+        if self.shared_private_adapter is not None:
+            self.shared_private_adapter.unfreeze_pretrained()
 
     def _encode_flat(self, flat: torch.Tensor) -> torch.Tensor:
         chunk_size = self.encoder_chunk_size
         if chunk_size <= 0 or flat.size(0) <= chunk_size:
+            if self.shared_private_adapter is not None:
+                _, tokens = self.encoder(flat, return_all=True)
+                return self.shared_private_adapter(tokens)
             if self.use_multiscale:
                 _, tokens = self.encoder(flat, return_all=True)
                 return self.temporal_pyramid(tokens)
@@ -713,7 +793,10 @@ class PatientMILClassifier(nn.Module):
         reps = []
         for start in range(0, flat.size(0), chunk_size):
             chunk = flat[start:start + chunk_size]
-            if self.use_multiscale:
+            if self.shared_private_adapter is not None:
+                _, tokens = self.encoder(chunk, return_all=True)
+                reps.append(self.shared_private_adapter(tokens))
+            elif self.use_multiscale:
                 _, tokens = self.encoder(chunk, return_all=True)
                 reps.append(self.temporal_pyramid(tokens))
             else:
@@ -756,7 +839,13 @@ class DualStreamPatientMILClassifier(nn.Module):
                  use_multiscale: bool = True, dropout: float = 0.3,
                  encoder_chunk_size: int = 0, ppg_channel: int = 0,
                  ecg_channel: int = 1,
-                 disease_conditioned_fusion: bool = True):
+                 disease_conditioned_fusion: bool = True,
+                 ecg_shared_private_adapter: Optional[
+                     SharedPrivateSegmentAdapter
+                 ] = None,
+                 ppg_shared_private_adapter: Optional[
+                     SharedPrivateSegmentAdapter
+                 ] = None):
         super().__init__()
         self.ecg_encoder = ecg_encoder
         self.ppg_encoder = ppg_encoder
@@ -765,10 +854,30 @@ class DualStreamPatientMILClassifier(nn.Module):
         self.ppg_channel = int(ppg_channel)
         self.ecg_channel = int(ecg_channel)
         self.disease_conditioned_fusion = bool(disease_conditioned_fusion)
+        self.ecg_shared_private_adapter = ecg_shared_private_adapter
+        self.ppg_shared_private_adapter = ppg_shared_private_adapter
+        if (
+            (self.ecg_shared_private_adapter is None)
+            != (self.ppg_shared_private_adapter is None)
+        ):
+            raise ValueError(
+                "Dual-stream shared/private adapters must be provided together"
+            )
+        self.use_shared_private = self.ecg_shared_private_adapter is not None
 
-        rep_dim = encoder_dim * 3 if use_multiscale else encoder_dim
-        self.ecg_pyramid = TemporalPyramidPool(encoder_dim) if use_multiscale else None
-        self.ppg_pyramid = TemporalPyramidPool(encoder_dim) if use_multiscale else None
+        rep_dim = (
+            encoder_dim
+            if self.use_shared_private
+            else encoder_dim * 3 if use_multiscale else encoder_dim
+        )
+        self.ecg_pyramid = (
+            TemporalPyramidPool(encoder_dim)
+            if use_multiscale and not self.use_shared_private else None
+        )
+        self.ppg_pyramid = (
+            TemporalPyramidPool(encoder_dim)
+            if use_multiscale and not self.use_shared_private else None
+        )
         self.ecg_proj = nn.Sequential(nn.Linear(rep_dim, encoder_dim), nn.LayerNorm(encoder_dim))
         self.ppg_proj = nn.Sequential(nn.Linear(rep_dim, encoder_dim), nn.LayerNorm(encoder_dim))
         if self.disease_conditioned_fusion:
@@ -790,11 +899,17 @@ class DualStreamPatientMILClassifier(nn.Module):
         for encoder in (self.ecg_encoder, self.ppg_encoder):
             for param in encoder.parameters():
                 param.requires_grad = False
+        if self.use_shared_private:
+            self.ecg_shared_private_adapter.freeze_pretrained()
+            self.ppg_shared_private_adapter.freeze_pretrained()
 
     def unfreeze_encoder(self):
         for encoder in (self.ecg_encoder, self.ppg_encoder):
             for param in encoder.parameters():
                 param.requires_grad = True
+        if self.use_shared_private:
+            self.ecg_shared_private_adapter.unfreeze_pretrained()
+            self.ppg_shared_private_adapter.unfreeze_pretrained()
 
     def shared_encoder_parameters(self):
         """Yield each shared online encoder parameter exactly once."""
@@ -812,7 +927,12 @@ class DualStreamPatientMILClassifier(nn.Module):
             if id(param) not in encoder_ids:
                 yield param
 
-    def _encode_one(self, encoder, pyramid, signal):
+    def _encode_one(
+        self, encoder, pyramid, signal, shared_private_adapter=None
+    ):
+        if shared_private_adapter is not None:
+            _, tokens = encoder(signal, return_all=True)
+            return shared_private_adapter(tokens)
         if self.use_multiscale:
             _, tokens = encoder(signal, return_all=True)
             return pyramid(tokens)
@@ -826,8 +946,14 @@ class DualStreamPatientMILClassifier(nn.Module):
             chunk = flat[start:start + chunk_size]
             ppg = chunk[:, self.ppg_channel:self.ppg_channel + 1]
             ecg = chunk[:, self.ecg_channel:self.ecg_channel + 1]
-            ecg_reps.append(self._encode_one(self.ecg_encoder, self.ecg_pyramid, ecg))
-            ppg_reps.append(self._encode_one(self.ppg_encoder, self.ppg_pyramid, ppg))
+            ecg_reps.append(self._encode_one(
+                self.ecg_encoder, self.ecg_pyramid, ecg,
+                self.ecg_shared_private_adapter,
+            ))
+            ppg_reps.append(self._encode_one(
+                self.ppg_encoder, self.ppg_pyramid, ppg,
+                self.ppg_shared_private_adapter,
+            ))
         return torch.cat(ecg_reps, dim=0), torch.cat(ppg_reps, dim=0)
 
     def forward(

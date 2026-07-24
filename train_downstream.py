@@ -47,7 +47,9 @@ from models.classifier import (
     SignalClassifier, DualChannelClassifier,
     SignalClassifierCoT, DualChannelClassifierCoT,
     MultiScaleClassifier, PatientMILClassifier, DualStreamPatientMILClassifier,
+    SharedPrivateSegmentAdapter,
 )
+from models.jepa import SharedPrivateTokenProjector, TokenProjectionHead
 from models.losses import build_criterion, compute_pos_weight
 
 
@@ -608,10 +610,15 @@ def load_pretrained_encoder(
     checkpoint_path: str, model_config: ModelConfig,
     encoder_type: str, device: torch.device,
     in_channels: Optional[int] = None,
+    checkpoint_data: Optional[dict] = None,
 ) -> SignalEncoder:
     """Load a pre-trained encoder from JEPA checkpoint."""
     encoder = build_encoder(model_config, in_channels=in_channels).to(device)
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    ckpt = (
+        checkpoint_data
+        if checkpoint_data is not None
+        else torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    )
     state_dict, key = _select_pretrained_encoder_state(ckpt, encoder_type)
 
     first_conv_key = "cnn.conv_blocks.0.0.weight"
@@ -629,6 +636,107 @@ def load_pretrained_encoder(
     encoder.load_state_dict(state_dict, strict=True)
     print(f"Loaded {key} for {encoder_type} role from {checkpoint_path}")
     return encoder
+
+
+def _checkpoint_shared_private_config(checkpoint: dict) -> Optional[dict]:
+    phase2_config = checkpoint.get("phase2_config", {})
+    state_dict = checkpoint.get("model_state_dict", {})
+    has_modules = any(
+        key.removeprefix("_orig_mod.").startswith("ecg_shared_private.")
+        for key in state_dict
+    ) and any(
+        key.removeprefix("_orig_mod.").startswith("ppg_shared_private.")
+        for key in state_dict
+    )
+    if not bool(phase2_config.get("shared_private_enabled", has_modules)):
+        return None
+    if not has_modules:
+        raise RuntimeError(
+            "Checkpoint metadata enables shared/private features, but the "
+            "projector tensors are missing from model_state_dict"
+        )
+    return phase2_config
+
+
+def _extract_checkpoint_module_state(
+    checkpoint: dict, module_prefix: str
+) -> dict:
+    state_dict = checkpoint.get("model_state_dict", {})
+    selected = {}
+    for key, value in state_dict.items():
+        normalized = key.removeprefix("_orig_mod.")
+        if normalized.startswith(module_prefix):
+            selected[normalized[len(module_prefix):]] = value
+    if not selected:
+        raise KeyError(
+            f"No checkpoint tensors found for module prefix '{module_prefix}'"
+        )
+    return selected
+
+
+def build_shared_private_adapter(
+    checkpoint: dict,
+    model_config: ModelConfig,
+    encoder_type: str,
+    output_dim: int,
+    use_multiscale: bool,
+    device: torch.device,
+) -> SharedPrivateSegmentAdapter:
+    """Restore one online shared/private branch for downstream inference."""
+    phase2_config = _checkpoint_shared_private_config(checkpoint)
+    if phase2_config is None:
+        raise ValueError("Checkpoint does not contain shared/private features")
+
+    private_dim = int(
+        phase2_config.get("private_dim", model_config.phase2_private_dim)
+    )
+    hidden_dim = int(
+        phase2_config.get(
+            "shared_private_hidden",
+            model_config.phase2_shared_private_hidden,
+        )
+    )
+    embedding_dim = int(model_config.embedding_dim)
+    if encoder_type == "context":
+        token_prefix = "ecg_token_proj."
+        split_prefix = "ecg_shared_private."
+    elif encoder_type == "target":
+        token_prefix = "ppg_token_proj."
+        split_prefix = "ppg_shared_private."
+    else:
+        raise ValueError(f"Unsupported shared/private role: {encoder_type}")
+
+    token_projector = TokenProjectionHead(
+        model_config.transformer_dim,
+        model_config.transformer_dim,
+        embedding_dim,
+    )
+    split_projector = SharedPrivateTokenProjector(
+        dim=embedding_dim,
+        private_dim=private_dim,
+        hidden_dim=hidden_dim,
+    )
+    token_projector.load_state_dict(
+        _extract_checkpoint_module_state(checkpoint, token_prefix),
+        strict=True,
+    )
+    split_projector.load_state_dict(
+        _extract_checkpoint_module_state(checkpoint, split_prefix),
+        strict=True,
+    )
+    adapter = SharedPrivateSegmentAdapter(
+        token_projector=token_projector,
+        shared_private_projector=split_projector,
+        shared_dim=embedding_dim,
+        private_dim=private_dim,
+        output_dim=output_dim,
+        use_multiscale=use_multiscale,
+    ).to(device)
+    print(
+        f"[SharedPrivate] Loaded {encoder_type} token/shared/private modules "
+        f"(shared={embedding_dim}, private={private_dim})"
+    )
+    return adapter
 
 
 def load_multidisease_dual_teacher(
@@ -1005,18 +1113,24 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
             print("[Warn] non-finite loss detected; skipping this batch")
             continue
         all_params = list(model.parameters()) + (list(proj_ppg.parameters()) if distill_mode else [])
+        optimizer_stepped = True
         if scaler is not None and scaler.is_enabled():
+            scale_before = scaler.get_scale()
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
+            # GradScaler skips optimizer.step() when it detects overflow.
+            # Advancing the scheduler on that batch causes PyTorch's
+            # scheduler-before-optimizer warning and shifts the LR schedule.
+            optimizer_stepped = scaler.get_scale() >= scale_before
         else:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
             optimizer.step()
 
-        if scheduler is not None and sched_mode == "batch":
+        if scheduler is not None and sched_mode == "batch" and optimizer_stepped:
             scheduler.step()
 
         running_loss += loss.item()
@@ -1518,6 +1632,36 @@ def train_downstream(
         and config.data.multidisease_dual_stream
         and not use_multidisease_teacher
     )
+    pretrained_checkpoint = None
+    use_shared_private_head = False
+    if multilabel and config.data.multidisease_patient_mil:
+        pretrained_checkpoint = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=True
+        )
+        shared_private_config = _checkpoint_shared_private_config(
+            pretrained_checkpoint
+        )
+        shared_private_mode = str(
+            getattr(config.model, "downstream_shared_private_head", "auto")
+        ).lower()
+        if shared_private_mode not in {"auto", "on", "off"}:
+            raise ValueError(
+                "downstream_shared_private_head must be auto, on, or off"
+            )
+        if shared_private_mode == "on" and shared_private_config is None:
+            raise ValueError(
+                "--shared_private_head on requires a Shared-Private checkpoint"
+            )
+        use_shared_private_head = (
+            shared_private_mode != "off"
+            and shared_private_config is not None
+            and not use_multidisease_teacher
+        )
+        print(
+            "[SharedPrivate] downstream_head="
+            f"{'on' if use_shared_private_head else 'off'} "
+            f"(mode={shared_private_mode})"
+        )
 
     # ── Check for ECG modes ──
     ecg_data_dir = os.path.join(config.data.chd_ecg_dir, config.data.chd_ecg_subdir)
@@ -1536,6 +1680,11 @@ def train_downstream(
         print(
             "[Distill] Multidisease dual-stream teacher -> PPG-only student "
             f"from {dual_teacher_checkpoint}"
+        )
+    elif multilabel:
+        print(
+            "[MultiDisease] Using ECG/PPG channels stored together in "
+            f"{config.data.multidisease_dir}"
         )
     else:
         print(f"[SingleChannel] No ECG data at {ecg_data_dir} → PPG only")
@@ -1649,6 +1798,7 @@ def train_downstream(
         encoder = load_pretrained_encoder(
             checkpoint_path, config.model, encoder_role, device,
             in_channels=downstream_in_channels,
+            checkpoint_data=pretrained_checkpoint,
         )
 
     # Build classifier (skip if dual-channel already created above)
@@ -1657,23 +1807,51 @@ def train_downstream(
             "[Model] Dual-stream patient MIL: "
             "ECG=context_encoder + PPG=target_encoder + disease-conditioned attention"
         )
+        use_multiscale_head = (
+            config.data.multidisease_use_multiscale
+            or config.model.use_multiscale
+        )
         ecg_encoder = load_pretrained_encoder(
             checkpoint_path, config.model, "context", device, in_channels=1,
+            checkpoint_data=pretrained_checkpoint,
         )
         ppg_encoder = load_pretrained_encoder(
             checkpoint_path, config.model, "target", device, in_channels=1,
+            checkpoint_data=pretrained_checkpoint,
         )
+        ecg_shared_private_adapter = None
+        ppg_shared_private_adapter = None
+        if use_shared_private_head:
+            ecg_shared_private_adapter = build_shared_private_adapter(
+                pretrained_checkpoint,
+                config.model,
+                "context",
+                config.model.transformer_dim,
+                use_multiscale_head,
+                device,
+            )
+            ppg_shared_private_adapter = build_shared_private_adapter(
+                pretrained_checkpoint,
+                config.model,
+                "target",
+                config.model.transformer_dim,
+                use_multiscale_head,
+                device,
+            )
+            print(
+                "[Model] Shared interaction + gated modality-private residuals"
+            )
         model = DualStreamPatientMILClassifier(
             ecg_encoder=ecg_encoder,
             ppg_encoder=ppg_encoder,
             encoder_dim=config.model.transformer_dim,
             num_classes=num_classes,
-            use_multiscale=(
-                config.data.multidisease_use_multiscale or config.model.use_multiscale
-            ),
+            use_multiscale=use_multiscale_head,
             encoder_chunk_size=config.data.multidisease_mil_encoder_chunk_size,
             ppg_channel=config.data.multidisease_ppg_channel,
             ecg_channel=config.data.multidisease_ecg_channel,
+            ecg_shared_private_adapter=ecg_shared_private_adapter,
+            ppg_shared_private_adapter=ppg_shared_private_adapter,
         ).to(device)
     elif not use_dual and not use_distill and not use_cotrain:
         # Pure PPG single-channel
@@ -1681,6 +1859,20 @@ def train_downstream(
             multilabel and config.data.multidisease_use_multiscale
         )
         if multilabel and config.data.multidisease_patient_mil:
+            shared_private_adapter = None
+            if use_shared_private_head:
+                shared_private_adapter = build_shared_private_adapter(
+                    pretrained_checkpoint,
+                    config.model,
+                    encoder_role,
+                    config.model.transformer_dim,
+                    use_multiscale_head,
+                    device,
+                )
+                print(
+                    "[Model] Shared representation + gated modality-private "
+                    "residual"
+                )
             print("[Model] Patient-level MIL head"
                   f" (multiscale={use_multiscale_head}, "
                   f"encoder_chunk_size={config.data.multidisease_mil_encoder_chunk_size})")
@@ -1694,6 +1886,7 @@ def train_downstream(
                     config.data.multidisease_ppg_channel
                     if use_multidisease_teacher else None
                 ),
+                shared_private_adapter=shared_private_adapter,
             ).to(device)
         elif use_multiscale_head:
             print("[Model] MultiScale classification head")
@@ -1734,6 +1927,8 @@ def train_downstream(
                 num_classes=num_classes,
             ).to(device)
     # else: use_dual=True — model already created as DualChannelClassifier above
+    if pretrained_checkpoint is not None:
+        del pretrained_checkpoint
 
     teacher_model = None
     if use_multidisease_teacher:
@@ -1994,10 +2189,21 @@ def train_downstream(
                 "multidisease_channel": (
                     config.data.multidisease_channel if multilabel else None
                 ),
+                "disease_labels": (
+                    list(config.data.multidisease_labels)
+                    if multilabel else None
+                ),
+                "shared_private_head": bool(use_shared_private_head),
                 "model_architecture": (
-                    "dual_disease_conditioned_modality_mil"
+                    "dual_shared_private_disease_conditioned_mil"
+                    if use_multidisease_dual_stream and use_shared_private_head
+                    else "dual_disease_conditioned_modality_mil"
                     if use_multidisease_dual_stream
-                    else "ppg_patient_mil"
+                    else "single_shared_private_patient_mil"
+                    if multilabel
+                    and config.data.multidisease_patient_mil
+                    and use_shared_private_head
+                    else "single_patient_mil"
                     if multilabel and config.data.multidisease_patient_mil
                     else type(model).__name__
                 ),
@@ -2056,8 +2262,11 @@ def train_downstream(
             config.data.multidisease_labels, test_labels, test_preds, test_probs, auc_list
         )
         per_class_table = format_multilabel_metrics_table(per_class_rows)
-        # In config.data.multidisease_labels, CHD/冠心病 is the 5th label.
-        chd_row = per_class_rows[4] if len(per_class_rows) > 4 else None
+        chd_row = (
+            per_class_rows[focus_idx]
+            if 0 <= focus_idx < len(per_class_rows)
+            else None
+        )
     else:
         (_, test_acc, auc, auc_list,
          prec, rec, f1, f05, report, _, _, _) = evaluate(
@@ -2162,6 +2371,16 @@ if __name__ == "__main__":
         help="Disable downstream automatic mixed precision",
     )
     parser.add_argument(
+        "--shared_private_head",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help=(
+            "Use pretrained Shared-Private token projectors in patient MIL. "
+            "'auto' enables them when present; 'off' runs the encoder-only "
+            "ablation."
+        ),
+    )
+    parser.add_argument(
         "--dual_teacher_checkpoint", type=str, default=None,
         help=(
             "Frozen dual-stream downstream checkpoint used to distill a "
@@ -2202,6 +2421,7 @@ if __name__ == "__main__":
         config.train.dataloader_workers = args.workers
     if args.no_amp:
         config.train.downstream_use_amp = False
+    config.model.downstream_shared_private_head = args.shared_private_head
     if args.dual_teacher_checkpoint is not None:
         config.train.multidisease_dual_teacher_checkpoint = args.dual_teacher_checkpoint
     if args.distill_logit_weight is not None:

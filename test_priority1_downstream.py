@@ -4,12 +4,17 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from dataset.data import MultiDiseasePatientMILDataset
+from dataset.data import (
+    MultiDiseasePatientMILDataset,
+    multidisease_label_value,
+)
 from models.classifier import (
     DiseaseConditionedMILHead,
     DualStreamPatientMILClassifier,
     PatientMILClassifier,
+    SharedPrivateSegmentAdapter,
 )
+from models.jepa import SharedPrivateTokenProjector, TokenProjectionHead
 from train_downstream import train_epoch
 
 
@@ -34,6 +39,40 @@ class DummySegmentDataset:
 
 
 class PriorityOneDownstreamTests(unittest.TestCase):
+    @staticmethod
+    def _shared_private_adapter(output_dim=8):
+        return SharedPrivateSegmentAdapter(
+            token_projector=TokenProjectionHead(8, 8, 6),
+            shared_private_projector=SharedPrivateTokenProjector(
+                dim=6, private_dim=4, hidden_dim=8,
+            ),
+            shared_dim=6,
+            private_dim=4,
+            output_dim=output_dim,
+            use_multiscale=False,
+            dropout=0.0,
+        )
+
+    def test_rare_vascular_labels_are_merged_with_logical_or(self):
+        self.assertEqual(
+            multidisease_label_value(
+                {"下肢动脉硬化闭塞症": 1, "脑卒中（中风）": 0},
+                "其他疾病",
+            ),
+            1.0,
+        )
+        self.assertEqual(
+            multidisease_label_value(
+                {"下肢动脉硬化闭塞症": 0, "脑卒中（中风）": 1},
+                "其他疾病",
+            ),
+            1.0,
+        )
+        self.assertEqual(
+            multidisease_label_value({}, "其他疾病"),
+            0.0,
+        )
+
     def test_short_patient_bag_is_zero_padded_and_masked(self):
         dataset = MultiDiseasePatientMILDataset.__new__(MultiDiseasePatientMILDataset)
         dataset.uids = ["u1"]
@@ -96,6 +135,42 @@ class PriorityOneDownstreamTests(unittest.TestCase):
         )
         self.assertEqual(tuple(logits.shape), (2, 3))
         self.assertEqual(tuple(embedding.shape), (2, 8))
+
+    def test_shared_private_single_stream_head_uses_private_features(self):
+        adapter = self._shared_private_adapter()
+        model = PatientMILClassifier(
+            DummyEncoder(), encoder_dim=8, num_classes=3,
+            use_multiscale=False, dropout=0.0,
+            shared_private_adapter=adapter,
+        )
+        signals = torch.randn(2, 3, 1, 16)
+        mask = torch.ones(2, 3, dtype=torch.bool)
+        logits = model(signals, segment_mask=mask)
+        logits.sum().backward()
+
+        private_gradient = sum(
+            parameter.grad.abs().sum().item()
+            for parameter in adapter.shared_private_projector.private_projector.parameters()
+            if parameter.grad is not None
+        )
+        self.assertEqual(tuple(logits.shape), (2, 3))
+        self.assertGreater(private_gradient, 0.0)
+
+    def test_shared_private_dual_stream_head_is_finite(self):
+        model = DualStreamPatientMILClassifier(
+            DummyEncoder(), DummyEncoder(), encoder_dim=8, num_classes=3,
+            use_multiscale=False, dropout=0.0,
+            ecg_shared_private_adapter=self._shared_private_adapter(),
+            ppg_shared_private_adapter=self._shared_private_adapter(),
+        ).eval()
+        signals = torch.randn(2, 3, 2, 16)
+        mask = torch.ones(2, 3, dtype=torch.bool)
+        logits, embedding = model(
+            signals, segment_mask=mask, return_embedding=True,
+        )
+        self.assertEqual(tuple(logits.shape), (2, 3))
+        self.assertEqual(tuple(embedding.shape), (2, 8))
+        self.assertTrue(torch.isfinite(logits).all())
 
     def test_legacy_dual_fusion_state_remains_available(self):
         model = DualStreamPatientMILClassifier(

@@ -10,6 +10,7 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 
 from config import Config
+from dataset.data import multidisease_label_value
 
 
 SPLIT_NAMES = ("train", "val", "test")
@@ -149,7 +150,10 @@ def load_patient_labels(
             if not isinstance(label_dict, dict):
                 raise ValueError(f"Missing label dictionary in {filename}")
             current = np.asarray(
-                [int(bool(label_dict.get(name, 0))) for name in disease_labels],
+                [
+                    int(multidisease_label_value(label_dict, name))
+                    for name in disease_labels
+                ],
                 dtype=np.int64,
             )
             if expected is None:

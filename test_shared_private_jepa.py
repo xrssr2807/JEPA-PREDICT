@@ -5,8 +5,12 @@ import unittest
 
 import torch
 
+from config import ModelConfig
 from models.jepa import JEPA, SharedPrivateTokenProjector
-from train_downstream import _select_pretrained_encoder_state
+from train_downstream import (
+    _select_pretrained_encoder_state,
+    build_shared_private_adapter,
+)
 from train_pretrain import (
     _checkpoint_uses_shared_private,
     _encoder_checkpoint_payload,
@@ -221,6 +225,33 @@ class SharedPrivateJEPATests(unittest.TestCase):
         self.assertEqual(ecg_key, "context_encoder")
         self.assertEqual(ppg_state.keys(), payload["ppg_encoder"].keys())
         self.assertEqual(ecg_state.keys(), payload["context_encoder"].keys())
+
+    def test_downstream_adapter_restores_pretrained_projectors(self):
+        model = self._tiny_model()
+        config = ModelConfig()
+        config.transformer_dim = 16
+        config.embedding_dim = 8
+        config.phase2_private_dim = 6
+        config.phase2_shared_private_hidden = 12
+        checkpoint = {
+            "phase2_config": {
+                "shared_private_enabled": True,
+                "private_dim": 6,
+                "shared_private_hidden": 12,
+            },
+            "model_state_dict": model.state_dict(),
+        }
+        adapter = build_shared_private_adapter(
+            checkpoint,
+            config,
+            encoder_type="target",
+            output_dim=16,
+            use_multiscale=False,
+            device=torch.device("cpu"),
+        )
+        output = adapter(torch.randn(3, 5, 16))
+        self.assertEqual(tuple(output.shape), (3, 16))
+        self.assertTrue(torch.isfinite(output).all())
 
     def test_checkpoint_health_rejects_collapsed_private_view(self):
         metrics = {

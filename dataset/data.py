@@ -589,9 +589,20 @@ class DualDownstreamDataset(Dataset):
         return ecg_data, ppg_data, label, uid
 
 
+MULTIDISEASE_LABEL_SOURCES = {
+    "其他疾病": ("下肢动脉硬化闭塞症", "脑卒中（中风）"),
+}
+
+
+def multidisease_label_value(label_dict: dict, label_name: str) -> float:
+    """Resolve one downstream target, including explicitly merged labels."""
+    source_names = MULTIDISEASE_LABEL_SOURCES.get(label_name, (label_name,))
+    return float(any(bool(label_dict.get(name, 0)) for name in source_names))
+
+
 class MultiDiseaseDataset(Dataset):
     """
-    Multi-label downstream dataset for 9 disease labels.
+    Multi-label downstream dataset for the configured disease labels.
 
     Files are split by filename prefix: train_<uid>_<segment>.pkl / test_<uid>_<segment>.pkl.
     Each sample contains:
@@ -625,8 +636,8 @@ class MultiDiseaseDataset(Dataset):
             self.channel = channel
         self.target_length = target_length
         self.disease_labels = disease_labels or [
-            "高血压", "高血糖", "高血脂", "下肢动脉硬化闭塞症", "冠心病",
-            "心律失常（房颤、频发早搏等）", "糖尿病", "脑卒中（中风）", "颈动脉斑块",
+            "高血压", "高血糖", "高血脂", "其他疾病", "冠心病",
+            "心律失常（房颤、频发早搏等）", "糖尿病", "颈动脉斑块",
         ]
 
         prefix = split + "_"
@@ -693,7 +704,10 @@ class MultiDiseaseDataset(Dataset):
 
         label_dict = sample["label"]
         labels = np.array(
-            [float(label_dict.get(name, 0)) for name in self.disease_labels],
+            [
+                multidisease_label_value(label_dict, name)
+                for name in self.disease_labels
+            ],
             dtype=np.float32,
         )
         uid = str(sample.get("uid", self.files[idx].split("_")[1]))

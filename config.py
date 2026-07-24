@@ -59,8 +59,8 @@ class DataConfig:
     num_classes: int = 2  # CHD: binary classification
     arrhythmia_num_classes: int = 6  # Arrhythmia: 6-class classification
     multidisease_labels: List[str] = field(default_factory=lambda: [
-        "高血压", "高血糖", "高血脂", "下肢动脉硬化闭塞症", "冠心病",
-        "心律失常（房颤、频发早搏等）", "糖尿病", "脑卒中（中风）", "颈动脉斑块",
+        "高血压", "高血糖", "高血脂", "其他疾病", "冠心病",
+        "心律失常（房颤、频发早搏等）", "糖尿病", "颈动脉斑块",
     ])
 
 
@@ -103,6 +103,9 @@ class ModelConfig:
     phase2_shared_private_hidden: int = 256
     phase2_private_loss_weight: float = 0.50
     phase2_orthogonality_weight: float = 0.05
+    # "auto" uses pretrained shared/private projectors when present.
+    # "off" keeps the historical encoder-only downstream head.
+    downstream_shared_private_head: str = "auto"
 
     # Input
     in_channels: int = 1  # single-channel (ECG or PPG separately)
