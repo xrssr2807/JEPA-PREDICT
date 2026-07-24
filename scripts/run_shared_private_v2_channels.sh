@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 CHECKPOINT="${CHECKPOINT:-outputs_phase2_shared_private_seed42/jepa_best.pt}"
 SPLIT="${SPLIT:-splits/multidisease_taskaware_downstream.json}"
 OUTPUT_PREFIX="${OUTPUT_PREFIX:-outputs_spv2}"
-SEED="${SEED:-42}"
+SEEDS="${SEEDS:-42 3407 2026}"
 WORKERS="${WORKERS:-8}"
 SHARED_PRIVATE_HEAD="${SHARED_PRIVATE_HEAD:-on}"
 
@@ -33,6 +33,7 @@ fi
 
 run_channel() {
     local channel="$1"
+    local seed="$2"
     local batch_size
     local chunk_size
 
@@ -44,11 +45,12 @@ run_channel() {
         chunk_size=128
     fi
 
-    local output_dir="${OUTPUT_PREFIX}_${channel}_seed${SEED}"
+    local output_dir="${OUTPUT_PREFIX}_${channel}_seed${seed}"
     mkdir -p "$output_dir"
 
     echo
     echo "============================================================"
+    echo "[Run] seed=$seed"
     echo "[Run] channel=$channel"
     echo "[Run] checkpoint=$CHECKPOINT"
     echo "[Run] split=$SPLIT"
@@ -67,14 +69,28 @@ run_channel() {
         --mil_batch_size "$batch_size" \
         --mil_chunk_size "$chunk_size" \
         --workers "$WORKERS" \
-        --seed "$SEED" \
+        --seed "$seed" \
         2>&1 | tee "$output_dir/downstream_console.log"
 
-    echo "[Done] channel=$channel"
+    echo "[Done] seed=$seed channel=$channel"
 }
 
-echo "[Sequence] PPG -> ECG -> ECG+PPG"
-run_channel ppg
-run_channel ecg
-run_channel both
-echo "[Complete] All downstream channel experiments finished."
+read -r -a seed_values <<< "$SEEDS"
+if [[ "${#seed_values[@]}" -eq 0 ]]; then
+    echo "[Error] SEEDS must contain at least one integer." >&2
+    exit 1
+fi
+
+for seed in "${seed_values[@]}"; do
+    if [[ ! "$seed" =~ ^[0-9]+$ ]]; then
+        echo "[Error] Invalid seed: $seed" >&2
+        exit 1
+    fi
+
+    echo "[Sequence] seed=$seed | PPG -> ECG -> ECG+PPG"
+    run_channel ppg "$seed"
+    run_channel ecg "$seed"
+    run_channel both "$seed"
+done
+
+echo "[Complete] All downstream experiments finished for seeds: $SEEDS"
