@@ -22,6 +22,7 @@ from config import Config
 from train_downstream import (
     compute_multilabel_pos_weight,
     finalize_downstream_model,
+    load_pretrained_encoder,
     train_epoch,
     validate_downstream_checkpoint_context,
 )
@@ -149,6 +150,36 @@ class PriorityOneDownstreamTests(unittest.TestCase):
         self.assertEqual(tuple(logits_a.shape), (2, 3))
         self.assertEqual(tuple(embedding.shape), (2, 8))
         self.assertTrue(torch.allclose(logits_a, logits_b, atol=1e-5))
+
+    def test_dual_stream_mil_ablation_accepts_single_segments(self):
+        torch.manual_seed(13)
+        model = DualStreamPatientMILClassifier(
+            DummyEncoder(), DummyEncoder(), encoder_dim=8, num_classes=3,
+            use_multiscale=False, dropout=0.0, ppg_channel=0, ecg_channel=1,
+            disease_conditioned_fusion=True,
+        ).eval()
+        signals = torch.randn(5, 2, 16)
+        logits, embedding = model(signals, return_embedding=True)
+
+        self.assertEqual(tuple(logits.shape), (5, 3))
+        self.assertEqual(tuple(embedding.shape), (5, 8))
+        self.assertTrue(torch.isfinite(logits).all())
+
+    def test_random_encoder_initialization_does_not_load_checkpoint(self):
+        encoder = DummyEncoder()
+        with mock.patch(
+            "train_downstream.build_encoder", return_value=encoder,
+        ), mock.patch("train_downstream.torch.load") as load_mock:
+            result = load_pretrained_encoder(
+                None,
+                Config().model,
+                "target",
+                torch.device("cpu"),
+                initialization="random",
+            )
+
+        self.assertIs(result, encoder)
+        load_mock.assert_not_called()
 
     def test_ppg_student_can_slice_a_dual_channel_bag(self):
         model = PatientMILClassifier(
@@ -306,6 +337,28 @@ class PriorityOneDownstreamTests(unittest.TestCase):
                 config,
                 {"sha256": "new"},
                 use_shared_private_head=True,
+            )
+
+    def test_final_evaluation_rejects_ablation_mismatch(self):
+        config = Config()
+        checkpoint = {
+            "disease_labels": list(config.data.multidisease_labels),
+            "multidisease_channel": config.data.multidisease_channel,
+            "shared_private_head": False,
+            "encoder_init": "random",
+            "patient_mil": False,
+            "multiscale": False,
+            "data_split": {"sha256": "same"},
+        }
+        with self.assertRaisesRegex(
+            ValueError, "encoder initialization mismatch"
+        ):
+            validate_downstream_checkpoint_context(
+                checkpoint,
+                config,
+                {"sha256": "same"},
+                use_shared_private_head=False,
+                encoder_init="pretrained",
             )
 
 

@@ -224,6 +224,7 @@ def build_model(model_config: ModelConfig) -> JEPA:
         phase1_mask_block_tokens=model_config.phase1_mask_block_tokens,
         phase1_bidirectional=model_config.phase1_bidirectional,
         phase1_token_loss_weight=model_config.phase1_token_loss_weight,
+        phase2_transport_enabled=model_config.phase2_transport_enabled,
         phase2_sample_rate_hz=model_config.phase2_sample_rate_hz,
         phase2_min_delay_ms=model_config.phase2_min_delay_ms,
         phase2_max_delay_ms=model_config.phase2_max_delay_ms,
@@ -369,10 +370,11 @@ def _checkpoint_is_eligible(
     phase: int,
     transport_progress: float = 1.0,
     shared_private_progress: float = 1.0,
+    transport_required: bool = True,
 ) -> bool:
     """Compare checkpoints only after every scheduled objective is active."""
     objective_ready = phase != 2 or (
-        transport_progress >= 1.0 - 1e-8
+        (not transport_required or transport_progress >= 1.0 - 1e-8)
         and shared_private_progress >= 1.0 - 1e-8
     )
     return objective_ready and _representation_is_healthy(metrics)
@@ -418,6 +420,9 @@ def _phase_checkpoint_metadata(model, config: Config) -> dict:
     return {
         "phase2_transport_progress": float(model.phase2_progress),
         "phase2_config": {
+            "transport_enabled": bool(
+                config.model.phase2_transport_enabled
+            ),
             "sample_rate_hz": float(config.model.phase2_sample_rate_hz),
             "token_ms": float(model.phase2_token_ms),
             "delay_offsets_tokens": model.phase2_delay_offsets.detach().cpu().tolist(),
@@ -601,7 +606,9 @@ def train(
         delay_offsets = model.phase2_delay_offsets.detach().cpu().tolist()
         delay_ms = [round(offset * model.phase2_token_ms) for offset in delay_offsets]
         print(
-            f"[Phase2] causal delay bins={delay_offsets} tokens ({delay_ms} ms) | "
+            "[Phase2] transport="
+            f"{'on' if config.model.phase2_transport_enabled else 'off'} | "
+            f"causal delay bins={delay_offsets} tokens ({delay_ms} ms) | "
             f"transport_start={config.train.phase2_transport_start_epoch} | "
             f"ramp={config.train.phase2_transport_ramp_epochs} epochs"
         )
@@ -663,6 +670,20 @@ def train(
                 "Resume checkpoint shared-private mode does not match the model. "
                 "Use --init_checkpoint to initialize Shared-Private JEPA from "
                 "a standard Phase 2 checkpoint."
+            )
+        checkpoint_transport = bool(
+            (ckpt.get("phase2_config") or {}).get(
+                "transport_enabled", True
+            )
+        )
+        if (
+            phase == 2
+            and checkpoint_transport
+            != bool(config.model.phase2_transport_enabled)
+        ):
+            raise ValueError(
+                "Resume checkpoint transport mode does not match the model. "
+                "Resume transport-on and transport-off runs separately."
             )
         # Load encoder weights
         if "context_encoder" in ckpt:
@@ -759,10 +780,14 @@ def train(
 
     for epoch in range(start_epoch, config.train.pretrain_epochs):
         if phase == 2:
-            transport_progress = phase2_transport_progress(
-                epoch,
-                config.train.phase2_transport_start_epoch,
-                config.train.phase2_transport_ramp_epochs,
+            transport_progress = (
+                phase2_transport_progress(
+                    epoch,
+                    config.train.phase2_transport_start_epoch,
+                    config.train.phase2_transport_ramp_epochs,
+                )
+                if config.model.phase2_transport_enabled
+                else 0.0
             )
             model.set_phase2_progress(transport_progress)
             if config.model.phase2_shared_private_enabled:
@@ -1034,11 +1059,15 @@ def train(
             phase,
             transport_progress,
             shared_private_progress,
+            transport_required=config.model.phase2_transport_enabled,
         )
         should_early_stop = False
         if val_metrics is not None and not checkpoint_eligible:
             if phase == 2 and (
-                transport_progress < 1.0 - 1e-8
+                (
+                    config.model.phase2_transport_enabled
+                    and transport_progress < 1.0 - 1e-8
+                )
                 or shared_private_progress < 1.0 - 1e-8
             ):
                 print(
@@ -1392,6 +1421,13 @@ if __name__ == "__main__":
         help="Phase 2 epoch where transport blending starts",
     )
     parser.add_argument(
+        "--disable_transport", action="store_true",
+        help=(
+            "Phase 2 ablation: train with direct bidirectional masked-token "
+            "prediction while disabling causal transport and delay losses"
+        ),
+    )
+    parser.add_argument(
         "--transport_ramp_epochs", type=int, default=None,
         help="Phase 2 epochs used to ramp transport from 0 to 1",
     )
@@ -1439,6 +1475,8 @@ if __name__ == "__main__":
         config.model.pretrain_phase = args.phase
     if args.shared_private:
         config.model.phase2_shared_private_enabled = True
+    if args.disable_transport:
+        config.model.phase2_transport_enabled = False
     if args.private_dim is not None:
         config.model.phase2_private_dim = args.private_dim
     if args.private_loss_weight is not None:
@@ -1459,6 +1497,8 @@ if __name__ == "__main__":
             if config.model.phase2_shared_private_enabled
             else "_phase2"
         )
+        if not config.model.phase2_transport_enabled:
+            suffix += "_no_transport"
         config.output_dir = config.output_dir.rstrip("/\\") + suffix
 
     if args.performance_mode:
@@ -1526,6 +1566,8 @@ if __name__ == "__main__":
 
     if args.shared_private and config.model.pretrain_phase != 2:
         parser.error("--shared_private requires --phase 2")
+    if args.disable_transport and config.model.pretrain_phase != 2:
+        parser.error("--disable_transport requires --phase 2")
     if args.init_checkpoint is not None and not args.shared_private:
         parser.error("--init_checkpoint requires --shared_private")
     if args.init_checkpoint is not None and args.resume is not None:

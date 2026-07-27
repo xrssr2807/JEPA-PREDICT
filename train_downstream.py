@@ -631,13 +631,33 @@ def _select_pretrained_encoder_state(ckpt: dict, encoder_type: str):
 
 
 def load_pretrained_encoder(
-    checkpoint_path: str, model_config: ModelConfig,
+    checkpoint_path: Optional[str], model_config: ModelConfig,
     encoder_type: str, device: torch.device,
     in_channels: Optional[int] = None,
     checkpoint_data: Optional[dict] = None,
+    initialization: str = "pretrained",
 ) -> SignalEncoder:
-    """Load a pre-trained encoder from JEPA checkpoint."""
+    """Build a random encoder or restore one pre-trained JEPA branch."""
+    initialization = str(initialization).lower()
+    if initialization not in {"pretrained", "random"}:
+        raise ValueError(
+            "initialization must be 'pretrained' or 'random'"
+        )
     encoder = build_encoder(model_config, in_channels=in_channels).to(device)
+    if initialization == "random":
+        if checkpoint_data is not None:
+            raise ValueError(
+                "Random encoder initialization cannot use checkpoint_data"
+            )
+        print(
+            f"[EncoderInit] Random {encoder_type} encoder "
+            f"(in_channels={in_channels or model_config.in_channels})"
+        )
+        return encoder
+    if not checkpoint_path:
+        raise ValueError(
+            "A checkpoint path is required for pretrained initialization"
+        )
     ckpt = (
         checkpoint_data
         if checkpoint_data is not None
@@ -1590,6 +1610,7 @@ def validate_downstream_checkpoint_context(
     config: Config,
     split_provenance: Optional[dict],
     use_shared_private_head: bool,
+    encoder_init: str = "pretrained",
 ):
     """Reject final evaluation when its experimental context does not match."""
     expected_labels = list(config.data.multidisease_labels)
@@ -1624,6 +1645,28 @@ def validate_downstream_checkpoint_context(
             "Saved downstream checkpoint Shared-Private mode mismatch: "
             f"checkpoint={bool(saved_head)}, current={bool(use_shared_private_head)}"
         )
+
+    saved_init = checkpoint.get("encoder_init")
+    if saved_init is not None and str(saved_init) != str(encoder_init):
+        raise ValueError(
+            "Saved downstream checkpoint encoder initialization mismatch: "
+            f"checkpoint={saved_init}, current={encoder_init}"
+        )
+
+    expected_flags = {
+        "patient_mil": bool(config.data.multidisease_patient_mil),
+        "multiscale": bool(
+            config.data.multidisease_use_multiscale
+            or config.model.use_multiscale
+        ),
+    }
+    for key, expected in expected_flags.items():
+        saved = checkpoint.get(key)
+        if saved is not None and bool(saved) != expected:
+            raise ValueError(
+                f"Saved downstream checkpoint {key} mismatch: "
+                f"checkpoint={bool(saved)}, current={expected}"
+            )
 
     saved_split = checkpoint.get("data_split") or {}
     if (
@@ -1860,19 +1903,37 @@ def finalize_downstream_model(
 
 def train_downstream(
     config: Config,
-    checkpoint_path: str,
+    checkpoint_path: Optional[str],
     dataset: str = "chd",
     seal_test: bool = False,
     evaluate_checkpoint: Optional[str] = None,
+    encoder_init: str = "pretrained",
+    experiment_id: Optional[str] = None,
 ):
     """
     Downstream fine-tuning pipeline.
 
     Args:
         config: master configuration
-        checkpoint_path: path to pre-trained JEPA checkpoint
+        checkpoint_path: path to pre-trained JEPA checkpoint, or None for
+            random initialization
         dataset: "chd" or "arrhythmia"
     """
+    encoder_init = str(encoder_init).lower()
+    if encoder_init not in {"pretrained", "random"}:
+        raise ValueError("encoder_init must be pretrained or random")
+    if encoder_init == "pretrained":
+        if not checkpoint_path:
+            raise ValueError(
+                "--checkpoint is required when --encoder_init pretrained"
+            )
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(
+                f"Pretrained checkpoint was not found: {checkpoint_path}"
+            )
+    checkpoint_source = (
+        os.path.abspath(checkpoint_path) if checkpoint_path else None
+    )
     seed_everything(config.seed)
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     configure_cuda_performance(device, config.train)
@@ -1882,6 +1943,12 @@ def train_downstream(
     )
     print(f"[AMP] downstream={'on' if use_amp else 'off'}")
     print(f"Device: {device} | Dataset: {dataset}")
+    print(
+        f"[Ablation] encoder_init={encoder_init} "
+        f"checkpoint={checkpoint_source or 'none'}"
+    )
+    if experiment_id:
+        print(f"[Experiment] id={experiment_id}")
 
     # ── Log file ──
     os.makedirs(config.output_dir, exist_ok=True)
@@ -1906,6 +1973,10 @@ def train_downstream(
         config.train, "multidisease_dual_teacher_checkpoint", ""
     ) or "")
     use_multidisease_teacher = bool(multilabel and dual_teacher_checkpoint)
+    if use_multidisease_teacher and encoder_init != "pretrained":
+        raise ValueError(
+            "Dual-teacher distillation requires pretrained initialization"
+        )
     if use_multidisease_teacher and not os.path.isfile(dual_teacher_checkpoint):
         raise FileNotFoundError(
             f"Dual teacher checkpoint was not found: {dual_teacher_checkpoint}"
@@ -1927,16 +1998,46 @@ def train_downstream(
             f"patient_mil={config.data.multidisease_patient_mil} "
             f"multiscale={config.data.multidisease_use_multiscale or config.model.use_multiscale}"
         )
+    ablation_config = {
+        "encoder_init": encoder_init,
+        "patient_mil": (
+            bool(config.data.multidisease_patient_mil)
+            if multilabel else None
+        ),
+        "multiscale": (
+            bool(
+                config.data.multidisease_use_multiscale
+                or config.model.use_multiscale
+            )
+            if multilabel else None
+        ),
+        "shared_private_head_mode": str(
+            getattr(config.model, "downstream_shared_private_head", "auto")
+        ),
+        "channel": (
+            str(config.data.multidisease_channel) if multilabel else None
+        ),
+    }
+    ablation_line = (
+        "[AblationConfig] "
+        + json.dumps(ablation_config, ensure_ascii=False, sort_keys=True)
+    )
+    print(ablation_line)
+    log_fh.write(ablation_line + "\n")
+    log_fh.flush()
     use_multidisease_dual_stream = bool(
         multilabel
-        and config.data.multidisease_patient_mil
         and config.data.multidisease_channel == "both"
         and config.data.multidisease_dual_stream
         and not use_multidisease_teacher
     )
     pretrained_checkpoint = None
     use_shared_private_head = False
-    if multilabel and config.data.multidisease_patient_mil:
+    if (
+        multilabel
+        and config.data.multidisease_patient_mil
+        and encoder_init == "pretrained"
+    ):
         pretrained_checkpoint = torch.load(
             checkpoint_path, map_location="cpu", weights_only=True
         )
@@ -1962,6 +2063,23 @@ def train_downstream(
         print(
             "[SharedPrivate] downstream_head="
             f"{'on' if use_shared_private_head else 'off'} "
+            f"(mode={shared_private_mode})"
+        )
+    elif multilabel:
+        shared_private_mode = str(
+            getattr(config.model, "downstream_shared_private_head", "auto")
+        ).lower()
+        if shared_private_mode == "on":
+            reason = (
+                "random initialization"
+                if encoder_init == "random"
+                else "the Patient-MIL ablation"
+            )
+            raise ValueError(
+                f"--shared_private_head on is incompatible with {reason}"
+            )
+        print(
+            "[SharedPrivate] downstream_head=off "
             f"(mode={shared_private_mode})"
         )
 
@@ -2020,8 +2138,14 @@ def train_downstream(
     # ── ECG mode setup ──
     # Dual-channel: load both encoders, concat fusion
     if use_dual:
-        ecg_encoder = load_pretrained_encoder(checkpoint_path, config.model, "context", device)
-        ppg_encoder = load_pretrained_encoder(checkpoint_path, config.model, "target", device)
+        ecg_encoder = load_pretrained_encoder(
+            checkpoint_path, config.model, "context", device,
+            initialization=encoder_init,
+        )
+        ppg_encoder = load_pretrained_encoder(
+            checkpoint_path, config.model, "target", device,
+            initialization=encoder_init,
+        )
         encoder = None
         print("[Model] ★ DualChannel ECG+PPG concat融合")
         model = DualChannelClassifier(
@@ -2051,7 +2175,10 @@ def train_downstream(
             shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
         )
         # Teacher: ECG encoder (frozen)
-        ecg_encoder = load_pretrained_encoder(checkpoint_path, config.model, "context", device)
+        ecg_encoder = load_pretrained_encoder(
+            checkpoint_path, config.model, "context", device,
+            initialization=encoder_init,
+        )
         ecg_encoder.eval()
         for p in ecg_encoder.parameters():
             p.requires_grad = False
@@ -2082,7 +2209,10 @@ def train_downstream(
             ecg_train_ds, batch_size=config.train.downstream_batch_size,
             shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
         )
-        ecg_encoder = load_pretrained_encoder(checkpoint_path, config.model, "context", device)
+        ecg_encoder = load_pretrained_encoder(
+            checkpoint_path, config.model, "context", device,
+            initialization=encoder_init,
+        )
         print(f"[CoTrain] ECG encoder loaded (trainable), shared classifier, {len(ecg_train_ds)} ECG samples")
 
     # Load encoder (PPG student / primary) — skip if dual-channel already set
@@ -2101,6 +2231,7 @@ def train_downstream(
             checkpoint_path, config.model, encoder_role, device,
             in_channels=downstream_in_channels,
             checkpoint_data=pretrained_checkpoint,
+            initialization=encoder_init,
         )
 
     # Build classifier (skip if dual-channel already created above)
@@ -2116,10 +2247,12 @@ def train_downstream(
         ecg_encoder = load_pretrained_encoder(
             checkpoint_path, config.model, "context", device, in_channels=1,
             checkpoint_data=pretrained_checkpoint,
+            initialization=encoder_init,
         )
         ppg_encoder = load_pretrained_encoder(
             checkpoint_path, config.model, "target", device, in_channels=1,
             checkpoint_data=pretrained_checkpoint,
+            initialization=encoder_init,
         )
         ecg_shared_private_adapter = None
         ppg_shared_private_adapter = None
@@ -2301,6 +2434,7 @@ def train_downstream(
                 config,
                 split_provenance,
                 use_shared_private_head,
+                encoder_init=encoder_init,
             )
         saved_state["source_checkpoint"] = os.path.abspath(evaluate_checkpoint)
         result = finalize_downstream_model(
@@ -2525,7 +2659,9 @@ def train_downstream(
                 "val_chd_auc": focus_auc, "val_best_metric": selected_metric,
                 "best_metric": config.train.best_metric,
                 "seed": config.seed,
-                "pretrained_checkpoint": os.path.abspath(checkpoint_path),
+                "pretrained_checkpoint": checkpoint_source,
+                "encoder_init": encoder_init,
+                "experiment_id": experiment_id,
                 "label_schema_version": 2 if multilabel else None,
                 "multidisease_channel": (
                     config.data.multidisease_channel if multilabel else None
@@ -2535,10 +2671,27 @@ def train_downstream(
                     if multilabel else None
                 ),
                 "shared_private_head": bool(use_shared_private_head),
+                "patient_mil": (
+                    bool(config.data.multidisease_patient_mil)
+                    if multilabel else None
+                ),
+                "multiscale": (
+                    bool(
+                        config.data.multidisease_use_multiscale
+                        or config.model.use_multiscale
+                    )
+                    if multilabel else None
+                ),
+                "ablation_config": dict(ablation_config),
                 "model_architecture": (
                     "dual_shared_private_disease_conditioned_mil"
                     if use_multidisease_dual_stream and use_shared_private_head
                     else "dual_disease_conditioned_modality_mil"
+                    if (
+                        use_multidisease_dual_stream
+                        and config.data.multidisease_patient_mil
+                    )
+                    else "dual_disease_conditioned_segment_fusion"
                     if use_multidisease_dual_stream
                     else "single_shared_private_patient_mil"
                     if multilabel
@@ -2600,8 +2753,25 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to pre-trained JEPA checkpoint")
+    parser.add_argument(
+        "--checkpoint", type=str, default=None,
+        help=(
+            "Path to a pre-trained JEPA checkpoint. Required unless "
+            "--encoder_init random is used"
+        ),
+    )
+    parser.add_argument(
+        "--encoder_init",
+        choices=["pretrained", "random"],
+        default="pretrained",
+        help="Encoder initialization for the pretraining-value ablation",
+    )
+    parser.add_argument(
+        "--experiment_id",
+        type=str,
+        default=None,
+        help="Stable paper experiment identifier stored in the checkpoint",
+    )
     parser.add_argument("--dataset", type=str, default="chd",
                         choices=["chd", "arrhythmia", "arrhythmia_binary",
                                  "multidisease", "multilabel"])
@@ -2624,6 +2794,26 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--patient_mil",
+        choices=["on", "off"],
+        default=None,
+        help=(
+            "Patient-level multi-instance learning ablation. With dual "
+            "channels, 'off' keeps the same dual-stream fusion with one "
+            "segment per training bag"
+        ),
+    )
+    parser.add_argument(
+        "--multiscale",
+        choices=["on", "off"],
+        default=None,
+        help="Enable or disable the downstream temporal multi-scale head",
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=None,
+        help="Segment-level batch size used when Patient-MIL is disabled",
+    )
     parser.add_argument(
         "--mil_batch_size", type=int, default=None,
         help="Patient-MIL patients per full fine-tune batch",
@@ -2688,6 +2878,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    for name in ("batch_size", "mil_batch_size", "mil_chunk_size", "workers"):
+        value = getattr(args, name)
+        if value is not None and value < 1:
+            parser.error(f"--{name} must be >= 1")
+
     config = Config()
     config.seed = args.seed
     if args.multidisease_channel is not None:
@@ -2700,6 +2895,13 @@ if __name__ == "__main__":
         config.data.multidisease_dual_stream = args.multidisease_channel == "both"
     if args.multidisease_split is not None:
         config.data.multidisease_split_file = args.multidisease_split
+    if args.patient_mil is not None:
+        config.data.multidisease_patient_mil = args.patient_mil == "on"
+    if args.multiscale is not None:
+        config.data.multidisease_use_multiscale = args.multiscale == "on"
+        config.model.use_multiscale = False
+    if args.batch_size is not None:
+        config.train.downstream_batch_size = args.batch_size
     if args.mil_batch_size is not None:
         config.train.multidisease_mil_batch_size = args.mil_batch_size
     if args.mil_chunk_size is not None:
@@ -2732,4 +2934,6 @@ if __name__ == "__main__":
         args.dataset,
         seal_test=args.seal_test,
         evaluate_checkpoint=args.evaluate_checkpoint,
+        encoder_init=args.encoder_init,
+        experiment_id=args.experiment_id,
     )

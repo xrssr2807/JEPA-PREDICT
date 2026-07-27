@@ -962,9 +962,17 @@ class DualStreamPatientMILClassifier(nn.Module):
         return_embedding: bool = False,
         segment_mask: torch.Tensor = None,
     ):
+        # The MIL ablation uses the identical dual-stream encoders and fusion
+        # head with one segment per bag. Patient-level evaluation still
+        # aggregates repeated segments by UID outside the model.
+        if x.dim() == 3:
+            x = x.unsqueeze(1)
+            if segment_mask is not None and segment_mask.dim() == 1:
+                segment_mask = segment_mask.unsqueeze(1)
         if x.dim() != 4:
             raise ValueError(
-                f"DualStreamPatientMILClassifier expects (B,S,C,L), got {tuple(x.shape)}"
+                "DualStreamPatientMILClassifier expects (B,C,L) or "
+                f"(B,S,C,L), got {tuple(x.shape)}"
             )
         B, S, C, L = x.shape
         required_channels = max(self.ppg_channel, self.ecg_channel) + 1

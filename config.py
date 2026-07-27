@@ -78,6 +78,7 @@ class ModelConfig:
     phase1_use_stats_loss: bool = False
 
     # Phase 2: causal, positive-delay monotonic token transport (B3).
+    phase2_transport_enabled: bool = True
     phase2_sample_rate_hz: float = 100.0
     phase2_min_delay_ms: float = 80.0
     phase2_max_delay_ms: float = 800.0

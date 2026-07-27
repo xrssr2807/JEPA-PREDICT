@@ -321,6 +321,7 @@ class JEPA(nn.Module):
         phase1_mask_block_tokens: int = 8,
         phase1_bidirectional: bool = True,
         phase1_token_loss_weight: float = 1.0,
+        phase2_transport_enabled: bool = True,
         phase2_sample_rate_hz: float = 100.0,
         phase2_min_delay_ms: float = 80.0,
         phase2_max_delay_ms: float = 800.0,
@@ -467,6 +468,9 @@ class JEPA(nn.Module):
                 )
                 self.phase2_transport_temperature = float(
                     phase2_transport_temperature
+                )
+                self.phase2_transport_enabled = bool(
+                    phase2_transport_enabled
                 )
                 self.phase2_transport_loss_weight = float(
                     phase2_transport_loss_weight
@@ -960,7 +964,11 @@ class JEPA(nn.Module):
         """Set the transport blend in [0, 1] for the current epoch."""
         if self.pretrain_phase != 2:
             return
-        self.phase2_progress = min(max(float(progress), 0.0), 1.0)
+        self.phase2_progress = (
+            min(max(float(progress), 0.0), 1.0)
+            if self.phase2_transport_enabled
+            else 0.0
+        )
 
     def set_shared_private_progress(self, progress: float) -> None:
         """Ramp new private objectives independently from causal transport."""
@@ -1385,38 +1393,62 @@ class JEPA(nn.Module):
         )
         direct_jepa = 0.5 * (direct_ecg_to_ppg + direct_ppg_to_ecg)
 
-        transport_state = self._build_phase2_transport(ecg_shared_tokens)
-        forward_transport = transport_state["forward_transport"]
-        reverse_transport = transport_state["reverse_transport"]
-        transported_ppg = torch.bmm(
-            forward_transport, ppg_teacher_shared.float()
-        )
-        transported_ecg = torch.bmm(
-            reverse_transport.transpose(1, 2), ecg_teacher_shared.float()
-        )
+        zero = direct_jepa.new_zeros(())
+        if self.phase2_transport_enabled:
+            transport_state = self._build_phase2_transport(ecg_shared_tokens)
+            forward_transport = transport_state["forward_transport"]
+            reverse_transport = transport_state["reverse_transport"]
+            transported_ppg = torch.bmm(
+                forward_transport, ppg_teacher_shared.float()
+            )
+            transported_ecg = torch.bmm(
+                reverse_transport.transpose(1, 2),
+                ecg_teacher_shared.float(),
+            )
 
-        transport_ecg_to_ppg = self._weighted_transport_regression(
-            ppg_prediction,
-            transported_ppg,
-            token_mask,
-            transport_state["valid_rows"],
-        )
-        transport_ppg_to_ecg = self._weighted_transport_regression(
-            ecg_prediction,
-            transported_ecg,
-            token_mask,
-            transport_state["valid_columns"],
-        )
-        transport_jepa = 0.5 * (
-            transport_ecg_to_ppg + transport_ppg_to_ecg
-        )
-
-        progress = self.phase2_progress
-        token_jepa = (
-            (1.0 - progress) * direct_jepa
-            + progress * self.phase2_transport_loss_weight * transport_jepa
-        )
-        regularizers = self._phase2_transport_regularizers(transport_state)
+            transport_ecg_to_ppg = self._weighted_transport_regression(
+                ppg_prediction,
+                transported_ppg,
+                token_mask,
+                transport_state["valid_rows"],
+            )
+            transport_ppg_to_ecg = self._weighted_transport_regression(
+                ecg_prediction,
+                transported_ecg,
+                token_mask,
+                transport_state["valid_columns"],
+            )
+            transport_jepa = 0.5 * (
+                transport_ecg_to_ppg + transport_ppg_to_ecg
+            )
+            regularizers = self._phase2_transport_regularizers(
+                transport_state
+            )
+            progress = self.phase2_progress
+            token_jepa = (
+                (1.0 - progress) * direct_jepa
+                + progress
+                * self.phase2_transport_loss_weight
+                * transport_jepa
+            )
+        else:
+            transport_ecg_to_ppg = zero
+            transport_ppg_to_ecg = zero
+            transport_jepa = zero
+            progress = 0.0
+            token_jepa = direct_jepa
+            regularizers = {
+                "delay_prior_loss": zero,
+                "monotonic_loss": zero,
+                "delay_smoothness_loss": zero,
+                "match_mass_loss": zero,
+                "delay_mean_ms": zero,
+                "delay_std_ms": zero,
+                "transport_entropy": zero,
+                "matched_mass": zero,
+                "minimum_matched_mass": zero,
+                "unmatched_mass": zero,
+            }
 
         private_reconstruction = token_jepa.new_zeros(())
         ecg_private_reconstruction = token_jepa.new_zeros(())
@@ -1500,6 +1532,7 @@ class JEPA(nn.Module):
             "masked_fraction": token_mask.float().mean().item(),
             "prediction_std": prediction_std.item(),
             "phase2_progress": progress,
+            "phase2_transport_enabled": self.phase2_transport_enabled,
             "shared_private_progress": shared_private_progress,
             "private_reconstruction": private_reconstruction.item(),
             "ecg_private_reconstruction": ecg_private_reconstruction.item(),

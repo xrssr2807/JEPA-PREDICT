@@ -15,7 +15,7 @@ from train_pretrain import (
 
 class Phase2JEPATests(unittest.TestCase):
     @staticmethod
-    def _tiny_model():
+    def _tiny_model(transport_enabled=True):
         return JEPA(
             cnn_channels=(8, 16),
             cnn_kernel_sizes=(3, 3),
@@ -34,6 +34,7 @@ class Phase2JEPATests(unittest.TestCase):
             phase1_mask_ratio=0.5,
             phase1_mask_block_tokens=3,
             phase1_bidirectional=True,
+            phase2_transport_enabled=transport_enabled,
             phase2_sample_rate_hz=100.0,
             phase2_min_delay_ms=40.0,
             phase2_max_delay_ms=160.0,
@@ -59,6 +60,35 @@ class Phase2JEPATests(unittest.TestCase):
         self.assertFalse(_checkpoint_is_eligible(healthy, 2, 0.95))
         self.assertTrue(_checkpoint_is_eligible(healthy, 2, 1.0))
         self.assertTrue(_checkpoint_is_eligible(healthy, 1, 0.0))
+        self.assertTrue(_checkpoint_is_eligible(
+            healthy,
+            2,
+            transport_progress=0.0,
+            transport_required=False,
+        ))
+
+    def test_transport_ablation_uses_direct_loss_only(self):
+        model = self._tiny_model(transport_enabled=False)
+        model.train()
+        model.set_phase2_progress(1.0)
+        loss, info, components = model.compute_loss(
+            torch.randn(3, 1, 64),
+            torch.randn(3, 1, 64),
+            return_components=True,
+        )
+
+        self.assertEqual(model.phase2_progress, 0.0)
+        self.assertFalse(info["phase2_transport_enabled"])
+        self.assertEqual(info["transport_token_jepa"], 0.0)
+        self.assertTrue(torch.allclose(
+            components["token_jepa"],
+            components["direct_token_jepa"],
+        ))
+        loss.backward()
+        self.assertTrue(all(
+            parameter.grad is None
+            for parameter in model.phase2_delay_head.parameters()
+        ))
 
     def test_early_stopping_requires_meaningful_validation_decrease(self):
         best, bad_epochs, improved = _early_stopping_step(
