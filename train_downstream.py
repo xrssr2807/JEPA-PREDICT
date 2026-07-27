@@ -41,6 +41,7 @@ from config import Config, DataConfig, ModelConfig, TrainConfig
 from dataset.data import (
     DownstreamDataset, DualDownstreamDataset,
     MultiDiseaseDataset, MultiDiseasePatientMILDataset,
+    multidisease_label_value,
 )
 from models.encoder import SignalEncoder
 from models.classifier import (
@@ -1568,7 +1569,10 @@ def compute_multilabel_pos_weight(dataset, device, max_weight: float = 20.0):
             item = pickle.load(f)
         label_dict = item.get("label", {})
         pos += np.array(
-            [float(label_dict.get(name, 0)) for name in dataset.disease_labels],
+            [
+                multidisease_label_value(label_dict, name)
+                for name in dataset.disease_labels
+            ],
             dtype=np.float64,
         )
 

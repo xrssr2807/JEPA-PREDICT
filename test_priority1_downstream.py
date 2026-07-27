@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from dataset.data import (
+    MULTIDISEASE_LABEL_SOURCES,
     MultiDiseasePatientMILDataset,
     multidisease_label_value,
 )
@@ -19,6 +20,7 @@ from models.classifier import (
 from models.jepa import SharedPrivateTokenProjector, TokenProjectionHead
 from config import Config
 from train_downstream import (
+    compute_multilabel_pos_weight,
     finalize_downstream_model,
     train_epoch,
     validate_downstream_checkpoint_context,
@@ -79,6 +81,24 @@ class PriorityOneDownstreamTests(unittest.TestCase):
             multidisease_label_value({}, "其他疾病"),
             0.0,
         )
+
+    def test_merged_label_is_included_in_positive_weight_statistics(self):
+        config = Config()
+        merged_label = config.data.multidisease_labels[3]
+        source_label = MULTIDISEASE_LABEL_SOURCES[merged_label][0]
+        dataset = type("Dataset", (), {
+            "files": ["train_patient_0.pkl"],
+            "data_dir": "/data",
+            "disease_labels": config.data.multidisease_labels,
+        })()
+        with mock.patch("builtins.open", mock.mock_open()), mock.patch(
+            "train_downstream.pickle.load",
+            return_value={"label": {source_label: 1}},
+        ):
+            weights = compute_multilabel_pos_weight(
+                dataset, torch.device("cpu")
+            )
+        self.assertAlmostEqual(float(weights[3]), 0.2, places=6)
 
     def test_short_patient_bag_is_zero_padded_and_masked(self):
         dataset = MultiDiseasePatientMILDataset.__new__(MultiDiseasePatientMILDataset)
