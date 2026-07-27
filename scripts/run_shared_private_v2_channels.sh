@@ -8,8 +8,10 @@ CHECKPOINT="${CHECKPOINT:-outputs_phase2_shared_private_seed42/jepa_best.pt}"
 SPLIT="${SPLIT:-splits/multidisease_taskaware_downstream.json}"
 OUTPUT_PREFIX="${OUTPUT_PREFIX:-outputs_spv2}"
 SEEDS="${SEEDS:-42 3407 2026}"
+HEAD_MODES="${HEAD_MODES:-on off}"
 WORKERS="${WORKERS:-8}"
-SHARED_PRIVATE_HEAD="${SHARED_PRIVATE_HEAD:-on}"
+SEAL_TEST="${SEAL_TEST:-1}"
+SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
@@ -30,10 +32,15 @@ if ! python train_downstream.py --help 2>&1 | grep -q -- "--shared_private_head"
     echo "Update branch soft-dtw-token-align before running this script." >&2
     exit 1
 fi
+if ! python train_downstream.py --help 2>&1 | grep -q -- "--seal_test"; then
+    echo "[Error] train_downstream.py does not support sealed development." >&2
+    exit 1
+fi
 
 run_channel() {
     local channel="$1"
     local seed="$2"
+    local head_mode="$3"
     local batch_size
     local chunk_size
 
@@ -45,7 +52,12 @@ run_channel() {
         chunk_size=128
     fi
 
-    local output_dir="${OUTPUT_PREFIX}_${channel}_seed${seed}"
+    local output_dir="${OUTPUT_PREFIX}_${head_mode}_${channel}_seed${seed}"
+    local saved_model="${output_dir}/downstream_multidisease_best.pt"
+    if [[ "$SKIP_COMPLETED" == "1" && -s "$saved_model" ]]; then
+        echo "[Skip] completed seed=$seed mode=$head_mode channel=$channel"
+        return
+    fi
     mkdir -p "$output_dir"
 
     echo
@@ -54,25 +66,32 @@ run_channel() {
     echo "[Run] channel=$channel"
     echo "[Run] checkpoint=$CHECKPOINT"
     echo "[Run] split=$SPLIT"
-    echo "[Run] shared_private_head=$SHARED_PRIVATE_HEAD"
+    echo "[Run] shared_private_head=$head_mode"
+    echo "[Run] seal_test=$SEAL_TEST"
     echo "[Run] batch_size=$batch_size chunk_size=$chunk_size"
     echo "[Run] output=$output_dir"
     echo "============================================================"
+
+    local seal_args=()
+    if [[ "$SEAL_TEST" == "1" ]]; then
+        seal_args+=(--seal_test)
+    fi
 
     python -u train_downstream.py \
         --checkpoint "$CHECKPOINT" \
         --dataset multidisease \
         --multidisease_channel "$channel" \
         --multidisease_split "$SPLIT" \
-        --shared_private_head "$SHARED_PRIVATE_HEAD" \
+        --shared_private_head "$head_mode" \
         --output_dir "$output_dir" \
         --mil_batch_size "$batch_size" \
         --mil_chunk_size "$chunk_size" \
         --workers "$WORKERS" \
         --seed "$seed" \
+        "${seal_args[@]}" \
         2>&1 | tee "$output_dir/downstream_console.log"
 
-    echo "[Done] seed=$seed channel=$channel"
+    echo "[Done] seed=$seed mode=$head_mode channel=$channel"
 }
 
 read -r -a seed_values <<< "$SEEDS"
@@ -87,10 +106,23 @@ for seed in "${seed_values[@]}"; do
         exit 1
     fi
 
-    echo "[Sequence] seed=$seed | PPG -> ECG -> ECG+PPG"
-    run_channel ppg "$seed"
-    run_channel ecg "$seed"
-    run_channel both "$seed"
+    read -r -a head_mode_values <<< "$HEAD_MODES"
+    for head_mode in "${head_mode_values[@]}"; do
+        if [[ "$head_mode" != "on" && "$head_mode" != "off" ]]; then
+            echo "[Error] HEAD_MODES accepts only on/off, got: $head_mode" >&2
+            exit 1
+        fi
+        echo "[Sequence] seed=$seed mode=$head_mode | PPG -> ECG -> ECG+PPG"
+        run_channel ppg "$seed" "$head_mode"
+        run_channel ecg "$seed" "$head_mode"
+        run_channel both "$seed" "$head_mode"
+    done
 done
 
-echo "[Complete] All downstream experiments finished for seeds: $SEEDS"
+python scripts/summarize_shared_private_ablation.py \
+    --output_prefix "$OUTPUT_PREFIX" \
+    --seeds $SEEDS \
+    --head_modes $HEAD_MODES
+
+echo "[Complete] All downstream experiments finished."
+echo "[Complete] seeds=$SEEDS head_modes=$HEAD_MODES seal_test=$SEAL_TEST"

@@ -22,7 +22,7 @@ class DataConfig:
     arrhythmia_dir: str = "/root/processed_dataset"
     multidisease_dir: str = "/root/ppgchd/ppgchd/data_updated"
     multidisease_development_split: str = "splits/development_split.json"
-    multidisease_split_file: str = "splits/multidisease_patient_split.json"
+    multidisease_split_file: str = "splits/multidisease_taskaware_downstream.json"
     multidisease_taskaware_split_file: str = "splits/multidisease_taskaware_split.json"
 
     # Preprocessing

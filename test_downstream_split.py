@@ -5,7 +5,10 @@ from unittest import mock
 
 import numpy as np
 
-from generate_multidisease_patient_split import iterative_multilabel_split
+from generate_multidisease_patient_split import (
+    derive_downstream_manifest,
+    iterative_multilabel_split,
+)
 from train_downstream import (
     load_multidisease_split_manifest,
     load_taskaware_multidisease_split_manifest,
@@ -60,6 +63,28 @@ class MultidiseaseDevelopmentSplitTests(unittest.TestCase):
                 {"train": train, "val": val, "test": test}, train + test
             )
 
+    def test_manifest_label_schema_mismatch_is_rejected(self):
+        manifest = {
+            "metadata": {"disease_labels": ["old_label"]},
+            "train": ["train_patienta_0.pkl"],
+            "val": ["train_patientb_0.pkl"],
+            "test": ["test_patientc_0.pkl"],
+        }
+        split_path = "/repo/splits/multidisease_patient_split.json"
+        with mock.patch(
+            "train_downstream.resolve_multidisease_split_file",
+            return_value=split_path,
+        ), mock.patch(
+            "builtins.open",
+            mock.mock_open(read_data=json.dumps(manifest)),
+        ), self.assertRaisesRegex(ValueError, "label schema"):
+            load_multidisease_split_manifest(
+                split_path,
+                "/data",
+                manifest["train"] + manifest["val"] + manifest["test"],
+                expected_disease_labels=["new_label"],
+            )
+
     def test_iterative_split_has_exact_sizes_and_no_unassigned_patients(self):
         labels = np.asarray([
             [1, 0, 0], [1, 1, 0], [0, 1, 0], [0, 0, 1],
@@ -108,6 +133,68 @@ class MultidiseaseDevelopmentSplitTests(unittest.TestCase):
             load_taskaware_multidisease_split_manifest(
                 split_path, "/data", files
             )
+
+    def test_taskaware_manifest_derives_exact_downstream_roles(self):
+        labels = ["label_a", "label_b"]
+        taskaware = {
+            "metadata": {
+                "version": 1,
+                "ratios": {
+                    "feedback_train": 0.55,
+                    "feedback_meta": 0.15,
+                    "val": 0.15,
+                    "test": 0.15,
+                },
+                "patient_counts": {
+                    "feedback_train": 2,
+                    "feedback_meta": 1,
+                    "val": 1,
+                    "test": 1,
+                },
+                "file_counts": {
+                    "feedback_train": 2,
+                    "feedback_meta": 1,
+                    "val": 1,
+                    "test": 1,
+                },
+                "disease_labels": labels,
+                "positive_patient_counts": {
+                    "feedback_train": {"label_a": 1, "label_b": 1},
+                    "feedback_meta": {"label_a": 1, "label_b": 0},
+                    "val": {"label_a": 0, "label_b": 1},
+                    "test": {"label_a": 1, "label_b": 1},
+                },
+            },
+            "feedback_train": [
+                "train_patientb_0.pkl",
+                "train_patienta_0.pkl",
+            ],
+            "feedback_meta": ["train_patientc_0.pkl"],
+            "val": ["train_patientd_0.pkl"],
+            "test": ["test_patiente_0.pkl"],
+        }
+        downstream = derive_downstream_manifest(taskaware)
+
+        self.assertEqual(
+            downstream["train"],
+            [
+                "train_patienta_0.pkl",
+                "train_patientb_0.pkl",
+                "train_patientc_0.pkl",
+            ],
+        )
+        self.assertEqual(
+            downstream["metadata"]["patient_counts"],
+            {"train": 3, "val": 1, "test": 1},
+        )
+        self.assertEqual(
+            downstream["metadata"]["positive_patient_counts"]["train"],
+            {"label_a": 2, "label_b": 1},
+        )
+        self.assertEqual(
+            downstream["metadata"]["source_roles"]["train"],
+            ["feedback_train", "feedback_meta"],
+        )
 
 
 if __name__ == "__main__":

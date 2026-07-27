@@ -126,7 +126,10 @@ def build_feedback_dataloaders(config: Config, split_file: str):
     available = _available_multidisease_files(config.data.multidisease_dir)
     train_files, meta_files, val_files, test_files, resolved = (
         load_taskaware_multidisease_split_manifest(
-            split_file, config.data.multidisease_dir, available
+            split_file,
+            config.data.multidisease_dir,
+            available,
+            expected_disease_labels=config.data.multidisease_labels,
         )
     )
     feedback_train = _make_patient_dataset(config, train_files, train=True)

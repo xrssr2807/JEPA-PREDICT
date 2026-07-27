@@ -148,6 +148,7 @@ def load_multidisease_named_split_manifest(
     data_dir: str,
     available_files: List[str],
     split_names: Sequence[str],
+    expected_disease_labels: Optional[Sequence[str]] = None,
 ) -> Tuple[Dict[str, List[str]], str]:
     """Load and validate an exact patient-disjoint named split manifest."""
     split_names = tuple(split_names)
@@ -159,6 +160,17 @@ def load_multidisease_named_split_manifest(
 
     if not isinstance(manifest, dict):
         raise ValueError("Multidisease split must be a JSON object")
+    manifest_labels = manifest.get("metadata", {}).get("disease_labels")
+    if (
+        expected_disease_labels is not None
+        and manifest_labels is not None
+        and list(manifest_labels) != list(expected_disease_labels)
+    ):
+        raise ValueError(
+            "Multidisease split label schema does not match the current "
+            f"configuration. manifest={manifest_labels}, "
+            f"config={list(expected_disease_labels)}. Regenerate the split."
+        )
 
     split_lists = {}
     for split_name in split_names:
@@ -228,10 +240,15 @@ def load_multidisease_split_manifest(
     split_file: str,
     data_dir: str,
     available_files: List[str],
+    expected_disease_labels: Optional[Sequence[str]] = None,
 ) -> Tuple[List[str], List[str], List[str], str]:
     """Load and validate an exact patient-disjoint train/val/test manifest."""
     splits, resolved = load_multidisease_named_split_manifest(
-        split_file, data_dir, available_files, ("train", "val", "test")
+        split_file,
+        data_dir,
+        available_files,
+        ("train", "val", "test"),
+        expected_disease_labels=expected_disease_labels,
     )
     return splits["train"], splits["val"], splits["test"], resolved
 
@@ -240,11 +257,16 @@ def load_taskaware_multidisease_split_manifest(
     split_file: str,
     data_dir: str,
     available_files: List[str],
+    expected_disease_labels: Optional[Sequence[str]] = None,
 ) -> Tuple[List[str], List[str], List[str], List[str], str]:
     """Load the four patient-disjoint splits used by task-aware pre-training."""
     names = ("feedback_train", "feedback_meta", "val", "test")
     splits, resolved = load_multidisease_named_split_manifest(
-        split_file, data_dir, available_files, names
+        split_file,
+        data_dir,
+        available_files,
+        names,
+        expected_disease_labels=expected_disease_labels,
     )
     return (
         splits["feedback_train"],
@@ -371,6 +393,7 @@ def build_downstream_dataloaders(
                 split_manifest,
                 data_config.multidisease_dir,
                 available_files,
+                expected_disease_labels=data_config.multidisease_labels,
             )
             val_dataset = copy.deepcopy(train_dataset)
             train_dataset.files = train_files
@@ -1558,10 +1581,285 @@ def compute_multilabel_pos_weight(dataset, device, max_weight: float = 20.0):
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
+def validate_downstream_checkpoint_context(
+    checkpoint: dict,
+    config: Config,
+    split_provenance: Optional[dict],
+    use_shared_private_head: bool,
+):
+    """Reject final evaluation when its experimental context does not match."""
+    expected_labels = list(config.data.multidisease_labels)
+    saved_labels = checkpoint.get("disease_labels")
+    if saved_labels is not None and list(saved_labels) != expected_labels:
+        raise ValueError(
+            "Saved downstream checkpoint label schema mismatch: "
+            f"checkpoint={saved_labels}, config={expected_labels}"
+        )
+
+    saved_channel = checkpoint.get("multidisease_channel")
+    current_channel = config.data.multidisease_channel
+    if saved_channel is not None and str(saved_channel) != str(current_channel):
+        raise ValueError(
+            "Saved downstream checkpoint channel mismatch: "
+            f"checkpoint={saved_channel}, config={current_channel}"
+        )
+
+    saved_seed = checkpoint.get("seed")
+    if saved_seed is not None and int(saved_seed) != int(config.seed):
+        raise ValueError(
+            "Saved downstream checkpoint seed mismatch: "
+            f"checkpoint={saved_seed}, current={config.seed}"
+        )
+
+    saved_head = checkpoint.get("shared_private_head")
+    if (
+        saved_head is not None
+        and bool(saved_head) != bool(use_shared_private_head)
+    ):
+        raise ValueError(
+            "Saved downstream checkpoint Shared-Private mode mismatch: "
+            f"checkpoint={bool(saved_head)}, current={bool(use_shared_private_head)}"
+        )
+
+    saved_split = checkpoint.get("data_split") or {}
+    if (
+        split_provenance is not None
+        and saved_split.get("sha256")
+        and saved_split["sha256"] != split_provenance["sha256"]
+    ):
+        raise ValueError(
+            "Saved downstream checkpoint split mismatch: "
+            f"checkpoint={saved_split['sha256']}, "
+            f"current={split_provenance['sha256']}"
+        )
+
+
+def save_torch_checkpoint_atomic(state: dict, path: str):
+    """Save a checkpoint atomically, including on non-ASCII Windows paths."""
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(temporary_path, "wb") as handle:
+            torch.save(state, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+
+def finalize_downstream_model(
+    model,
+    best_state: dict,
+    val_loader,
+    test_loader,
+    criterion,
+    device,
+    config: Config,
+    dataset: str,
+    num_classes: int,
+    focus_idx: int,
+    use_dual: bool,
+    use_amp: bool,
+    log_fh,
+    evaluate_test: bool,
+) -> float:
+    """Tune on validation, save reproducibly, and optionally unseal test."""
+    if best_state is None:
+        raise RuntimeError("No valid downstream checkpoint was produced")
+    model.load_state_dict(best_state["model_state_dict"])
+
+    thresholds = best_state.get("thresholds")
+    multilabel = dataset in ("multidisease", "multilabel")
+    if multilabel and thresholds is None:
+        if val_loader is None:
+            raise ValueError(
+                "Threshold tuning and sealed development require a validation set"
+            )
+        (
+            _, val_acc, val_auc, val_auc_list, _, _, _, _, _, _,
+            val_labels, val_probs,
+        ) = evaluate_multilabel(
+            model,
+            val_loader,
+            criterion,
+            device,
+            config.data.multidisease_labels,
+            use_amp=use_amp,
+        )
+        thresholds_array = tune_thresholds_from_config(
+            val_labels, val_probs, config.train
+        )
+        thresholds = thresholds_array.tolist()
+        val_preds = (
+            val_probs >= thresholds_array.reshape(1, -1)
+        ).astype(np.float32)
+        val_acc = float((val_preds == val_labels).mean() * 100.0)
+        validation_rows = multilabel_per_class_metrics(
+            config.data.multidisease_labels,
+            val_labels,
+            val_preds,
+            val_probs,
+            val_auc_list,
+        )
+        val_prec = precision_score(
+            val_labels, val_preds, average="macro", zero_division=0
+        )
+        val_rec = recall_score(
+            val_labels, val_preds, average="macro", zero_division=0
+        )
+        val_f1 = fbeta_score(
+            val_labels, val_preds, beta=1.0, average="macro", zero_division=0
+        )
+        val_f05 = fbeta_score(
+            val_labels, val_preds, beta=0.5, average="macro", zero_division=0
+        )
+        best_state["thresholds"] = thresholds
+        best_state["validation_metrics"] = {
+            "acc": float(val_acc),
+            "auc": float(val_auc),
+            "auc_per_class": [float(value) for value in val_auc_list],
+            "precision": float(val_prec),
+            "recall": float(val_rec),
+            "f1": float(val_f1),
+            "f05": float(val_f05),
+            "per_class_metrics": validation_rows,
+        }
+        threshold_msg = (
+            f"Tuned thresholds ({config.train.threshold_strategy}, "
+            f"recall_floor={config.train.threshold_recall_floor}, "
+            f"metric={config.train.threshold_opt_metric}): "
+            f"{[round(float(t), 3) for t in thresholds]}"
+        )
+        print(threshold_msg)
+        log_fh.write(threshold_msg + "\n")
+
+    save_path = os.path.join(
+        config.output_dir, f"downstream_{dataset}_best.pt"
+    )
+    if not evaluate_test:
+        best_state["test_evaluated"] = False
+        best_state["test_status"] = "sealed"
+        save_torch_checkpoint_atomic(best_state, save_path)
+        print("\n" + "=" * 60)
+        print("DEVELOPMENT COMPLETE (TEST SET SEALED)")
+        print("=" * 60)
+        print(f"Best Val AUC (macro): {best_state['val_auc']:.4f}")
+        if best_state.get("val_chd_auc") is not None:
+            print(f"CHD/Coronary AUC:     {best_state['val_chd_auc']:.4f}")
+        print(f"Model saved -> {save_path}")
+        log_fh.write(
+            "\nDEVELOPMENT COMPLETE | TEST SET SEALED | "
+            f"Val AUC={best_state['val_auc']:.4f} "
+            f"CHD_AUC={best_state.get('val_chd_auc')}\n"
+        )
+        log_fh.write(f"Model saved -> {save_path}\n")
+        return float(best_state["val_acc"])
+
+    print("\n" + "=" * 60)
+    print("FINAL EVALUATION (SEALED TEST SET)")
+    print("=" * 60)
+    if multilabel:
+        (
+            _, test_acc, auc, auc_list, prec, rec, f1, f05, report,
+            test_preds, test_labels, test_probs,
+        ) = evaluate_multilabel(
+            model,
+            test_loader,
+            criterion,
+            device,
+            config.data.multidisease_labels,
+            thresholds=thresholds,
+            use_amp=use_amp,
+        )
+        per_class_rows = multilabel_per_class_metrics(
+            config.data.multidisease_labels,
+            test_labels,
+            test_preds,
+            test_probs,
+            auc_list,
+        )
+        per_class_table = format_multilabel_metrics_table(per_class_rows)
+        chd_row = (
+            per_class_rows[focus_idx]
+            if 0 <= focus_idx < len(per_class_rows)
+            else None
+        )
+    else:
+        (
+            _, test_acc, auc, auc_list, prec, rec, f1, f05, report,
+            _, _, _,
+        ) = evaluate(
+            model,
+            test_loader,
+            criterion,
+            device,
+            num_classes,
+            is_dual=use_dual,
+        )
+        per_class_rows = None
+        per_class_table = None
+        chd_row = None
+
+    print(f"Best Test Acc:       {test_acc:.2f}%")
+    print(f"Best Test AUC (macro): {auc:.4f}")
+    if auc_list:
+        print(f"Per-class AUC:        {[round(a, 4) for a in auc_list]}")
+    if chd_row is not None:
+        print(
+            f"CHD/Coronary AUC:      {chd_row['auc']:.4f} "
+            f"(P={chd_row['precision']:.4f}, R={chd_row['recall']:.4f}, "
+            f"F1={chd_row['f1']:.4f}, support={chd_row['support']})"
+        )
+    print(f"Precision (macro):   {prec:.4f}")
+    print(f"Recall (macro):      {rec:.4f}")
+    print(f"F1 (macro):          {f1:.4f}")
+    print(f"F0.5 (macro):        {f05:.4f}")
+    if per_class_table is not None:
+        print(f"\n{per_class_table}")
+    print(f"\nClassification Report:\n{report}")
+
+    best_state["test_evaluated"] = True
+    best_state["test_status"] = "evaluated"
+    best_state["test_auc"] = float(auc)
+    best_state["test_acc"] = float(test_acc)
+    best_state["test_f1"] = float(f1)
+    if per_class_rows is not None:
+        best_state["test_per_class_metrics"] = per_class_rows
+    if chd_row is not None:
+        best_state["test_chd_auc"] = float(chd_row["auc"])
+    save_torch_checkpoint_atomic(best_state, save_path)
+    print(f"Model saved -> {save_path}")
+
+    log_fh.write(f"\n{'='*60}\n")
+    log_fh.write(
+        f"FINAL | Acc={test_acc:.2f}% AUC={auc:.4f} F1={f1:.4f}\n"
+    )
+    if auc_list:
+        log_fh.write(
+            f"Per-class AUC: {[round(float(a), 4) for a in auc_list]}\n"
+        )
+    if chd_row is not None:
+        log_fh.write(
+            f"CHD/Coronary AUC: {chd_row['auc']:.4f} "
+            f"P={chd_row['precision']:.4f} R={chd_row['recall']:.4f} "
+            f"F1={chd_row['f1']:.4f} support={chd_row['support']}\n"
+        )
+    if per_class_table is not None:
+        log_fh.write(per_class_table + "\n")
+    log_fh.write(f"Classification Report:\n{report}\n")
+    log_fh.write(f"Model saved -> {save_path}\n")
+    return float(test_acc)
+
+
 def train_downstream(
     config: Config,
     checkpoint_path: str,
     dataset: str = "chd",
+    seal_test: bool = False,
+    evaluate_checkpoint: Optional[str] = None,
 ):
     """
     Downstream fine-tuning pipeline.
@@ -1983,6 +2281,43 @@ def train_downstream(
             f"best_metric={config.train.best_metric}"
         )
 
+    # One-time test unsealing reuses the exact training-time model factory.
+    if evaluate_checkpoint is not None:
+        saved_state = torch.load(
+            evaluate_checkpoint, map_location="cpu", weights_only=False
+        )
+        if not isinstance(saved_state, dict) or "model_state_dict" not in saved_state:
+            raise ValueError(
+                "--evaluate_checkpoint must be a downstream checkpoint "
+                "containing model_state_dict"
+            )
+        if multilabel:
+            validate_downstream_checkpoint_context(
+                saved_state,
+                config,
+                split_provenance,
+                use_shared_private_head,
+            )
+        saved_state["source_checkpoint"] = os.path.abspath(evaluate_checkpoint)
+        result = finalize_downstream_model(
+            model=model,
+            best_state=saved_state,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            criterion=criterion,
+            device=device,
+            config=config,
+            dataset=dataset,
+            num_classes=num_classes,
+            focus_idx=focus_idx,
+            use_dual=use_dual,
+            use_amp=use_amp,
+            log_fh=log_fh,
+            evaluate_test=True,
+        )
+        log_fh.close()
+        return result
+
     # ── Phase 1: Linear Probe ──
     full_train_loader = train_loader
     full_encoder_chunk_size = getattr(model, "encoder_chunk_size", None)
@@ -2186,6 +2521,8 @@ def train_downstream(
                 "val_chd_auc": focus_auc, "val_best_metric": selected_metric,
                 "best_metric": config.train.best_metric,
                 "seed": config.seed,
+                "pretrained_checkpoint": os.path.abspath(checkpoint_path),
+                "label_schema_version": 2 if multilabel else None,
                 "multidisease_channel": (
                     config.data.multidisease_channel if multilabel else None
                 ),
@@ -2227,101 +2564,30 @@ def train_downstream(
 
     # ── Final Report ──
     print("\n" + "=" * 60)
-    print("FINAL EVALUATION (Best Model)")
+    print(
+        "FINALIZE DEVELOPMENT (TEST SEALED)"
+        if seal_test else "FINAL EVALUATION (Best Model)"
+    )
     print("=" * 60)
 
-    # Load best model and re-evaluate
-    if best_state is not None:
-        model.load_state_dict(best_state["model_state_dict"])
-    if multilabel:
-        thresholds = None
-        if val_loader is not None:
-            (_, _, _, _, _, _, _, _, _, _, val_labels, val_probs) = evaluate_multilabel(
-                model, val_loader, criterion, device, config.data.multidisease_labels,
-                use_amp=use_amp,
-            )
-            thresholds = tune_thresholds_from_config(val_labels, val_probs, config.train)
-            threshold_msg = (
-                f"Tuned thresholds ({config.train.threshold_strategy}, "
-                f"recall_floor={config.train.threshold_recall_floor}, "
-                f"metric={config.train.threshold_opt_metric}): "
-                f"{[round(float(t), 3) for t in thresholds]}"
-            )
-            print(threshold_msg)
-            log_fh.write(threshold_msg + "\n")
-            if best_state is not None:
-                best_state["thresholds"] = thresholds.tolist()
-
-        (_, test_acc, auc, auc_list,
-         prec, rec, f1, f05, report, test_preds, test_labels, test_probs) = evaluate_multilabel(
-            model, test_loader, criterion, device, config.data.multidisease_labels,
-            thresholds=thresholds,
-            use_amp=use_amp,
-        )
-        per_class_rows = multilabel_per_class_metrics(
-            config.data.multidisease_labels, test_labels, test_preds, test_probs, auc_list
-        )
-        per_class_table = format_multilabel_metrics_table(per_class_rows)
-        chd_row = (
-            per_class_rows[focus_idx]
-            if 0 <= focus_idx < len(per_class_rows)
-            else None
-        )
-    else:
-        (_, test_acc, auc, auc_list,
-         prec, rec, f1, f05, report, _, _, _) = evaluate(
-            model, test_loader, criterion, device, num_classes, is_dual=use_dual,
-        )
-        per_class_table = None
-        chd_row = None
-
-    print(f"Best Test Acc:       {test_acc:.2f}%")
-    print(f"Best Test AUC (macro): {auc:.4f}")
-    if auc_list:
-        print(f"Per-class AUC:        {[round(a, 4) for a in auc_list]}")
-    if chd_row is not None:
-        print(
-            f"CHD/冠心病 AUC:        {chd_row['auc']:.4f} "
-            f"(P={chd_row['precision']:.4f}, R={chd_row['recall']:.4f}, "
-            f"F1={chd_row['f1']:.4f}, support={chd_row['support']})"
-        )
-    print(f"Precision (macro):   {prec:.4f}")
-    print(f"Recall (macro):      {rec:.4f}")
-    print(f"F1 (macro):          {f1:.4f}")
-    print(f"F0.5 (macro):        {f05:.4f}")
-    if per_class_table is not None:
-        print(f"\n{per_class_table}")
-    print(f"\nClassification Report:\n{report}")
-
-    # Save
-    save_path = os.path.join(config.output_dir, f"downstream_{dataset}_best.pt")
-    if best_state is not None:
-        if multilabel and per_class_table is not None:
-            best_state["test_auc"] = float(auc)
-            best_state["test_per_class_metrics"] = per_class_rows
-            if chd_row is not None:
-                best_state["test_chd_auc"] = float(chd_row["auc"])
-        torch.save(best_state, save_path)
-        print(f"Model saved → {save_path}")
-        log_fh.write(f"Model saved → {save_path}\n")
-
-    # ── Final log ──
-    log_fh.write(f"\n{'='*60}\n")
-    log_fh.write(f"FINAL | Acc={test_acc:.2f}% AUC={auc:.4f} F1={f1:.4f}\n")
-    if auc_list:
-        log_fh.write(f"Per-class AUC: {[round(float(a), 4) for a in auc_list]}\n")
-    if chd_row is not None:
-        log_fh.write(
-            f"CHD/冠心病 AUC: {chd_row['auc']:.4f} "
-            f"P={chd_row['precision']:.4f} R={chd_row['recall']:.4f} "
-            f"F1={chd_row['f1']:.4f} support={chd_row['support']}\n"
-        )
-    if per_class_table is not None:
-        log_fh.write(per_class_table + "\n")
-    log_fh.write(f"Classification Report:\n{report}\n")
+    result = finalize_downstream_model(
+        model=model,
+        best_state=best_state,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        criterion=criterion,
+        device=device,
+        config=config,
+        dataset=dataset,
+        num_classes=num_classes,
+        focus_idx=focus_idx,
+        use_dual=use_dual,
+        use_amp=use_amp,
+        log_fh=log_fh,
+        evaluate_test=not seal_test,
+    )
     log_fh.close()
-
-    return test_acc
+    return result
 
 
 # ── CLI ─────────────────────────────────────────────────────────
@@ -2369,6 +2635,23 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no_amp", action="store_true",
         help="Disable downstream automatic mixed precision",
+    )
+    parser.add_argument(
+        "--seal_test",
+        action="store_true",
+        help=(
+            "Development mode: tune thresholds on validation and save the "
+            "best model without iterating over the test loader"
+        ),
+    )
+    parser.add_argument(
+        "--evaluate_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "One-time final evaluation of a saved downstream checkpoint. "
+            "Skips training and validates split/channel/label provenance."
+        ),
     )
     parser.add_argument(
         "--shared_private_head",
@@ -2439,4 +2722,10 @@ if __name__ == "__main__":
     config.output_dir = args.output_dir
     os.makedirs(config.output_dir, exist_ok=True)
 
-    train_downstream(config, args.checkpoint, args.dataset)
+    train_downstream(
+        config,
+        args.checkpoint,
+        args.dataset,
+        seal_test=args.seal_test,
+        evaluate_checkpoint=args.evaluate_checkpoint,
+    )

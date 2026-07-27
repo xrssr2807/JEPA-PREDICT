@@ -1,4 +1,6 @@
+import io
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -15,7 +17,12 @@ from models.classifier import (
     SharedPrivateSegmentAdapter,
 )
 from models.jepa import SharedPrivateTokenProjector, TokenProjectionHead
-from train_downstream import train_epoch
+from config import Config
+from train_downstream import (
+    finalize_downstream_model,
+    train_epoch,
+    validate_downstream_checkpoint_context,
+)
 
 
 class DummyEncoder(nn.Module):
@@ -207,6 +214,79 @@ class PriorityOneDownstreamTests(unittest.TestCase):
             teacher_embedding_weight=0.1, teacher_temperature=2.0,
         )
         self.assertTrue(np.isfinite(loss))
+
+    def test_sealed_development_never_evaluates_test_loader(self):
+        config = Config()
+        model = nn.Linear(1, 1)
+        labels = np.zeros(
+            (2, len(config.data.multidisease_labels)), dtype=np.int64
+        )
+        labels[0, :] = 1
+        probs = np.full(labels.shape, 0.5, dtype=np.float32)
+        predictions = np.zeros_like(labels)
+        auc_list = [0.5] * labels.shape[1]
+        evaluation = (
+            0.5, 75.0, 0.5, auc_list, 0.0, 0.0, 0.0, 0.0,
+            "validation report", predictions, labels, probs,
+        )
+        best_state = {
+            "model_state_dict": model.state_dict(),
+            "val_acc": 75.0,
+            "val_auc": 0.5,
+            "val_f1": 0.0,
+            "val_chd_auc": 0.5,
+        }
+
+        config.output_dir = "."
+        with mock.patch(
+            "train_downstream.evaluate_multilabel",
+            return_value=evaluation,
+        ) as evaluate_mock, mock.patch(
+            "train_downstream.tune_thresholds_from_config",
+            return_value=np.full(labels.shape[1], 0.5),
+        ), mock.patch(
+            "train_downstream.save_torch_checkpoint_atomic",
+        ) as save_mock:
+            finalize_downstream_model(
+                model=model,
+                best_state=best_state,
+                val_loader="validation_loader",
+                test_loader="sealed_test_loader",
+                criterion=None,
+                device=torch.device("cpu"),
+                config=config,
+                dataset="multidisease",
+                num_classes=labels.shape[1],
+                focus_idx=4,
+                use_dual=False,
+                use_amp=False,
+                log_fh=io.StringIO(),
+                evaluate_test=False,
+            )
+
+        self.assertEqual(evaluate_mock.call_count, 1)
+        self.assertEqual(
+            evaluate_mock.call_args.args[1], "validation_loader"
+        )
+        checkpoint = save_mock.call_args.args[0]
+        self.assertFalse(checkpoint["test_evaluated"])
+        self.assertEqual(checkpoint["test_status"], "sealed")
+
+    def test_final_evaluation_rejects_split_hash_mismatch(self):
+        config = Config()
+        checkpoint = {
+            "disease_labels": list(config.data.multidisease_labels),
+            "multidisease_channel": config.data.multidisease_channel,
+            "shared_private_head": True,
+            "data_split": {"sha256": "old"},
+        }
+        with self.assertRaisesRegex(ValueError, "split mismatch"):
+            validate_downstream_checkpoint_context(
+                checkpoint,
+                config,
+                {"sha256": "new"},
+                use_shared_private_head=True,
+            )
 
 
 if __name__ == "__main__":

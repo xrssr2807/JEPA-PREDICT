@@ -227,10 +227,138 @@ def build_manifest(
     return {"metadata": metadata, **split_files}
 
 
+def derive_downstream_manifest(taskaware_manifest: dict) -> dict:
+    """Merge task-aware development roles into a sealed train/val/test split."""
+    missing = [
+        name for name in TASKAWARE_SPLIT_NAMES
+        if not isinstance(taskaware_manifest.get(name), list)
+    ]
+    if missing:
+        raise ValueError(
+            "Task-aware manifest is missing list splits: " + ", ".join(missing)
+        )
+
+    metadata = taskaware_manifest.get("metadata", {})
+    patient_counts = metadata.get("patient_counts", {})
+    positive_counts = metadata.get("positive_patient_counts", {})
+    disease_labels = list(metadata.get("disease_labels", []))
+    if not disease_labels:
+        raise ValueError("Task-aware manifest metadata has no disease_labels")
+
+    file_sets = {
+        name: set(taskaware_manifest[name])
+        for name in TASKAWARE_SPLIT_NAMES
+    }
+    uid_sets = {
+        name: {uid_from_filename(filename) for filename in files}
+        for name, files in file_sets.items()
+    }
+    for left_index, left in enumerate(TASKAWARE_SPLIT_NAMES):
+        for right in TASKAWARE_SPLIT_NAMES[left_index + 1:]:
+            if file_sets[left] & file_sets[right]:
+                raise ValueError(
+                    f"Task-aware manifest has {left}/{right} file leakage"
+                )
+            if uid_sets[left] & uid_sets[right]:
+                raise ValueError(
+                    f"Task-aware manifest has {left}/{right} patient leakage"
+                )
+    for name in TASKAWARE_SPLIT_NAMES:
+        recorded_count = patient_counts.get(name)
+        if recorded_count is not None and int(recorded_count) != len(uid_sets[name]):
+            raise ValueError(
+                f"Task-aware {name} patient count mismatch: "
+                f"metadata={recorded_count}, actual={len(uid_sets[name])}"
+            )
+
+    train_files = sorted(
+        taskaware_manifest["feedback_train"]
+        + taskaware_manifest["feedback_meta"]
+    )
+    val_files = sorted(taskaware_manifest["val"])
+    test_files = sorted(taskaware_manifest["test"])
+
+    train_positive_counts = {}
+    for label in disease_labels:
+        train_positive_counts[label] = int(
+            positive_counts.get("feedback_train", {}).get(label, 0)
+            + positive_counts.get("feedback_meta", {}).get(label, 0)
+        )
+
+    downstream_metadata = {
+        **metadata,
+        "version": max(2, int(metadata.get("version", 1))),
+        "split_purpose": "downstream_development",
+        "source_roles": {
+            "train": ["feedback_train", "feedback_meta"],
+            "val": ["val"],
+            "test": ["test"],
+        },
+        "ratios": {
+            "train": float(metadata.get("ratios", {}).get("feedback_train", 0.0))
+            + float(metadata.get("ratios", {}).get("feedback_meta", 0.0)),
+            "val": float(metadata.get("ratios", {}).get("val", 0.0)),
+            "test": float(metadata.get("ratios", {}).get("test", 0.0)),
+        },
+        "patient_counts": {
+            "train": len(uid_sets["feedback_train"])
+            + len(uid_sets["feedback_meta"]),
+            "val": len(uid_sets["val"]),
+            "test": len(uid_sets["test"]),
+        },
+        "file_counts": {
+            "train": len(train_files),
+            "val": len(val_files),
+            "test": len(test_files),
+        },
+        "positive_patient_counts": {
+            "train": train_positive_counts,
+            "val": {
+                label: int(positive_counts.get("val", {}).get(label, 0))
+                for label in disease_labels
+            },
+            "test": {
+                label: int(positive_counts.get("test", {}).get(label, 0))
+                for label in disease_labels
+            },
+        },
+    }
+    return {
+        "metadata": downstream_metadata,
+        "train": train_files,
+        "val": val_files,
+        "test": test_files,
+    }
+
+
+def save_manifest_atomic(manifest: dict, output_path: str):
+    """Write a split manifest atomically so interrupted jobs cannot corrupt it."""
+    output_path = os.path.abspath(output_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    temporary_path = f"{output_path}.tmp.{os.getpid()}"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, output_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default=Config().data.multidisease_dir)
     parser.add_argument("--output", default=None)
+    parser.add_argument(
+        "--downstream_output",
+        default=None,
+        help=(
+            "Derived train/val/test output for --taskaware. Defaults to "
+            "splits/multidisease_taskaware_downstream.json"
+        ),
+    )
     parser.add_argument("--train_ratio", type=float, default=0.70)
     parser.add_argument("--feedback_train_ratio", type=float, default=0.55)
     parser.add_argument("--feedback_meta_ratio", type=float, default=0.15)
@@ -286,20 +414,23 @@ def main():
     )
 
     output_path = os.path.abspath(args.output or default_output)
-    output_dir = os.path.dirname(output_path)
-    os.makedirs(output_dir, exist_ok=True)
-    temporary_path = f"{output_path}.tmp.{os.getpid()}"
-    try:
-        with open(temporary_path, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temporary_path, output_path)
-    finally:
-        if os.path.exists(temporary_path):
-            os.remove(temporary_path)
+    save_manifest_atomic(manifest, output_path)
     print(json.dumps(manifest["metadata"], ensure_ascii=False, indent=2))
     print(f"Saved patient-disjoint split to {output_path}")
+    if args.taskaware:
+        downstream_manifest = derive_downstream_manifest(manifest)
+        downstream_output = os.path.abspath(
+            args.downstream_output
+            or "splits/multidisease_taskaware_downstream.json"
+        )
+        downstream_manifest["metadata"]["derived_from"] = os.path.basename(
+            output_path
+        )
+        save_manifest_atomic(downstream_manifest, downstream_output)
+        print(
+            "Saved sealed downstream train/val/test split to "
+            f"{downstream_output}"
+        )
 
 
 if __name__ == "__main__":
