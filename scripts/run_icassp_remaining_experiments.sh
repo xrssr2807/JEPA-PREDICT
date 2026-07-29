@@ -29,9 +29,50 @@ stage() {
     echo "################################################################"
 }
 
+resolve_checkpoint() {
+    local label="$1"
+    local explicit="$2"
+    shift 2
+    local candidate
+
+    if [[ -n "$explicit" ]]; then
+        [[ -s "$explicit" ]] \
+            || die "$label checkpoint is missing or empty: $explicit"
+        printf '%s\n' "$explicit"
+        return
+    fi
+
+    for candidate in "$@"; do
+        if [[ -s "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    done
+    die "$label checkpoint was not found in any known project directory"
+}
+
+PHASE0_CKPT_RESOLVED="$(resolve_checkpoint \
+    "Phase 0" "${PHASE0_CKPT:-}" \
+    outputs/jepa_best.pt \
+    /root/autodl-tmp/JEPA-PREDICT/outputs/jepa_best.pt)"
+PHASE1_CKPT_RESOLVED="$(resolve_checkpoint \
+    "Phase 1" "${PHASE1_CKPT:-}" \
+    outputs_phase1_perf/jepa_best.pt \
+    /root/autodl-tmp/JEPA-PREDICT/outputs_phase1_perf/jepa_best.pt)"
+PHASE2_CKPT_RESOLVED="$(resolve_checkpoint \
+    "Phase 2" "${PHASE2_CKPT:-}" \
+    outputs_phase2_shared_private_seed42/jepa_best.pt \
+    /root/autodl-tmp/JEPA-PREDICT/outputs_phase2_shared_private_seed42/jepa_best.pt)"
+PHASE2_NO_TRANSPORT_CKPT_RESOLVED="$(resolve_checkpoint \
+    "Phase 2 no-Transport" "${PHASE2_NO_TRANSPORT_CKPT:-}" \
+    outputs_phase2_shared_private_no_transport_seed42/jepa_best.pt \
+    /root/autodl-tmp/JEPA-PREDICT/outputs_phase2_shared_private_no_transport_seed42/jepa_best.pt)"
+
 [[ -s "$SPLIT" ]] || die "Frozen downstream split is missing: $SPLIT"
-[[ -s outputs_phase2_shared_private_seed42/jepa_best.pt ]] \
-    || die "Phase 2 checkpoint is missing"
+echo "[Checkpoint] Phase 0: $PHASE0_CKPT_RESOLVED"
+echo "[Checkpoint] Phase 1: $PHASE1_CKPT_RESOLVED"
+echo "[Checkpoint] Phase 2: $PHASE2_CKPT_RESOLVED"
+echo "[Checkpoint] Phase 2 no-Transport: $PHASE2_NO_TRANSPORT_CKPT_RESOLVED"
 
 stage "0/7 preflight and leakage audit"
 python scripts/audit_multidisease_split.py \
@@ -49,7 +90,7 @@ if [[ "$SKIP_COMPLETED" == "1" && -s "$smoke_summary" ]]; then
 else
     mkdir -p "$smoke_dir"
     env \
-        CHECKPOINT=outputs_phase2_shared_private_seed42/jepa_best.pt \
+        CHECKPOINT="$PHASE2_CKPT_RESOLVED" \
         SPLIT="$SPLIT" \
         DOMAINS=teacher_tokens \
         MAX_SEGMENTS=128 \
@@ -75,7 +116,7 @@ if [[ "$SKIP_COMPLETED" == "1" ]] \
 else
     mkdir -p "$formal_dir"
     env \
-        CHECKPOINT=outputs_phase2_shared_private_seed42/jepa_best.pt \
+        CHECKPOINT="$PHASE2_CKPT_RESOLVED" \
         SPLIT="$SPLIT" \
         DOMAINS="teacher_tokens waveform" \
         MAX_SEGMENTS=512 \
@@ -98,6 +139,10 @@ env \
     EXPERIMENTS="random_init phase0 phase1 phase2 mil_off multiscale_off transport_off" \
     SKIP_COMPLETED="$SKIP_COMPLETED" \
     WORKERS="$WORKERS" \
+    PHASE0_CKPT="$PHASE0_CKPT_RESOLVED" \
+    PHASE1_CKPT="$PHASE1_CKPT_RESOLVED" \
+    PHASE2_CKPT="$PHASE2_CKPT_RESOLVED" \
+    PHASE2_NO_TRANSPORT_CKPT="$PHASE2_NO_TRANSPORT_CKPT_RESOLVED" \
     bash scripts/run_p2_core_ablations.sh \
     2>&1 | tee "${MASTER_LOG_DIR}/stage3_p2.log"
 
@@ -107,6 +152,10 @@ env \
     SEEDS="$SEEDS" \
     EXPERIMENTS="random_init phase0 phase1 phase2 mil_off multiscale_off transport_off" \
     WORKERS="$WORKERS" \
+    PHASE0_CKPT="$PHASE0_CKPT_RESOLVED" \
+    PHASE1_CKPT="$PHASE1_CKPT_RESOLVED" \
+    PHASE2_CKPT="$PHASE2_CKPT_RESOLVED" \
+    PHASE2_NO_TRANSPORT_CKPT="$PHASE2_NO_TRANSPORT_CKPT_RESOLVED" \
     bash scripts/export_p2_validation_predictions.sh \
     2>&1 | tee "${MASTER_LOG_DIR}/stage4_predictions.log"
 
