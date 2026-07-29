@@ -1,0 +1,133 @@
+{
+  "protocol": {
+    "analysis_unit": "patient",
+    "test_set_sealed": true,
+    "checkpoint_seed": 42,
+    "sample_rate_hz": 100.0,
+    "requested_delay_range_ms": [
+      80.0,
+      800.0
+    ],
+    "effective_token_delay_support_ms": [
+      160.0,
+      320.0,
+      480.0,
+      640.0,
+      800.0
+    ],
+    "delay_prior_ms": 250.0,
+    "pat_definition": "ECG R-peak to PPG foot; PAT proxy, not pure PTT",
+    "causal_claim_scope": "physiological temporal-direction consistency, not causal discovery"
+  },
+  "counts": {
+    "segments": 512,
+    "patients": 457,
+    "quality_controlled_pat_segments": 430,
+    "chd_positive_patients": 76,
+    "chd_negative_patients": 381,
+    "segments_with_pat": 430
+  },
+  "physiological_agreement": {
+    "valid_patients": 388,
+    "model_delay_mean_ms": 357.7613182461139,
+    "model_delay_median_ms": 357.541259765625,
+    "pat_mean_ms": 116.69458762886597,
+    "pat_median_ms": 85.0,
+    "spearman_model_vs_pat": 0.022445064526997075,
+    "mae_ms": 256.15397730561875,
+    "bias_model_minus_pat_ms": 241.0667306172479,
+    "bland_altman_lower_ms": 47.84244085213055,
+    "bland_altman_upper_ms": 434.2910203823653
+  },
+  "dynamicity": {
+    "patient_mean_delay_sd_ms": 1.9800720570216852,
+    "median_within_patient_segment_sd_ms": 0.873935471535461,
+    "median_within_segment_token_sd_ms": 30.873536109924316,
+    "median_monotonic_violation_rate": 0.0,
+    "median_matched_mass": 0.8149206936359406
+  },
+  "temporal_controls": {
+    "segment_static_delay": {
+      "control_minus_dynamic_mean": 4.115770825671941e-05,
+      "ci95": [
+        9.806419129705534e-06,
+        8.090560954202704e-05
+      ],
+      "positive_supports_dynamic_causal": true
+    },
+    "token_shuffled_delay": {
+      "control_minus_dynamic_mean": 0.017101356737250443,
+      "ci95": [
+        0.01683363507708628,
+        0.01735409588585618
+      ],
+      "positive_supports_dynamic_causal": true
+    },
+    "cross_patient_delay_policy": {
+      "control_minus_dynamic_mean": 6.51811271971112e-05,
+      "ci95": [
+        2.669137683483065e-05,
+        0.00011262903687966011
+      ],
+      "positive_supports_dynamic_causal": true
+    },
+    "fixed_prior": {
+      "control_minus_dynamic_mean": 0.004817436710081554,
+      "ci95": [
+        0.004058787172061087,
+        0.0056602158212292475
+      ],
+      "positive_supports_dynamic_causal": true
+    },
+    "zero_delay": {
+      "control_minus_dynamic_mean": 0.008703553356246563,
+      "ci95": [
+        0.007590920029409817,
+        0.009895270562901912
+      ],
+      "positive_supports_dynamic_causal": true
+    },
+    "negative_delay": {
+      "control_minus_dynamic_mean": 0.017657007416812153,
+      "ci95": [
+        0.016346504263268048,
+        0.018930691999283412
+      ],
+      "positive_supports_dynamic_causal": true
+    },
+    "reversed_ppg": {
+      "control_minus_dynamic_mean": 0.2705715226286643,
+      "ci95": [
+        0.2614186497862681,
+        0.2803845305511365
+      ],
+      "positive_supports_dynamic_causal": true
+    },
+    "shuffled_pair": {
+      "control_minus_dynamic_mean": 0.08461163456488556,
+      "ci95": [
+        0.07515100098741842,
+        0.09403991755016587
+      ],
+      "positive_supports_dynamic_causal": true
+    }
+  },
+  "chd_association": {
+    "positive_mean_delay_ms": 357.4488296508789,
+    "negative_mean_delay_ms": 357.90025702048473,
+    "positive_minus_negative_ms": -0.45142736960582397,
+    "ci95": [
+      -0.9890236886566541,
+      0.1276982582378278
+    ],
+    "standardized_mean_difference": -0.21350586316988054,
+    "interpretation_limit": "association only; the downstream classifier does not consume the delay head directly"
+  },
+  "inputs": {
+    "checkpoint": "/root/autodl-tmp/JEPA-PREDICT-priority1/outputs_phase2_shared_private_seed42/jepa_best.pt",
+    "split": "/root/autodl-tmp/JEPA-PREDICT-priority1/splits/multidisease_taskaware_downstream.json",
+    "role": "val",
+    "data_dir": "/root/ppgchd/ppgchd/data_updated",
+    "seed": 42
+  }
+}

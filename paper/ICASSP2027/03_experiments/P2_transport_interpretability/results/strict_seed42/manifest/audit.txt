@@ -1,0 +1,9 @@
+status=PASS
+role=val
+segments=512
+patients=457
+segment_uids=457
+all_files_in_val=true
+files_in_train=0
+files_in_test=0
+test_set_sealed=true

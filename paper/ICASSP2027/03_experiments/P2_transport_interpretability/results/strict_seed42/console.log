@@ -1,0 +1,6 @@
+[Runtime] device=cpu torch_threads=16 interop_threads=64
+[MultiDiseaseDataset] val: 2310 files from /root/ppgchd/ppgchd/data_updated
+[MultiDiseaseDataset] channel=both labels=['高血压', '高血糖', '高血脂', '其他疾病', '冠心病', '心律失常（房颤、频发早搏等）', '糖尿病', '颈动脉斑块']
+[MultiDiseaseDataset] val: 512 files from /root/ppgchd/ppgchd/data_updated
+[MultiDiseaseDataset] channel=both labels=['高血压', '高血糖', '高血脂', '其他疾病', '冠心病', '心律失常（房颤、频发早搏等）', '糖尿病', '颈动脉斑块']
+[Complete] Transport interpretation saved to /root/autodl-tmp/JEPA-PREDICT-priority1/outputs_transport_interpretability_strict_seed42 | test_set_sealed=True
