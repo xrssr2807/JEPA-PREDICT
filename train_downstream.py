@@ -17,6 +17,7 @@ import sys
 import time
 import math
 import json
+import csv
 import hashlib
 import copy
 import pickle
@@ -44,6 +45,7 @@ from dataset.data import (
     multidisease_label_value,
 )
 from models.encoder import SignalEncoder
+from models.baselines import ResNet1DEncoder
 from models.classifier import (
     SignalClassifier, DualChannelClassifier,
     SignalClassifierCoT, DualChannelClassifierCoT,
@@ -585,7 +587,17 @@ def build_downstream_dataloaders(
 
 # ── Encoder ─────────────────────────────────────────────────────
 
-def build_encoder(model_config: ModelConfig, in_channels: Optional[int] = None) -> SignalEncoder:
+def build_encoder(model_config: ModelConfig, in_channels: Optional[int] = None) -> nn.Module:
+    architecture = str(
+        getattr(model_config, "downstream_encoder_arch", "jepa_transformer")
+    ).lower()
+    if architecture == "resnet1d":
+        return ResNet1DEncoder(
+            in_channels=in_channels or model_config.in_channels,
+            output_dim=model_config.transformer_dim,
+        )
+    if architecture != "jepa_transformer":
+        raise ValueError(f"Unknown downstream encoder architecture: {architecture}")
     return SignalEncoder(
         in_channels=in_channels or model_config.in_channels,
         cnn_channels=tuple(model_config.cnn_channels),
@@ -642,6 +654,14 @@ def load_pretrained_encoder(
     if initialization not in {"pretrained", "random"}:
         raise ValueError(
             "initialization must be 'pretrained' or 'random'"
+        )
+    architecture = str(
+        getattr(model_config, "downstream_encoder_arch", "jepa_transformer")
+    ).lower()
+    if initialization == "pretrained" and architecture != "jepa_transformer":
+        raise ValueError(
+            "Pretrained JEPA checkpoints require "
+            "--encoder_arch jepa_transformer"
         )
     encoder = build_encoder(model_config, in_channels=in_channels).to(device)
     if initialization == "random":
@@ -1340,7 +1360,8 @@ def evaluate(model, dataloader, criterion, device, num_classes: int,
 def evaluate_multilabel(model, dataloader, criterion, device,
                         label_names: List[str], aggregate_by_uid: bool = True,
                         thresholds: Optional[np.ndarray] = None,
-                        use_amp: bool = False):
+                        use_amp: bool = False,
+                        return_uids: bool = False):
     """Evaluate multi-label disease prediction with sigmoid probabilities."""
     model.eval()
     running_loss = 0.0
@@ -1381,15 +1402,18 @@ def evaluate_multilabel(model, dataloader, criterion, device,
     if aggregate_by_uid and uid_logits:
         logits_arr = []
         labels_arr = []
+        evaluated_uids = []
         for uid in uid_logits:
             logits_arr.append(torch.cat(uid_logits[uid], dim=0).mean(dim=0, keepdim=True).cpu())
             labels_arr.append(uid_labels[uid].cpu())
+            evaluated_uids.append(uid)
         logits_arr = torch.cat(logits_arr, dim=0).numpy()
         labels_arr = torch.cat(labels_arr, dim=0).numpy()
         print(f"[Evaluate] UID aggregation: {len(uid_logits)} patients")
     else:
         logits_arr = torch.cat(all_logits, dim=0).numpy()
         labels_arr = torch.cat(all_labels, dim=0).numpy()
+        evaluated_uids = [str(index) for index in range(len(labels_arr))]
 
     logits_arr = np.nan_to_num(logits_arr, nan=0.0, posinf=60.0, neginf=-60.0)
     logits_arr = np.clip(logits_arr, -60.0, 60.0)
@@ -1419,9 +1443,52 @@ def evaluate_multilabel(model, dataloader, criterion, device,
         labels_arr, preds, target_names=label_names, digits=4, zero_division=0
     )
 
-    return (avg_loss, acc, macro_auc, auc_list,
-            precision, recall, f1, f05, report,
-            preds, labels_arr, probs)
+    result = (
+        avg_loss, acc, macro_auc, auc_list,
+        precision, recall, f1, f05, report,
+        preds, labels_arr, probs,
+    )
+    if return_uids:
+        return result + (evaluated_uids,)
+    return result
+
+
+def save_multilabel_patient_predictions(
+    output_path: str,
+    uids: Sequence[str],
+    label_names: Sequence[str],
+    labels: np.ndarray,
+    predictions: np.ndarray,
+    probabilities: np.ndarray,
+    split_role: str,
+):
+    """Persist patient-level outputs required for paired inference."""
+    if not (
+        len(uids) == len(labels) == len(predictions) == len(probabilities)
+    ):
+        raise ValueError("Patient prediction arrays have inconsistent lengths")
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    fieldnames = ["uid", "split"]
+    for label_name in label_names:
+        fieldnames.extend([
+            f"label::{label_name}",
+            f"prob::{label_name}",
+            f"pred::{label_name}",
+        ])
+    with open(output_path, "w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row_index, uid in enumerate(uids):
+            row = {"uid": str(uid), "split": str(split_role)}
+            for class_index, label_name in enumerate(label_names):
+                row[f"label::{label_name}"] = int(labels[row_index, class_index])
+                row[f"prob::{label_name}"] = float(
+                    probabilities[row_index, class_index]
+                )
+                row[f"pred::{label_name}"] = int(
+                    predictions[row_index, class_index]
+                )
+            writer.writerow(row)
 
 
 # ── Main Pipeline ───────────────────────────────────────────────
@@ -1636,6 +1703,20 @@ def validate_downstream_checkpoint_context(
             f"checkpoint={saved_seed}, current={config.seed}"
         )
 
+    saved_ablation = checkpoint.get("ablation_config") or {}
+    saved_architecture = saved_ablation.get("encoder_arch")
+    current_architecture = str(
+        getattr(config.model, "downstream_encoder_arch", "jepa_transformer")
+    )
+    if (
+        saved_architecture is not None
+        and str(saved_architecture) != current_architecture
+    ):
+        raise ValueError(
+            "Saved downstream checkpoint encoder architecture mismatch: "
+            f"checkpoint={saved_architecture}, current={current_architecture}"
+        )
+
     saved_head = checkpoint.get("shared_private_head")
     if (
         saved_head is not None
@@ -1720,48 +1801,63 @@ def finalize_downstream_model(
 
     thresholds = best_state.get("thresholds")
     multilabel = dataset in ("multidisease", "multilabel")
-    if multilabel and thresholds is None:
+    val_predictions = val_labels = val_probabilities = val_uids = None
+    if multilabel:
         if val_loader is None:
             raise ValueError(
                 "Threshold tuning and sealed development require a validation set"
             )
-        (
-            _, val_acc, val_auc, val_auc_list, _, _, _, _, _, _,
-            val_labels, val_probs,
-        ) = evaluate_multilabel(
+        validation_evaluation = evaluate_multilabel(
             model,
             val_loader,
             criterion,
             device,
             config.data.multidisease_labels,
+            thresholds=thresholds,
             use_amp=use_amp,
+            return_uids=True,
         )
+        if len(validation_evaluation) == 13:
+            (
+                _, val_acc, val_auc, val_auc_list, _, _, _, _, _,
+                val_predictions, val_labels, val_probabilities, val_uids,
+            ) = validation_evaluation
+        else:
+            (
+                _, val_acc, val_auc, val_auc_list, _, _, _, _, _,
+                val_predictions, val_labels, val_probabilities,
+            ) = validation_evaluation
+            val_uids = [str(index) for index in range(len(val_labels))]
+
+    if multilabel and thresholds is None:
         thresholds_array = tune_thresholds_from_config(
-            val_labels, val_probs, config.train
+            val_labels, val_probabilities, config.train
         )
         thresholds = thresholds_array.tolist()
-        val_preds = (
-            val_probs >= thresholds_array.reshape(1, -1)
+        val_predictions = (
+            val_probabilities >= thresholds_array.reshape(1, -1)
         ).astype(np.float32)
-        val_acc = float((val_preds == val_labels).mean() * 100.0)
+        val_acc = float((val_predictions == val_labels).mean() * 100.0)
         validation_rows = multilabel_per_class_metrics(
             config.data.multidisease_labels,
             val_labels,
-            val_preds,
-            val_probs,
+            val_predictions,
+            val_probabilities,
             val_auc_list,
         )
         val_prec = precision_score(
-            val_labels, val_preds, average="macro", zero_division=0
+            val_labels, val_predictions, average="macro", zero_division=0
         )
         val_rec = recall_score(
-            val_labels, val_preds, average="macro", zero_division=0
+            val_labels, val_predictions, average="macro", zero_division=0
         )
         val_f1 = fbeta_score(
-            val_labels, val_preds, beta=1.0, average="macro", zero_division=0
+            val_labels, val_predictions, beta=1.0,
+            average="macro", zero_division=0
         )
         val_f05 = fbeta_score(
-            val_labels, val_preds, beta=0.5, average="macro", zero_division=0
+            val_labels, val_predictions, beta=0.5,
+            average="macro", zero_division=0
         )
         best_state["thresholds"] = thresholds
         best_state["validation_metrics"] = {
@@ -1782,6 +1878,27 @@ def finalize_downstream_model(
         )
         print(threshold_msg)
         log_fh.write(threshold_msg + "\n")
+
+    if multilabel:
+        validation_predictions_path = os.path.join(
+            config.output_dir, "validation_patient_predictions.csv"
+        )
+        save_multilabel_patient_predictions(
+            validation_predictions_path,
+            val_uids,
+            config.data.multidisease_labels,
+            val_labels,
+            val_predictions,
+            val_probabilities,
+            split_role="val",
+        )
+        best_state["validation_predictions_file"] = os.path.basename(
+            validation_predictions_path
+        )
+        print(
+            "[Predictions] Validation patient predictions saved -> "
+            f"{validation_predictions_path}"
+        )
 
     save_path = os.path.join(
         config.output_dir, f"downstream_{dataset}_best.pt"
@@ -1811,7 +1928,7 @@ def finalize_downstream_model(
     if multilabel:
         (
             _, test_acc, auc, auc_list, prec, rec, f1, f05, report,
-            test_preds, test_labels, test_probs,
+            test_preds, test_labels, test_probs, test_uids,
         ) = evaluate_multilabel(
             model,
             test_loader,
@@ -1820,6 +1937,7 @@ def finalize_downstream_model(
             config.data.multidisease_labels,
             thresholds=thresholds,
             use_amp=use_amp,
+            return_uids=True,
         )
         per_class_rows = multilabel_per_class_metrics(
             config.data.multidisease_labels,
@@ -1833,6 +1951,21 @@ def finalize_downstream_model(
             per_class_rows[focus_idx]
             if 0 <= focus_idx < len(per_class_rows)
             else None
+        )
+        test_predictions_path = os.path.join(
+            config.output_dir, "test_patient_predictions.csv"
+        )
+        save_multilabel_patient_predictions(
+            test_predictions_path,
+            test_uids,
+            config.data.multidisease_labels,
+            test_labels,
+            test_preds,
+            test_probs,
+            split_role="test",
+        )
+        best_state["test_predictions_file"] = os.path.basename(
+            test_predictions_path
         )
     else:
         (
@@ -2000,6 +2133,13 @@ def train_downstream(
         )
     ablation_config = {
         "encoder_init": encoder_init,
+        "encoder_arch": str(
+            getattr(
+                config.model,
+                "downstream_encoder_arch",
+                "jepa_transformer",
+            )
+        ),
         "patient_mil": (
             bool(config.data.multidisease_patient_mil)
             if multilabel else None
@@ -2451,7 +2591,7 @@ def train_downstream(
             use_dual=use_dual,
             use_amp=use_amp,
             log_fh=log_fh,
-            evaluate_test=True,
+            evaluate_test=not seal_test,
         )
         log_fh.close()
         return result
@@ -2767,6 +2907,15 @@ if __name__ == "__main__":
         help="Encoder initialization for the pretraining-value ablation",
     )
     parser.add_argument(
+        "--encoder_arch",
+        choices=["jepa_transformer", "resnet1d"],
+        default="jepa_transformer",
+        help=(
+            "Downstream waveform encoder. resnet1d is a supervised random-init "
+            "paper baseline and cannot load JEPA checkpoints"
+        ),
+    )
+    parser.add_argument(
         "--experiment_id",
         type=str,
         default=None,
@@ -2843,8 +2992,9 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help=(
-            "One-time final evaluation of a saved downstream checkpoint. "
-            "Skips training and validates split/channel/label provenance."
+            "Evaluate a saved downstream checkpoint without training. With "
+            "--seal_test, exports validation patient predictions and keeps "
+            "the test set sealed; without it, performs one-time final test."
         ),
     )
     parser.add_argument(
@@ -2885,6 +3035,9 @@ if __name__ == "__main__":
 
     config = Config()
     config.seed = args.seed
+    config.model.downstream_encoder_arch = args.encoder_arch
+    if args.encoder_arch == "resnet1d" and args.encoder_init != "random":
+        parser.error("--encoder_arch resnet1d requires --encoder_init random")
     if args.multidisease_channel is not None:
         channel_map = {
             "both": "both",

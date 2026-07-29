@@ -297,7 +297,9 @@ class PriorityOneDownstreamTests(unittest.TestCase):
             return_value=np.full(labels.shape[1], 0.5),
         ), mock.patch(
             "train_downstream.save_torch_checkpoint_atomic",
-        ) as save_mock:
+        ) as save_mock, mock.patch(
+            "train_downstream.save_multilabel_patient_predictions",
+        ):
             finalize_downstream_model(
                 model=model,
                 best_state=best_state,
