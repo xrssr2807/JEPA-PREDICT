@@ -1,8 +1,10 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from analyze_transport_time_shift import (
+    configure_reproducibility,
     evaluate_compensation_profile,
     shift_sequence_non_circular,
     shift_transport_columns,
@@ -11,6 +13,11 @@ from analyze_transport_time_shift import (
 
 
 class TransportTimeShiftTests(unittest.TestCase):
+    @patch("analyze_transport_time_shift.seed_everything")
+    def test_reproducibility_uses_current_seed_api(self, seed_mock):
+        configure_reproducibility(3407)
+        seed_mock.assert_called_once_with(3407)
+
     def test_waveform_shift_has_no_wraparound(self):
         waveform = torch.arange(1, 7, dtype=torch.float32).view(1, 1, -1)
 

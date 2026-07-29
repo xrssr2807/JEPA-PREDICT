@@ -625,6 +625,16 @@ def _validate_shift_grid(shifts: Sequence[float], name: str) -> List[float]:
     return values
 
 
+def configure_reproducibility(seed: int):
+    """Configure the current downstream seeding API for deterministic analysis."""
+    seed_everything(seed)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+
 def main():
     args = parse_args()
     if args.bootstrap_iterations < 100:
@@ -643,7 +653,7 @@ def main():
                 f"{shift} ms"
             )
 
-    seed_everything(args.seed, deterministic=True, enable_tf32=True)
+    configure_reproducibility(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
