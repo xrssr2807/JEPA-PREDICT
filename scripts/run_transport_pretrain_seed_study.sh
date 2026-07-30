@@ -24,6 +24,7 @@ MIL_CHUNK_SIZE="${MIL_CHUNK_SIZE:-64}"
 BOOTSTRAP_ITERATIONS="${BOOTSTRAP_ITERATIONS:-2000}"
 REUSE_SEED42="${REUSE_SEED42:-1}"
 SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
+PRUNE_INTERMEDIATE="${PRUNE_INTERMEDIATE:-1}"
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
@@ -145,6 +146,40 @@ write_checkpoint_manifest() {
     } > "${study_dir}/checkpoint_manifest.txt"
 }
 
+prune_pretraining_artifacts() {
+    local mode="$1"
+    local seed="$2"
+    local study_dir="${PRETRAIN_ROOT}/${mode}_seed${seed}"
+    local prune_log="${study_dir}/pruned_artifacts.txt"
+    local candidates=(
+        "${study_dir}/base/jepa_best.pt"
+        "${study_dir}/base/jepa_last.pt"
+        "${study_dir}/shared_private/jepa_last.pt"
+        "${study_dir}/base/jepa_best.pt.tmp"
+        "${study_dir}/base/jepa_last.pt.tmp"
+        "${study_dir}/shared_private/jepa_best.pt.tmp"
+        "${study_dir}/shared_private/jepa_last.pt.tmp"
+    )
+
+    [[ "$PRUNE_INTERMEDIATE" == "1" ]] || return
+    [[ "$seed" != "42" || "$REUSE_SEED42" != "1" ]] || return
+    [[ -s "${study_dir}/shared_private/jepa_best.pt" ]] \
+        || die "Refusing to prune before final checkpoint exists: $study_dir"
+
+    {
+        echo "pruned_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "kept=${study_dir}/shared_private/jepa_best.pt"
+        local candidate
+        for candidate in "${candidates[@]}"; do
+            if [[ -e "$candidate" ]]; then
+                stat -c 'removed=%s_bytes %n' "$candidate"
+            fi
+        done
+    } > "$prune_log"
+    rm -f -- "${candidates[@]}"
+    echo "[Prune] kept final best only | transport=$mode pretrain_seed=$seed"
+}
+
 run_pretraining() {
     local mode="$1"
     local seed="$2"
@@ -164,6 +199,15 @@ run_pretraining() {
     local final_checkpoint="${sp_dir}/jepa_best.pt"
     local transport_args=()
     [[ "$mode" == "off" ]] && transport_args=(--disable_transport)
+
+    if [[ "$SKIP_COMPLETED" == "1" && -s "$final_checkpoint" ]] \
+        && grep -q "Pre-training complete." "${sp_dir}/console.log" 2>/dev/null; then
+        echo "[Skip] completed full pre-training | transport=$mode pretrain_seed=$seed"
+        cp "${sp_dir}/pretrain_split.json" "${study_dir}/pretrain_split.json"
+        write_checkpoint_manifest "$mode" "$seed" "$final_checkpoint"
+        prune_pretraining_artifacts "$mode" "$seed"
+        return
+    fi
 
     if [[ "$SKIP_COMPLETED" != "1" || ! -s "$base_checkpoint" ]] \
         || ! grep -q "Pre-training complete." "${base_dir}/console.log" 2>/dev/null; then
@@ -224,6 +268,7 @@ run_pretraining() {
         || die "Shared-Private checkpoint missing: $final_checkpoint"
     cp "${sp_dir}/pretrain_split.json" "${study_dir}/pretrain_split.json"
     write_checkpoint_manifest "$mode" "$seed" "$final_checkpoint"
+    prune_pretraining_artifacts "$mode" "$seed"
 }
 
 checkpoint_for() {
