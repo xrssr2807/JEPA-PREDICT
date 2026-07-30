@@ -202,6 +202,7 @@ class TrainConfig:
     pretrain_warmup_epochs: int = 5  # shorter warmup → earlier cosine decay
     pretrain_weight_decay: float = 0.05
     pretrain_val_every: int = 1
+    pretrain_checkpoint_interval: int = 20
 
     # Phase 1 doubles online branches. AMP plus accumulation keeps the
     # effective batch near the Phase 0 value while fitting a 24 GB GPU.
@@ -308,6 +309,7 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     device: str = "cuda"
     seed: int = 42
+    pretrain_split_seed: int = 42
     output_dir: str = "/root/autodl-tmp/JEPA-PREDICT/outputs"
     deterministic: bool = True
 

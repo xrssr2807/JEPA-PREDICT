@@ -550,6 +550,7 @@ def train(
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     print(
         f"Device: {device} | seed={config.seed} | "
+        f"data_split_seed={config.pretrain_split_seed} | "
         f"deterministic={config.deterministic}"
     )
 
@@ -593,7 +594,7 @@ def train(
         config.train,
         return_stats=use_stats_targets,
         use_processed=True,
-        seed=config.seed,
+        seed=config.pretrain_split_seed,
         batch_size=batch_size,
     )
     steps_per_epoch = len(train_loader)
@@ -762,6 +763,8 @@ def train(
             config.model.phase2_shared_private_enabled
         ),
         "seed": config.seed,
+        "optimization_seed": config.seed,
+        "data_split_seed": config.pretrain_split_seed,
         "val_ratio": config.data.pretrain_val_split,
         "train_files": list(train_loader.dataset.files),
         "val_files": list(val_loader.dataset.files),
@@ -1138,6 +1141,7 @@ def train(
                     "early_stop_best_loss": early_stop_best_loss,
                     "early_stop_bad_epochs": early_stop_bad_epochs,
                     "seed": config.seed,
+                    "data_split_seed": config.pretrain_split_seed,
                     "train_segments": len(train_loader.dataset),
                     "val_segments": len(val_loader.dataset),
                 },
@@ -1164,12 +1168,16 @@ def train(
                 "early_stop_best_loss": early_stop_best_loss,
                 "early_stop_bad_epochs": early_stop_bad_epochs,
                 "seed": config.seed,
+                "data_split_seed": config.pretrain_split_seed,
             },
             last_path,
         )
 
-        # Save periodic
-        if (epoch + 1) % 20 == 0:
+        # Save periodic checkpoints only when explicitly enabled.
+        checkpoint_interval = int(
+            config.train.pretrain_checkpoint_interval
+        )
+        if checkpoint_interval > 0 and (epoch + 1) % checkpoint_interval == 0:
             ckpt_path = os.path.join(config.output_dir, f"jepa_epoch_{epoch+1}.pt")
             _save_checkpoint(
                 {
@@ -1186,6 +1194,7 @@ def train(
                     "early_stop_best_loss": early_stop_best_loss,
                     "early_stop_bad_epochs": early_stop_bad_epochs,
                     "seed": config.seed,
+                    "data_split_seed": config.pretrain_split_seed,
                 },
                 ckpt_path,
             )
@@ -1393,6 +1402,13 @@ if __name__ == "__main__":
         help="Override the experiment seed",
     )
     parser.add_argument(
+        "--data_split_seed", type=int, default=None,
+        help=(
+            "Seed for the patient-grouped pre-training train/validation split; "
+            "kept separate from model/optimizer randomness"
+        ),
+    )
+    parser.add_argument(
         "--batch_size", type=int, default=None,
         help="Override per-GPU batch size for the selected phase",
     )
@@ -1411,6 +1427,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prefetch_factor", type=int, default=None,
         help="Batches prefetched by each DataLoader worker",
+    )
+    parser.add_argument(
+        "--checkpoint_interval", type=int, default=None,
+        help="Periodic checkpoint interval in epochs; 0 disables periodic saves",
     )
     parser.add_argument(
         "--performance_mode", action="store_true",
@@ -1485,6 +1505,8 @@ if __name__ == "__main__":
         config.model.phase2_orthogonality_weight = args.orthogonality_weight
     if args.seed is not None:
         config.seed = args.seed
+    if args.data_split_seed is not None:
+        config.pretrain_split_seed = args.data_split_seed
     if args.epochs is not None:
         config.train.pretrain_epochs = args.epochs
     if args.output_dir is not None:
@@ -1507,6 +1529,10 @@ if __name__ == "__main__":
         config.train.pretrain_dataloader_workers = args.workers
     if args.prefetch_factor is not None:
         config.train.pretrain_prefetch_factor = args.prefetch_factor
+    if args.checkpoint_interval is not None:
+        config.train.pretrain_checkpoint_interval = args.checkpoint_interval
+    if config.train.pretrain_checkpoint_interval < 0:
+        parser.error("--checkpoint_interval must be >= 0")
 
     if config.model.pretrain_phase == 2:
         if args.batch_size is not None:
