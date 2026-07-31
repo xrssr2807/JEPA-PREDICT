@@ -13,7 +13,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LambdaLR,
+    LinearLR,
+    SequentialLR,
+)
 
 from config import Config, DataConfig, ModelConfig, TrainConfig
 from dataset.data import (
@@ -52,6 +57,23 @@ def _seed_worker(worker_id: int):
     worker_seed = torch.initial_seed() % (2 ** 32)
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
+
+def _global_pretrain_lr_factor(
+    optimizer_step: int,
+    warmup_steps: int,
+    total_steps: int,
+    start_factor: float = 1e-6,
+) -> float:
+    """Return the original warmup-cosine factor at an absolute optimizer step."""
+    step = max(0, min(int(optimizer_step), int(total_steps)))
+    warmup_steps = max(0, min(int(warmup_steps), int(total_steps)))
+    if warmup_steps > 0 and step <= warmup_steps:
+        progress = step / warmup_steps
+        return start_factor + (1.0 - start_factor) * progress
+    cosine_steps = max(1, int(total_steps) - warmup_steps)
+    cosine_step = min(max(step - warmup_steps, 0), cosine_steps)
+    return 0.5 * (1.0 + math.cos(math.pi * cosine_step / cosine_steps))
 
 
 def _make_pretrain_dataset(
@@ -654,6 +676,7 @@ def train(
     resume_best_loss = float("inf")
     early_stop_best_loss = float("inf")
     early_stop_bad_epochs = 0
+    resume_optimizer_step = None
     if resume_from is not None:
         print(f"[Resume] Loading checkpoint: {resume_from}")
         ckpt = torch.load(resume_from, map_location=device, weights_only=False)
@@ -722,14 +745,38 @@ def train(
             ckpt.get("early_stop_best_loss", resume_best_loss)
         )
         early_stop_bad_epochs = int(ckpt.get("early_stop_bad_epochs", 0))
+        if ckpt.get("optimizer_step") is not None:
+            resume_optimizer_step = int(ckpt["optimizer_step"])
         model._enforce_teacher_eval()
         print(f"[Resume] Continuing from epoch {start_epoch}")
 
     # LR schedule: warmup + cosine (adjusted for resume)
     remaining_epochs = config.train.pretrain_epochs - start_epoch
     remaining_steps = remaining_epochs * optimizer_steps_per_epoch
-    # Skip warmup when resuming (already past warmup phase)
-    if start_epoch >= warmup_epochs:
+    optimizer_step = (
+        resume_optimizer_step
+        if resume_optimizer_step is not None
+        else start_epoch * optimizer_steps_per_epoch
+    )
+    if resume_from is not None:
+        full_warmup_steps = warmup_epochs * optimizer_steps_per_epoch
+        for param_group in optimizer.param_groups:
+            param_group["initial_lr"] = pretrain_lr
+        scheduler = LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: _global_pretrain_lr_factor(
+                step,
+                full_warmup_steps,
+                total_steps,
+            ),
+            last_epoch=optimizer_step - 1,
+        )
+        print(
+            f"[Resume] Restored global LR schedule at optimizer_step="
+            f"{optimizer_step}/{total_steps} | lr="
+            f"{scheduler.get_last_lr()[0]:.2e}"
+        )
+    elif start_epoch >= warmup_epochs:
         warmup_scheduler = LinearLR(
             optimizer, start_factor=1.0, end_factor=1.0, total_iters=1
         )
@@ -779,7 +826,6 @@ def train(
         json.dump(split_manifest, f, ensure_ascii=False, indent=2)
 
     best_loss = resume_best_loss
-    optimizer_step = start_epoch * optimizer_steps_per_epoch
 
     for epoch in range(start_epoch, config.train.pretrain_epochs):
         if phase == 2:
@@ -1132,6 +1178,7 @@ def train(
                     **_encoder_checkpoint_payload(model),
                     **_phase_checkpoint_metadata(model, config),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "optimizer_step": optimizer_step,
                     "loss": epoch_loss,
                     "train_metrics": train_metrics,
                     "val_loss": current_val_loss,
@@ -1159,6 +1206,7 @@ def train(
                 **_encoder_checkpoint_payload(model),
                 **_phase_checkpoint_metadata(model, config),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "optimizer_step": optimizer_step,
                 "loss": epoch_loss,
                 "train_metrics": train_metrics,
                 "val_loss": current_val_loss,
@@ -1187,6 +1235,7 @@ def train(
                     **_encoder_checkpoint_payload(model),
                     **_phase_checkpoint_metadata(model, config),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "optimizer_step": optimizer_step,
                     "train_metrics": train_metrics,
                     "val_metrics": val_metrics,
                     "best_val_loss": best_loss,

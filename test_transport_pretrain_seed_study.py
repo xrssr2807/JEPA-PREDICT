@@ -5,6 +5,7 @@ from uuid import uuid4
 import numpy as np
 
 from config import Config
+from train_pretrain import _global_pretrain_lr_factor
 from scripts.summarize_transport_pretrain_seed_study import (
     _paired_bootstrap,
     _split_content_hash,
@@ -18,6 +19,26 @@ def test_pretrain_split_seed_is_independent_from_optimization_seed():
     assert config.seed == 3407
     assert config.pretrain_split_seed == 42
     assert config.train.pretrain_checkpoint_interval == 20
+
+
+def test_global_resume_lr_uses_original_absolute_schedule():
+    steps_per_epoch = 271
+    total_steps = 80 * steps_per_epoch
+    warmup_steps = 5 * steps_per_epoch
+
+    assert _global_pretrain_lr_factor(0, warmup_steps, total_steps) == 1e-6
+    assert _global_pretrain_lr_factor(
+        warmup_steps, warmup_steps, total_steps
+    ) == 1.0
+    resumed_factor = _global_pretrain_lr_factor(
+        76 * steps_per_epoch,
+        warmup_steps,
+        total_steps,
+    )
+    assert 0.0 < resumed_factor < 0.02
+    assert _global_pretrain_lr_factor(
+        total_steps, warmup_steps, total_steps
+    ) == 0.0
 
 
 def test_split_content_hash_ignores_metadata_and_file_order():
