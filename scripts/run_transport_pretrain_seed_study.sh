@@ -180,6 +180,20 @@ prune_pretraining_artifacts() {
     echo "[Prune] kept final best only | transport=$mode pretrain_seed=$seed"
 }
 
+checkpoint_next_epoch() {
+    local checkpoint="$1"
+    python -c '
+import sys
+import torch
+
+checkpoint = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+epoch = int(checkpoint.get("epoch", -1))
+if epoch < 0:
+    raise ValueError(f"Missing checkpoint epoch: {sys.argv[1]}")
+print(epoch + 1)
+' "$checkpoint" 2>/dev/null
+}
+
 run_pretraining() {
     local mode="$1"
     local seed="$2"
@@ -212,10 +226,26 @@ run_pretraining() {
     if [[ "$SKIP_COMPLETED" != "1" || ! -s "$base_checkpoint" ]] \
         || ! grep -q "Pre-training complete." "${base_dir}/console.log" 2>/dev/null; then
         mkdir -p "$base_dir"
-        echo "[Run] Phase 2 base | transport=$mode pretrain_seed=$seed"
+        local base_start_args=()
+        local base_tee_args=()
+        local base_next_epoch=0
+        if [[ "$SKIP_COMPLETED" == "1" && -s "$base_checkpoint" ]]; then
+            base_next_epoch="$(checkpoint_next_epoch "$base_checkpoint" || echo 0)"
+        fi
+        if (( base_next_epoch > 0 && base_next_epoch <= BASE_EPOCHS )); then
+            base_start_args=(
+                --resume "$base_checkpoint"
+                --start_epoch "$base_next_epoch"
+            )
+            base_tee_args=(-a)
+            echo "[Resume] Phase 2 base | transport=$mode pretrain_seed=$seed start_epoch=$base_next_epoch"
+        else
+            echo "[Run] Phase 2 base | transport=$mode pretrain_seed=$seed"
+        fi
         python -u train_pretrain.py \
             --phase 2 \
             "${transport_args[@]}" \
+            "${base_start_args[@]}" \
             --output_dir "$base_dir" \
             --epochs "$BASE_EPOCHS" \
             --batch_size "$BATCH_SIZE" \
@@ -228,7 +258,7 @@ run_pretraining() {
             --performance_mode \
             --seed "$seed" \
             --data_split_seed "$DATA_SPLIT_SEED" \
-            2>&1 | tee "${base_dir}/console.log"
+            2>&1 | tee "${base_tee_args[@]}" "${base_dir}/console.log"
     else
         echo "[Skip] completed base | transport=$mode pretrain_seed=$seed"
     fi
@@ -237,12 +267,30 @@ run_pretraining() {
     if [[ "$SKIP_COMPLETED" != "1" || ! -s "$final_checkpoint" ]] \
         || ! grep -q "Pre-training complete." "${sp_dir}/console.log" 2>/dev/null; then
         mkdir -p "$sp_dir"
-        echo "[Run] Shared-Private | transport=$mode pretrain_seed=$seed"
+        local sp_last_checkpoint="${sp_dir}/jepa_last.pt"
+        local sp_start_args=(--init_checkpoint "$base_checkpoint")
+        local sp_tee_args=()
+        local sp_next_epoch=0
+        if [[ "$SKIP_COMPLETED" == "1" && -s "$sp_last_checkpoint" ]]; then
+            sp_next_epoch="$(
+                checkpoint_next_epoch "$sp_last_checkpoint" || echo 0
+            )"
+        fi
+        if (( sp_next_epoch > 0 && sp_next_epoch <= SP_EPOCHS )); then
+            sp_start_args=(
+                --resume "$sp_last_checkpoint"
+                --start_epoch "$sp_next_epoch"
+            )
+            sp_tee_args=(-a)
+            echo "[Resume] Shared-Private | transport=$mode pretrain_seed=$seed start_epoch=$sp_next_epoch"
+        else
+            echo "[Run] Shared-Private | transport=$mode pretrain_seed=$seed"
+        fi
         python -u train_pretrain.py \
             --phase 2 \
             "${transport_args[@]}" \
             --shared_private \
-            --init_checkpoint "$base_checkpoint" \
+            "${sp_start_args[@]}" \
             --output_dir "$sp_dir" \
             --epochs "$SP_EPOCHS" \
             --batch_size "$BATCH_SIZE" \
@@ -260,7 +308,7 @@ run_pretraining() {
             --performance_mode \
             --seed "$seed" \
             --data_split_seed "$DATA_SPLIT_SEED" \
-            2>&1 | tee "${sp_dir}/console.log"
+            2>&1 | tee "${sp_tee_args[@]}" "${sp_dir}/console.log"
     else
         echo "[Skip] completed Shared-Private | transport=$mode pretrain_seed=$seed"
     fi
