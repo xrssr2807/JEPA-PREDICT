@@ -625,6 +625,10 @@ class MultiDiseaseDataset(Dataset):
         channel: Optional[int] = 0,
         target_length: int = None,
         files: Optional[List[str]] = None,
+        canonical_sample_rate_hz: float = 100.0,
+        fixed_device_rate_hz: Optional[float] = None,
+        train_device_rate_choices: Optional[List[float]] = None,
+        device_rate_probability: float = 0.0,
     ):
         self.data_dir = data_dir
         self.split = split
@@ -635,6 +639,12 @@ class MultiDiseaseDataset(Dataset):
         else:
             self.channel = channel
         self.target_length = target_length
+        self.canonical_sample_rate_hz = float(canonical_sample_rate_hz)
+        self.fixed_device_rate_hz = fixed_device_rate_hz
+        self.train_device_rate_choices = [
+            float(value) for value in (train_device_rate_choices or [])
+        ]
+        self.device_rate_probability = float(device_rate_probability)
         self.disease_labels = disease_labels or [
             "高血压", "高血糖", "高血脂", "其他疾病", "冠心病",
             "心律失常（房颤、频发早搏等）", "糖尿病", "颈动脉斑块",
@@ -687,9 +697,35 @@ class MultiDiseaseDataset(Dataset):
         elif self.channel is not None:
             data = data[self.channel:self.channel + 1]
 
+        device_rate_hz = self.fixed_device_rate_hz
+        if (
+            device_rate_hz is None
+            and self.train_device_rate_choices
+            and np.random.random() < self.device_rate_probability
+        ):
+            device_rate_hz = float(np.random.choice(self.train_device_rate_choices))
+        if device_rate_hz is not None:
+            from dataset.sampling import bridge_device_sampling_rate
+            source_hz = sample.get(
+                "sampling_rate", self.canonical_sample_rate_hz
+            )
+            data, _ = bridge_device_sampling_rate(
+                data,
+                source_hz=source_hz,
+                canonical_hz=self.canonical_sample_rate_hz,
+                device_hz=device_rate_hz,
+                axis=-1,
+            )
+
         if self.target_length is not None and data.shape[-1] != self.target_length:
-            from scipy.signal import resample
-            data = resample(data, self.target_length, axis=-1).astype(np.float32)
+            from dataset.sampling import polyphase_resample
+            data = polyphase_resample(
+                data,
+                source_hz=float(data.shape[-1]),
+                target_hz=float(self.target_length),
+                axis=-1,
+                expected_length=self.target_length,
+            )
 
         if self.normalize == "zscore":
             data = self._zscore(data)
@@ -738,6 +774,10 @@ class MultiDiseasePatientMILDataset(Dataset):
         max_segments: int = 8,
         files: Optional[List[str]] = None,
         train: bool = True,
+        canonical_sample_rate_hz: float = 100.0,
+        fixed_device_rate_hz: Optional[float] = None,
+        train_device_rate_choices: Optional[List[float]] = None,
+        device_rate_probability: float = 0.0,
     ):
         self.segment_dataset = MultiDiseaseDataset(
             data_dir=data_dir,
@@ -748,6 +788,10 @@ class MultiDiseasePatientMILDataset(Dataset):
             channel=channel,
             target_length=target_length,
             files=files,
+            canonical_sample_rate_hz=canonical_sample_rate_hz,
+            fixed_device_rate_hz=fixed_device_rate_hz,
+            train_device_rate_choices=train_device_rate_choices,
+            device_rate_probability=device_rate_probability,
         )
         self.max_segments = max_segments
         self.train = train

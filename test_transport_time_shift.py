@@ -6,6 +6,7 @@ import torch
 from analyze_transport_time_shift import (
     configure_reproducibility,
     evaluate_compensation_profile,
+    evaluate_reference_shift_profile,
     shift_sequence_non_circular,
     shift_transport_columns,
     shift_waveform_non_circular,
@@ -97,6 +98,20 @@ class TransportTimeShiftTests(unittest.TestCase):
         self.assertEqual(profile["candidate_shifts_tokens"][best], 1.0)
         self.assertLess(float(losses[best]), 1e-6)
         self.assertGreater(float(losses[1]), float(losses[best]) + 0.5)
+
+    def test_reference_profile_recovers_shift_without_transport(self):
+        teacher = torch.eye(7, dtype=torch.float32).unsqueeze(0)
+        shifted, valid = shift_sequence_non_circular(teacher, -1.0)
+        profile = evaluate_reference_shift_profile(
+            teacher,
+            shifted,
+            valid,
+            candidate_shifts_tokens=[-1.0, 0.0, 1.0],
+        )
+        losses = profile["losses"][0]
+        best = int(torch.nan_to_num(losses, nan=float("inf")).argmin())
+        self.assertEqual(profile["candidate_shifts_tokens"][best], -1.0)
+        self.assertLess(float(losses[best]), 1e-6)
 
 
 if __name__ == "__main__":

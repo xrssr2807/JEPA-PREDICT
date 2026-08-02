@@ -247,6 +247,7 @@ def build_model(model_config: ModelConfig) -> JEPA:
         phase1_bidirectional=model_config.phase1_bidirectional,
         phase1_token_loss_weight=model_config.phase1_token_loss_weight,
         phase2_transport_enabled=model_config.phase2_transport_enabled,
+        phase2_transport_mode=model_config.phase2_transport_mode,
         phase2_sample_rate_hz=model_config.phase2_sample_rate_hz,
         phase2_min_delay_ms=model_config.phase2_min_delay_ms,
         phase2_max_delay_ms=model_config.phase2_max_delay_ms,
@@ -445,6 +446,10 @@ def _phase_checkpoint_metadata(model, config: Config) -> dict:
             "transport_enabled": bool(
                 config.model.phase2_transport_enabled
             ),
+            "transport_mode": str(config.model.phase2_transport_mode),
+            "effective_constraint_weights": (
+                model._phase2_effective_regularizer_weights()
+            ),
             "sample_rate_hz": float(config.model.phase2_sample_rate_hz),
             "token_ms": float(model.phase2_token_ms),
             "delay_offsets_tokens": model.phase2_delay_offsets.detach().cpu().tolist(),
@@ -532,6 +537,27 @@ def _initialize_shared_private_from_phase2(model, checkpoint: dict) -> list:
     if "model_state_dict" not in checkpoint:
         raise ValueError(
             "Initialization checkpoint must contain model_state_dict"
+        )
+    checkpoint_phase2 = checkpoint.get("phase2_config") or {}
+    checkpoint_transport = bool(
+        checkpoint_phase2.get("transport_enabled", True)
+    )
+    if checkpoint_transport != bool(model.phase2_transport_enabled):
+        raise ValueError(
+            "Initialization checkpoint transport enabled/disabled state "
+            "does not match the requested Shared-Private run"
+        )
+    checkpoint_mode = str(
+        checkpoint_phase2.get("transport_mode", "full")
+    )
+    if (
+        model.phase2_transport_enabled
+        and checkpoint_mode != model.phase2_transport_mode
+    ):
+        raise ValueError(
+            "Initialization checkpoint Transport constraint mode "
+            f"{checkpoint_mode!r} does not match "
+            f"{model.phase2_transport_mode!r}"
         )
 
     result = model.load_state_dict(
@@ -631,9 +657,14 @@ def train(
         print(
             "[Phase2] transport="
             f"{'on' if config.model.phase2_transport_enabled else 'off'} | "
+            f"mode={config.model.phase2_transport_mode} | "
             f"causal delay bins={delay_offsets} tokens ({delay_ms} ms) | "
             f"transport_start={config.train.phase2_transport_start_epoch} | "
             f"ramp={config.train.phase2_transport_ramp_epochs} epochs"
+        )
+        print(
+            "[Phase2] effective constraint weights="
+            f"{model._phase2_effective_regularizer_weights()}"
         )
         if config.model.phase2_shared_private_enabled:
             print(
@@ -708,6 +739,22 @@ def train(
             raise ValueError(
                 "Resume checkpoint transport mode does not match the model. "
                 "Resume transport-on and transport-off runs separately."
+            )
+        checkpoint_transport_mode = str(
+            (ckpt.get("phase2_config") or {}).get(
+                "transport_mode", "full"
+            )
+        )
+        if (
+            phase == 2
+            and checkpoint_transport
+            and checkpoint_transport_mode
+            != config.model.phase2_transport_mode
+        ):
+            raise ValueError(
+                "Resume checkpoint Transport constraint mode does not match "
+                f"the model ({checkpoint_transport_mode!r} != "
+                f"{config.model.phase2_transport_mode!r})."
             )
         # Load encoder weights
         if "context_encoder" in ckpt:
@@ -1497,6 +1544,22 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--transport_mode",
+        choices=(
+            "full",
+            "static_delay",
+            "fixed_prior",
+            "zero_delay",
+            "no_monotonic",
+            "token_shuffled",
+        ),
+        default=None,
+        help=(
+            "Phase 2 Transport constraint-composition ablation. "
+            "'full' is the paper model."
+        ),
+    )
+    parser.add_argument(
         "--transport_ramp_epochs", type=int, default=None,
         help="Phase 2 epochs used to ramp transport from 0 to 1",
     )
@@ -1546,6 +1609,8 @@ if __name__ == "__main__":
         config.model.phase2_shared_private_enabled = True
     if args.disable_transport:
         config.model.phase2_transport_enabled = False
+    if args.transport_mode is not None:
+        config.model.phase2_transport_mode = args.transport_mode
     if args.private_dim is not None:
         config.model.phase2_private_dim = args.private_dim
     if args.private_loss_weight is not None:
@@ -1570,6 +1635,8 @@ if __name__ == "__main__":
         )
         if not config.model.phase2_transport_enabled:
             suffix += "_no_transport"
+        elif config.model.phase2_transport_mode != "full":
+            suffix += f"_{config.model.phase2_transport_mode}"
         config.output_dir = config.output_dir.rstrip("/\\") + suffix
 
     if args.performance_mode:
@@ -1643,6 +1710,13 @@ if __name__ == "__main__":
         parser.error("--shared_private requires --phase 2")
     if args.disable_transport and config.model.pretrain_phase != 2:
         parser.error("--disable_transport requires --phase 2")
+    if args.transport_mode is not None and config.model.pretrain_phase != 2:
+        parser.error("--transport_mode requires --phase 2")
+    if args.disable_transport and args.transport_mode not in (None, "full"):
+        parser.error(
+            "--disable_transport cannot be combined with a non-full "
+            "--transport_mode"
+        )
     if args.init_checkpoint is not None and not args.shared_private:
         parser.error("--init_checkpoint requires --shared_private")
     if args.init_checkpoint is not None and args.resume is not None:

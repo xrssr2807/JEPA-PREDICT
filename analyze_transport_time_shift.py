@@ -276,6 +276,45 @@ def evaluate_compensation_profile(
 
 
 @torch.no_grad()
+def evaluate_reference_shift_profile(
+    baseline_teacher: torch.Tensor,
+    shifted_teacher: torch.Tensor,
+    shifted_teacher_valid: torch.Tensor,
+    candidate_shifts_tokens: Sequence[float],
+) -> Dict[str, torch.Tensor]:
+    """Measure the recoverable shift without involving the Transport model.
+
+    This reference profile shifts the original teacher representation over the
+    same candidate grid and compares it with the intervened teacher. It tests
+    whether the perturbation, encoder and search grid can recover the injected
+    shift at all. A weak reference recovery means the Transport recovery must
+    not be interpreted as a direct failure of temporal modeling.
+    """
+
+    if baseline_teacher.shape != shifted_teacher.shape:
+        raise ValueError(
+            f"Teacher mismatch: {baseline_teacher.shape} vs "
+            f"{shifted_teacher.shape}"
+        )
+    losses = []
+    valid_fractions = []
+    for candidate in candidate_shifts_tokens:
+        candidate_teacher, candidate_valid = shift_sequence_non_circular(
+            baseline_teacher, float(candidate)
+        )
+        valid = candidate_valid & shifted_teacher_valid
+        losses.append(
+            _masked_cosine_distance(candidate_teacher, shifted_teacher, valid)
+        )
+        valid_fractions.append(valid.float().mean(dim=1))
+    return {
+        "candidate_shifts_tokens": [float(value) for value in candidate_shifts_tokens],
+        "losses": torch.stack(losses, dim=1),
+        "valid_fractions": torch.stack(valid_fractions, dim=1),
+    }
+
+
+@torch.no_grad()
 def _encode_ecg_transport(model, ecg: torch.Tensor):
     ecg_input = model.context_encoder.tokenize(ecg)
     _, ecg_tokens = model.context_encoder.encode_tokens(
@@ -355,6 +394,9 @@ def _aggregate_patient_shift_rows(segment_rows: List[dict]) -> List[dict]:
         "minimum_profile_loss",
         "recovered_shift_ms",
         "recovery_abs_error_ms",
+        "reference_minimum_profile_loss",
+        "reference_recovered_shift_ms",
+        "reference_recovery_abs_error_ms",
         "loss_delta_vs_zero",
         "uncompensated_valid_fraction",
         "oracle_valid_fraction",
@@ -404,6 +446,10 @@ def _patient_response_statistics(
         recovered = np.asarray(
             [row["recovered_shift_ms"] for row in rows], dtype=np.float64
         )
+        reference_recovered = np.asarray(
+            [row["reference_recovered_shift_ms"] for row in rows],
+            dtype=np.float64,
+        )
         delta_ci = bootstrap_mean_ci(delta, rng, iterations)
         benefit_ci = bootstrap_mean_ci(benefit, rng, iterations)
         shift_summary[str(shift)] = {
@@ -419,10 +465,18 @@ def _patient_response_statistics(
             "recovery_mae_ms": _mean_or_nan(
                 abs(value - shift) for value in recovered
             ),
+            "reference_recovered_shift_mean_ms": _mean_or_nan(
+                reference_recovered
+            ),
+            "reference_recovery_mae_ms": _mean_or_nan(
+                abs(value - shift) for value in reference_recovered
+            ),
         }
 
     patient_slopes = []
     patient_correlations = []
+    reference_patient_slopes = []
+    reference_patient_correlations = []
     x = np.asarray(sorted(required), dtype=np.float64)
     for values in complete.values():
         y = np.asarray(
@@ -432,7 +486,21 @@ def _patient_response_statistics(
         if np.isfinite(y).all() and np.unique(x).size >= 2:
             patient_slopes.append(float(np.polyfit(x, y, 1)[0]))
             patient_correlations.append(spearman_correlation(x, y))
+        reference_y = np.asarray(
+            [values[shift]["reference_recovered_shift_ms"] for shift in x],
+            dtype=np.float64,
+        )
+        if np.isfinite(reference_y).all() and np.unique(x).size >= 2:
+            reference_patient_slopes.append(
+                float(np.polyfit(x, reference_y, 1)[0])
+            )
+            reference_patient_correlations.append(
+                spearman_correlation(x, reference_y)
+            )
     slope_ci = bootstrap_mean_ci(patient_slopes, rng, iterations)
+    reference_slope_ci = bootstrap_mean_ci(
+        reference_patient_slopes, rng, iterations
+    )
 
     zero_minimum = []
     for values in complete.values():
@@ -456,6 +524,17 @@ def _patient_response_statistics(
                 row["recovery_abs_error_ms"] for row in patient_rows
             ),
             "zero_shift_is_minimum_rate": _mean_or_nan(zero_minimum),
+            "reference_patient_slope_mean": _mean_or_nan(
+                reference_patient_slopes
+            ),
+            "reference_patient_slope_ci95": list(reference_slope_ci),
+            "reference_patient_spearman_mean": _mean_or_nan(
+                reference_patient_correlations
+            ),
+            "reference_patient_recovery_mae_ms": _mean_or_nan(
+                row["reference_recovery_abs_error_ms"]
+                for row in patient_rows
+            ),
         },
     }
 
@@ -478,8 +557,9 @@ def _write_report(path: Path, summary: dict) -> None:
         "## Shift sensitivity and compensation",
         "",
         "| Injected shift | Loss delta vs zero | 95% CI | "
-        "Oracle compensation benefit | 95% CI | Recovered shift | Recovery MAE |",
-        "|---:|---:|---:|---:|---:|---:|---:|",
+        "Oracle compensation benefit | 95% CI | Recovered shift | Recovery MAE | "
+        "Reference recovered | Reference MAE |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for key, item in sorted(
         response["by_injected_shift"].items(), key=lambda pair: float(pair[0])
@@ -493,7 +573,9 @@ def _write_report(path: Path, summary: dict) -> None:
             f"[{_format_number(item['oracle_compensation_benefit_ci95'][0])}, "
             f"{_format_number(item['oracle_compensation_benefit_ci95'][1])}] | "
             f"{_format_number(item['recovered_shift_mean_ms'], 1)} ms | "
-            f"{_format_number(item['recovery_mae_ms'], 1)} ms |"
+            f"{_format_number(item['recovery_mae_ms'], 1)} ms | "
+            f"{_format_number(item['reference_recovered_shift_mean_ms'], 1)} ms | "
+            f"{_format_number(item['reference_recovery_mae_ms'], 1)} ms |"
         )
     recovery = response["recovery"]
     lines.extend([
@@ -510,6 +592,13 @@ def _write_report(path: Path, summary: dict) -> None:
         f"{_format_number(recovery['patient_recovery_mae_ms'], 1)} ms.",
         f"- Zero-shift minimum rate: "
         f"{_format_number(recovery['zero_shift_is_minimum_rate'])}.",
+        f"- Reference-only recovery slope: "
+        f"{_format_number(recovery['reference_patient_slope_mean'])}; 95% CI "
+        f"[{_format_number(recovery['reference_patient_slope_ci95'][0])}, "
+        f"{_format_number(recovery['reference_patient_slope_ci95'][1])}].",
+        f"- Reference-only recovery Spearman/MAE: "
+        f"{_format_number(recovery['reference_patient_spearman_mean'])}/"
+        f"{_format_number(recovery['reference_patient_recovery_mae_ms'], 1)} ms.",
         "",
         "## Interpretation boundary",
         "",
@@ -537,6 +626,9 @@ def _make_plots(output_dir: Path, summary: dict) -> None:
     shifts = np.asarray([float(key) for key, _ in items])
     loss = np.asarray([item["uncompensated_loss_mean"] for _, item in items])
     recovered = np.asarray([item["recovered_shift_mean_ms"] for _, item in items])
+    reference_recovered = np.asarray([
+        item["reference_recovered_shift_mean_ms"] for _, item in items
+    ])
     benefit = np.asarray([
         item["oracle_compensation_benefit_mean"] for _, item in items
     ])
@@ -554,6 +646,13 @@ def _make_plots(output_dir: Path, summary: dict) -> None:
 
     fig, ax = plt.subplots(figsize=(5.0, 4.5))
     ax.plot(shifts, recovered, "o-", color="#2A9D8F", label="loss-profile estimate")
+    ax.plot(
+        shifts,
+        reference_recovered,
+        "s-",
+        color="#F4A261",
+        label="teacher-only reference",
+    )
     ax.plot(shifts, shifts, "--", color="#B23A48", label="ideal")
     ax.set_xlabel("Injected PPG shift (ms)")
     ax.set_ylabel("Recovered compensation (ms)")
@@ -748,9 +847,18 @@ def main():
                 teacher_valid,
                 candidate_tokens,
             )
+            reference_profile = evaluate_reference_shift_profile(
+                baseline_teacher,
+                shifted_teacher,
+                teacher_valid,
+                candidate_tokens,
+            )
             losses = profile["losses"]
             recovered_ms, minimum_losses = _best_candidate(
                 losses, compensation_ms
+            )
+            reference_recovered_ms, reference_minimum_losses = _best_candidate(
+                reference_profile["losses"], compensation_ms
             )
             zero_index = min(
                 range(len(compensation_ms)),
@@ -769,6 +877,7 @@ def main():
                 uncompensated = _safe_float(cpu_losses[index, zero_index])
                 oracle = _safe_float(cpu_losses[index, oracle_index])
                 recovered = recovered_ms[index]
+                reference_recovered = reference_recovered_ms[index]
                 row = {
                     "uid": str(uid),
                     "file": str(filename),
@@ -790,6 +899,15 @@ def main():
                     "recovery_abs_error_ms": (
                         abs(recovered - injected_ms)
                         if math.isfinite(recovered)
+                        else float("nan")
+                    ),
+                    "reference_minimum_profile_loss": (
+                        reference_minimum_losses[index]
+                    ),
+                    "reference_recovered_shift_ms": reference_recovered,
+                    "reference_recovery_abs_error_ms": (
+                        abs(reference_recovered - injected_ms)
+                        if math.isfinite(reference_recovered)
                         else float("nan")
                     ),
                     "uncompensated_valid_fraction": _safe_float(
@@ -821,6 +939,16 @@ def main():
                         ),
                         "overlap_mass": _safe_float(
                             cpu_overlap[index, candidate_index]
+                        ),
+                        "reference_loss": _safe_float(
+                            reference_profile["losses"][
+                                index, candidate_index
+                            ]
+                        ),
+                        "reference_valid_fraction": _safe_float(
+                            reference_profile["valid_fractions"][
+                                index, candidate_index
+                            ]
                         ),
                     })
         if (batch_index + 1) % 10 == 0:
@@ -854,6 +982,10 @@ def main():
             "recovered_shift_definition": (
                 "argmin candidate compensation under pairwise alignment loss"
             ),
+            "reference_recovery_definition": (
+                "argmin candidate shift between original and intervened PPG "
+                "teacher representations; no ECG predictor or Transport plan"
+            ),
         },
         "response": response,
         "inputs": {
@@ -868,7 +1000,8 @@ def main():
         },
         "claim_boundary": (
             "Tests temporal geometry and shift sensitivity; does not test "
-            "PPG-conditioned delay-head adaptation, PAT/PTT recovery, or "
+            "PPG-conditioned delay-head adaptation, physiological PAT/PTT "
+            "recovery, or "
             "causal discovery."
         ),
     }

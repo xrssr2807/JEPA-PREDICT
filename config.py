@@ -45,6 +45,12 @@ class DataConfig:
     multidisease_patient_mil: bool = True
     multidisease_mil_segments: int = 8
     multidisease_mil_encoder_chunk_size: int = 128
+    multidisease_canonical_sample_rate_hz: float = 100.0
+    multidisease_fixed_device_rate_hz: float = 0.0
+    multidisease_train_device_rates_hz: List[float] = field(
+        default_factory=list
+    )
+    multidisease_device_rate_probability: float = 0.0
 
     # Augmentation (PhysioAugment — applied to ECG context signal)
     use_augment: bool = False
@@ -79,6 +85,8 @@ class ModelConfig:
 
     # Phase 2: causal, positive-delay monotonic token transport (B3).
     phase2_transport_enabled: bool = True
+    # Constraint-composition ablation. "full" is the paper model.
+    phase2_transport_mode: str = "full"
     phase2_sample_rate_hz: float = 100.0
     phase2_min_delay_ms: float = 80.0
     phase2_max_delay_ms: float = 800.0

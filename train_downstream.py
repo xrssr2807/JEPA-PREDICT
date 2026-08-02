@@ -364,6 +364,18 @@ def build_downstream_dataloaders(
             if multidisease_data_channel is None
             else multidisease_data_channel
         )
+        canonical_rate = float(
+            getattr(data_config, "multidisease_canonical_sample_rate_hz", 100.0)
+        )
+        fixed_device_rate = float(
+            getattr(data_config, "multidisease_fixed_device_rate_hz", 0.0)
+        ) or None
+        train_device_rates = list(
+            getattr(data_config, "multidisease_train_device_rates_hz", [])
+        )
+        device_rate_probability = float(
+            getattr(data_config, "multidisease_device_rate_probability", 0.0)
+        )
         train_dataset = MultiDiseaseDataset(
             data_dir=data_config.multidisease_dir,
             split="train",
@@ -372,6 +384,10 @@ def build_downstream_dataloaders(
             normalize_clip=data_config.normalize_clip,
             channel=data_channel,
             target_length=target_len,
+            canonical_sample_rate_hz=canonical_rate,
+            fixed_device_rate_hz=fixed_device_rate,
+            train_device_rate_choices=train_device_rates,
+            device_rate_probability=device_rate_probability,
         )
         test_dataset = MultiDiseaseDataset(
             data_dir=data_config.multidisease_dir,
@@ -381,6 +397,8 @@ def build_downstream_dataloaders(
             normalize_clip=data_config.normalize_clip,
             channel=data_channel,
             target_length=target_len,
+            canonical_sample_rate_hz=canonical_rate,
+            fixed_device_rate_hz=fixed_device_rate,
         )
         val_dataset = None
         split_manifest = getattr(
@@ -401,6 +419,8 @@ def build_downstream_dataloaders(
             val_dataset = copy.deepcopy(train_dataset)
             train_dataset.files = train_files
             val_dataset.files = val_files
+            val_dataset.train_device_rate_choices = []
+            val_dataset.device_rate_probability = 0.0
             test_dataset.files = test_files
         elif data_config.val_split > 0:
             labels_for_split = []
@@ -414,6 +434,8 @@ def build_downstream_dataloaders(
             val_dataset = copy.deepcopy(train_dataset)
             train_dataset.files = train_files
             val_dataset.files = val_files
+            val_dataset.train_device_rate_choices = []
+            val_dataset.device_rate_probability = 0.0
             print(f"[Data] UID-group train/val split: {len(train_files)} train + {len(val_files)} val")
 
         if data_config.multidisease_patient_mil:
@@ -428,6 +450,10 @@ def build_downstream_dataloaders(
                 max_segments=data_config.multidisease_mil_segments,
                 files=train_dataset.files,
                 train=True,
+                canonical_sample_rate_hz=canonical_rate,
+                fixed_device_rate_hz=fixed_device_rate,
+                train_device_rate_choices=train_device_rates,
+                device_rate_probability=device_rate_probability,
             )
             if val_dataset is not None:
                 val_dataset = MultiDiseasePatientMILDataset(
@@ -441,6 +467,8 @@ def build_downstream_dataloaders(
                     max_segments=data_config.multidisease_mil_segments,
                     files=val_dataset.files,
                     train=False,
+                    canonical_sample_rate_hz=canonical_rate,
+                    fixed_device_rate_hz=fixed_device_rate,
                 )
             test_dataset = MultiDiseasePatientMILDataset(
                 data_dir=data_config.multidisease_dir,
@@ -453,6 +481,17 @@ def build_downstream_dataloaders(
                 max_segments=data_config.multidisease_mil_segments,
                 files=test_dataset.files,
                 train=False,
+                canonical_sample_rate_hz=canonical_rate,
+                fixed_device_rate_hz=fixed_device_rate,
+            )
+
+        if fixed_device_rate is not None or train_device_rates:
+            print(
+                "[PhysicalTimeBridge] "
+                f"canonical={canonical_rate:g}Hz "
+                f"fixed_device={fixed_device_rate} "
+                f"train_choices={train_device_rates} "
+                f"probability={device_rate_probability:g}"
             )
 
         batch_size = train_config.downstream_batch_size
@@ -3008,6 +3047,27 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--device_rate_hz",
+        type=float,
+        default=None,
+        help=(
+            "Simulate a fixed acquisition rate with anti-aliasing before "
+            "mapping signals to the canonical model time grid"
+        ),
+    )
+    parser.add_argument(
+        "--multirate_train_hz",
+        type=str,
+        default=None,
+        help="Comma-separated device rates sampled during training, e.g. 25,50,100",
+    )
+    parser.add_argument(
+        "--multirate_probability",
+        type=float,
+        default=None,
+        help="Probability of applying one simulated training device rate",
+    )
+    parser.add_argument(
         "--dual_teacher_checkpoint", type=str, default=None,
         help=(
             "Frozen dual-stream downstream checkpoint used to distill a "
@@ -3053,6 +3113,28 @@ if __name__ == "__main__":
     if args.multiscale is not None:
         config.data.multidisease_use_multiscale = args.multiscale == "on"
         config.model.use_multiscale = False
+    if args.device_rate_hz is not None:
+        if args.device_rate_hz <= 0:
+            parser.error("--device_rate_hz must be > 0")
+        config.data.multidisease_fixed_device_rate_hz = args.device_rate_hz
+    if args.multirate_train_hz is not None:
+        try:
+            rates = [
+                float(value.strip())
+                for value in args.multirate_train_hz.split(",")
+                if value.strip()
+            ]
+        except ValueError as exc:
+            parser.error(f"Invalid --multirate_train_hz: {exc}")
+        if not rates or any(value <= 0 for value in rates):
+            parser.error("--multirate_train_hz requires positive rates")
+        config.data.multidisease_train_device_rates_hz = rates
+    if args.multirate_probability is not None:
+        if not 0.0 <= args.multirate_probability <= 1.0:
+            parser.error("--multirate_probability must be within [0, 1]")
+        config.data.multidisease_device_rate_probability = (
+            args.multirate_probability
+        )
     if args.batch_size is not None:
         config.train.downstream_batch_size = args.batch_size
     if args.mil_batch_size is not None:

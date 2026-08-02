@@ -322,6 +322,7 @@ class JEPA(nn.Module):
         phase1_bidirectional: bool = True,
         phase1_token_loss_weight: float = 1.0,
         phase2_transport_enabled: bool = True,
+        phase2_transport_mode: str = "full",
         phase2_sample_rate_hz: float = 100.0,
         phase2_min_delay_ms: float = 80.0,
         phase2_max_delay_ms: float = 800.0,
@@ -427,6 +428,23 @@ class JEPA(nn.Module):
             nn.init.normal_(self.ppg_mask_token, std=0.02)
 
             if self.pretrain_phase == 2:
+                transport_modes = {
+                    "full",
+                    "static_delay",
+                    "fixed_prior",
+                    "zero_delay",
+                    "no_monotonic",
+                    "token_shuffled",
+                }
+                phase2_transport_mode = str(
+                    phase2_transport_mode
+                ).strip().lower()
+                if phase2_transport_mode not in transport_modes:
+                    raise ValueError(
+                        "Unsupported phase2_transport_mode="
+                        f"{phase2_transport_mode!r}; expected one of "
+                        f"{sorted(transport_modes)}"
+                    )
                 if phase2_sample_rate_hz <= 0:
                     raise ValueError("phase2_sample_rate_hz must be positive")
                 if phase2_min_delay_ms <= 0:
@@ -472,6 +490,7 @@ class JEPA(nn.Module):
                 self.phase2_transport_enabled = bool(
                     phase2_transport_enabled
                 )
+                self.phase2_transport_mode = phase2_transport_mode
                 self.phase2_transport_loss_weight = float(
                     phase2_transport_loss_weight
                 )
@@ -984,17 +1003,59 @@ class JEPA(nn.Module):
         )
 
     def _build_phase2_transport(self, ecg_tokens: torch.Tensor) -> dict:
-        """Build a causal banded transport with an unmatched dustbin."""
+        """Build the configured Transport policy with an unmatched dustbin."""
         if self.pretrain_phase != 2:
             raise RuntimeError("Phase 2 transport requested outside Phase 2")
         batch_size, num_tokens, _ = ecg_tokens.shape
         offsets = self.phase2_delay_offsets
-        if num_tokens <= int(offsets.min().item()):
+        mode = self.phase2_transport_mode
+        if mode != "zero_delay" and num_tokens <= int(offsets.min().item()):
             raise ValueError(
                 "Phase 2 token sequence is too short for the configured "
                 "positive delay"
             )
         num_bins = offsets.numel()
+        if mode == "zero_delay":
+            identity = torch.eye(
+                num_tokens,
+                dtype=torch.float32,
+                device=ecg_tokens.device,
+            ).unsqueeze(0).expand(batch_size, -1, -1)
+            zeros = identity.new_zeros(batch_size, num_tokens)
+            return {
+                "transport": identity,
+                "forward_transport": identity,
+                "reverse_transport": identity,
+                "delay_probabilities": identity.new_zeros(
+                    batch_size, num_tokens, num_bins
+                ),
+                "conditional_delay_probabilities": identity.new_zeros(
+                    batch_size, num_tokens, num_bins
+                ),
+                "unmatched_probability": zeros,
+                "match_mass": torch.ones_like(zeros),
+                "expected_delay": zeros,
+                "valid_delay": torch.zeros(
+                    batch_size,
+                    num_tokens,
+                    num_bins,
+                    dtype=torch.bool,
+                    device=ecg_tokens.device,
+                ),
+                "valid_rows": torch.ones(
+                    batch_size,
+                    num_tokens,
+                    dtype=torch.bool,
+                    device=ecg_tokens.device,
+                ),
+                "valid_columns": torch.ones(
+                    batch_size,
+                    num_tokens,
+                    dtype=torch.bool,
+                    device=ecg_tokens.device,
+                ),
+            }
+
         temperature = max(self.phase2_transport_temperature, 1e-4)
         logits = self.phase2_delay_head(ecg_tokens).float() / temperature
 
@@ -1002,12 +1063,43 @@ class JEPA(nn.Module):
         target = source + offsets.view(1, 1, num_bins)
         valid_delay = target < num_tokens
         delay_logits = logits[..., :num_bins].masked_fill(~valid_delay, -1e4)
-        logits = torch.cat([delay_logits, logits[..., -1:]], dim=-1)
-        probabilities = F.softmax(logits, dim=-1)
-        delay_probabilities = probabilities[..., :num_bins] * valid_delay
+
+        if mode == "fixed_prior":
+            prior_index = int(
+                torch.argmin(
+                    (
+                        offsets.float()
+                        - float(self.phase2_delay_prior_tokens)
+                    ).abs()
+                ).item()
+            )
+            selected_valid = valid_delay[..., prior_index].expand(
+                batch_size, -1
+            )
+            delay_logits = delay_logits.new_full(
+                (batch_size, num_tokens, num_bins), -1e4
+            )
+            delay_logits[..., prior_index] = torch.where(
+                selected_valid,
+                delay_logits.new_zeros(()),
+                delay_logits.new_full((), -1e4),
+            )
+            unmatched_logits = torch.where(
+                selected_valid,
+                delay_logits.new_full(selected_valid.shape, -1e4),
+                delay_logits.new_zeros(selected_valid.shape),
+            ).unsqueeze(-1)
+        else:
+            unmatched_logits = logits[..., -1:]
+
+        probabilities = F.softmax(
+            torch.cat([delay_logits, unmatched_logits], dim=-1),
+            dim=-1,
+        )
+        base_delay_probabilities = probabilities[..., :num_bins] * valid_delay
         unmatched_probability = probabilities[..., -1]
-        match_mass = delay_probabilities.sum(dim=-1)
-        valid_rows = valid_delay.any(dim=-1).expand(batch_size, -1)
+        match_mass = base_delay_probabilities.sum(dim=-1)
+        expanded_valid_delay = valid_delay.expand(batch_size, -1, -1)
 
         # Condition on a token being matched using a separate softmax. Dividing
         # by match_mass is algebraically equivalent, but creates 1/mass
@@ -1015,6 +1107,24 @@ class JEPA(nn.Module):
         # gradients can overflow under AMP even while the forward loss is
         # finite.
         conditional_delay = F.softmax(delay_logits, dim=-1) * valid_delay
+        if mode == "static_delay":
+            conditional_delay = conditional_delay.mean(
+                dim=1, keepdim=True
+            ).expand_as(conditional_delay)
+        elif mode == "token_shuffled":
+            conditional_delay = torch.roll(
+                conditional_delay,
+                shifts=max(1, num_tokens // 4),
+                dims=1,
+            )
+        if mode in {"static_delay", "token_shuffled"}:
+            conditional_delay = conditional_delay * valid_delay
+            conditional_delay = conditional_delay / conditional_delay.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-8)
+        policy_valid = expanded_valid_delay & (conditional_delay > 0)
+        valid_rows = policy_valid.any(dim=-1)
+        delay_probabilities = conditional_delay * match_mass.unsqueeze(-1)
 
         target_indices = target.clamp(max=max(num_tokens - 1, 0)).expand(
             batch_size, -1, -1
@@ -1031,19 +1141,24 @@ class JEPA(nn.Module):
         # Normalize the reverse direction with a column-wise masked softmax,
         # avoiding another division by a potentially tiny column mass.
         dummy_target = torch.full_like(target, num_tokens)
-        dense_indices = torch.where(valid_delay, target, dummy_target).expand(
-            batch_size, -1, -1
+        dense_indices = torch.where(
+            policy_valid,
+            target.expand(batch_size, -1, -1),
+            dummy_target.expand(batch_size, -1, -1),
+        )
+        policy_logits = conditional_delay.clamp_min(1e-8).log().masked_fill(
+            ~policy_valid, -1e4
         )
         reverse_logits = delay_logits.new_full(
             (batch_size, num_tokens, num_tokens + 1), -1e4
-        ).scatter(2, dense_indices, delay_logits)
+        ).scatter(2, dense_indices, policy_logits)
         reverse_logits = reverse_logits[..., :num_tokens]
         reverse_valid = torch.zeros(
-            (1, num_tokens, num_tokens + 1),
+            (batch_size, num_tokens, num_tokens + 1),
             dtype=torch.bool,
             device=ecg_tokens.device,
-        ).scatter(2, torch.where(valid_delay, target, dummy_target), valid_delay)
-        reverse_valid = reverse_valid[..., :num_tokens].expand(batch_size, -1, -1)
+        ).scatter(2, dense_indices, policy_valid)
+        reverse_valid = reverse_valid[..., :num_tokens]
         reverse_transport = F.softmax(reverse_logits, dim=1) * reverse_valid
         valid_columns = reverse_valid.any(dim=1)
 
@@ -1060,10 +1175,26 @@ class JEPA(nn.Module):
             "unmatched_probability": unmatched_probability,
             "match_mass": match_mass,
             "expected_delay": expected_delay,
-            "valid_delay": valid_delay.expand(batch_size, -1, -1),
+            "valid_delay": policy_valid,
             "valid_rows": valid_rows,
             "valid_columns": valid_columns,
         }
+
+    def _phase2_effective_regularizer_weights(self) -> dict:
+        """Return only the constraint weights active in this ablation mode."""
+        weights = {
+            "delay_prior": self.phase2_delay_prior_weight,
+            "monotonic": self.phase2_monotonic_weight,
+            "delay_smoothness": self.phase2_delay_smoothness_weight,
+            "match_mass": self.phase2_match_mass_weight,
+        }
+        if self.phase2_transport_mode == "no_monotonic":
+            weights["monotonic"] = 0.0
+        elif self.phase2_transport_mode in {"fixed_prior", "zero_delay"}:
+            # These policies are fixed by construction; policy regularizers
+            # would add constants without training a delay distribution.
+            weights = {name: 0.0 for name in weights}
+        return weights
 
     def _phase2_transport_regularizers(self, state: dict) -> dict:
         """Positive-delay prior, monotonicity, smoothness, and mass control."""
@@ -1502,12 +1633,16 @@ class JEPA(nn.Module):
         total_loss = self.phase1_token_loss_weight * token_jepa
         total_loss = total_loss + self.phase2_variance_weight * variance_loss
         total_loss = total_loss + self.phase2_covariance_weight * covariance_loss
+        constraint_weights = self._phase2_effective_regularizer_weights()
         total_loss = total_loss + progress * (
-            self.phase2_delay_prior_weight * regularizers["delay_prior_loss"]
-            + self.phase2_monotonic_weight * regularizers["monotonic_loss"]
-            + self.phase2_delay_smoothness_weight
+            constraint_weights["delay_prior"]
+            * regularizers["delay_prior_loss"]
+            + constraint_weights["monotonic"]
+            * regularizers["monotonic_loss"]
+            + constraint_weights["delay_smoothness"]
             * regularizers["delay_smoothness_loss"]
-            + self.phase2_match_mass_weight * regularizers["match_mass_loss"]
+            + constraint_weights["match_mass"]
+            * regularizers["match_mass_loss"]
         )
         shared_private_progress = (
             self.phase2_shared_private_progress
@@ -1533,6 +1668,7 @@ class JEPA(nn.Module):
             "prediction_std": prediction_std.item(),
             "phase2_progress": progress,
             "phase2_transport_enabled": self.phase2_transport_enabled,
+            "phase2_transport_mode": self.phase2_transport_mode,
             "shared_private_progress": shared_private_progress,
             "private_reconstruction": private_reconstruction.item(),
             "ecg_private_reconstruction": ecg_private_reconstruction.item(),
