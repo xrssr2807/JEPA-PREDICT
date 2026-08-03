@@ -1530,6 +1530,222 @@ def save_multilabel_patient_predictions(
             writer.writerow(row)
 
 
+def build_external_multidisease_loader(
+    data_dir: str,
+    config: Config,
+) -> Tuple[DataLoader, MultiDiseasePatientMILDataset, dict]:
+    """Build a deterministic patient-level loader for a frozen external cohort."""
+    data_dir = os.path.abspath(os.path.expanduser(data_dir))
+    if not os.path.isdir(data_dir):
+        raise FileNotFoundError(f"External data directory was not found: {data_dir}")
+    if str(config.data.multidisease_channel) != str(
+        config.data.multidisease_ppg_channel
+    ):
+        raise ValueError(
+            "The current multicenter cohort contains PPG only. Use "
+            "--multidisease_channel ppg."
+        )
+
+    files = sorted(
+        name for name in os.listdir(data_dir) if name.endswith(".pkl")
+    )
+    if not files:
+        raise ValueError(f"No .pkl windows were found in {data_dir}")
+
+    labels_by_uid: Dict[str, np.ndarray] = {}
+    label_valid_by_uid: Dict[str, np.ndarray] = {}
+    for name in files:
+        path = os.path.join(data_dir, name)
+        with open(path, "rb") as handle:
+            sample = pickle.load(handle)
+        uid = str(sample.get("uid", uid_from_filename(name)))
+        label_dict = sample.get("label", {})
+        labels = np.asarray([
+            multidisease_label_value(label_dict, label_name)
+            for label_name in config.data.multidisease_labels
+        ], dtype=np.float32)
+        valid_dict = sample.get("label_valid", {})
+        valid = np.asarray([
+            float(bool(valid_dict.get(label_name, 1)))
+            for label_name in config.data.multidisease_labels
+        ], dtype=np.float32)
+        if uid in labels_by_uid and not np.array_equal(labels_by_uid[uid], labels):
+            raise ValueError(f"External labels disagree across windows for UID {uid}")
+        if uid in label_valid_by_uid and not np.array_equal(
+            label_valid_by_uid[uid], valid
+        ):
+            raise ValueError(
+                f"External label-valid masks disagree across windows for UID {uid}"
+            )
+        labels_by_uid[uid] = labels
+        label_valid_by_uid[uid] = valid
+
+    invalid = {
+        uid: mask.tolist()
+        for uid, mask in label_valid_by_uid.items()
+        if not bool(np.all(mask == 1.0))
+    }
+    if invalid:
+        raise ValueError(
+            "External model_input contains incomplete label-valid masks. "
+            "Exclude unresolved patients before evaluation; affected patients="
+            f"{len(invalid)}"
+        )
+
+    target_len = (
+        config.data.signal_align_to
+        if config.data.signal_align_to > 0 else None
+    )
+    dataset = MultiDiseasePatientMILDataset(
+        data_dir=data_dir,
+        split="test",
+        disease_labels=config.data.multidisease_labels,
+        normalize=config.data.normalize,
+        normalize_clip=config.data.normalize_clip,
+        channel=config.data.multidisease_channel,
+        target_length=target_len,
+        max_segments=config.data.multidisease_mil_segments,
+        files=files,
+        train=False,
+        canonical_sample_rate_hz=float(
+            getattr(config.data, "multidisease_canonical_sample_rate_hz", 100.0)
+        ),
+    )
+    loader_kwargs = dataloader_performance_kwargs(config.train)
+    loader = DataLoader(
+        dataset,
+        batch_size=config.train.multidisease_mil_batch_size,
+        shuffle=False,
+        **loader_kwargs,
+    )
+    positive_counts = np.stack(list(labels_by_uid.values()), axis=0).sum(axis=0)
+    provenance = {
+        "data_dir": data_dir,
+        "window_count": len(files),
+        "patient_count": len(labels_by_uid),
+        "positive_patient_counts": {
+            label_name: int(positive_counts[index])
+            for index, label_name in enumerate(config.data.multidisease_labels)
+        },
+        "label_validity": "complete",
+        "threshold_source": "internal_validation_checkpoint",
+    }
+    return loader, dataset, provenance
+
+
+def evaluate_external_multidisease_checkpoint(
+    model,
+    saved_state: dict,
+    external_loader: DataLoader,
+    criterion,
+    device,
+    config: Config,
+    use_amp: bool,
+    provenance: dict,
+) -> float:
+    """Run inference once on an external cohort without fitting any parameter."""
+    thresholds = saved_state.get("thresholds")
+    if thresholds is None:
+        raise ValueError(
+            "The downstream checkpoint has no validation-tuned thresholds. "
+            "External data must never be used to tune thresholds."
+        )
+    if len(thresholds) != len(config.data.multidisease_labels):
+        raise ValueError(
+            "Checkpoint threshold count does not match the disease label schema"
+        )
+
+    model.load_state_dict(saved_state["model_state_dict"], strict=True)
+    result = evaluate_multilabel(
+        model,
+        external_loader,
+        criterion,
+        device,
+        config.data.multidisease_labels,
+        thresholds=np.asarray(thresholds, dtype=np.float32),
+        use_amp=use_amp,
+        return_uids=True,
+    )
+    (
+        loss, acc, macro_auc_with_placeholders, auc_list,
+        precision, recall, f1, f05, report,
+        predictions, labels, probabilities, uids,
+    ) = result
+    prediction_path = os.path.join(
+        config.output_dir, "external_patient_predictions.csv"
+    )
+    save_multilabel_patient_predictions(
+        prediction_path,
+        uids,
+        config.data.multidisease_labels,
+        labels,
+        predictions,
+        probabilities,
+        split_role="external",
+    )
+
+    evaluable_indices = [
+        index for index in range(labels.shape[1])
+        if np.unique(labels[:, index]).size > 1
+    ]
+    evaluable_auc = [auc_list[index] for index in evaluable_indices]
+    macro_auc = float(np.mean(evaluable_auc)) if evaluable_auc else float("nan")
+    undefined_labels = [
+        config.data.multidisease_labels[index]
+        for index in range(labels.shape[1])
+        if index not in evaluable_indices
+    ]
+    chd_index = int(config.train.chd_label_index)
+    summary = {
+        "evaluation_role": "external_validation",
+        "analysis_unit": "patient",
+        "model_frozen": True,
+        "threshold_tuning_on_external": False,
+        "thresholds": [float(value) for value in thresholds],
+        "loss": float(loss),
+        "accuracy": float(acc),
+        "macro_auc_evaluable_labels_only": macro_auc,
+        "macro_auc_placeholder_value_not_reportable": float(
+            macro_auc_with_placeholders
+        ),
+        "auc_per_class": {
+            label_name: (
+                float(auc_list[index])
+                if index in evaluable_indices else None
+            )
+            for index, label_name in enumerate(config.data.multidisease_labels)
+        },
+        "undefined_auc_labels": undefined_labels,
+        "chd_auc": (
+            float(auc_list[chd_index])
+            if chd_index in evaluable_indices else None
+        ),
+        "precision_macro": float(precision),
+        "recall_macro": float(recall),
+        "f1_macro": float(f1),
+        "f05_macro": float(f05),
+        "classification_report": report,
+        "predictions_file": os.path.basename(prediction_path),
+        "cohort": provenance,
+    }
+    summary_path = os.path.join(config.output_dir, "external_evaluation_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, ensure_ascii=False, indent=2)
+
+    print("\n" + "=" * 60)
+    print("EXTERNAL VALIDATION (FROZEN MODEL AND INTERNAL THRESHOLDS)")
+    print("=" * 60)
+    print(f"Patients:             {len(uids)}")
+    print(f"Macro AUC (defined):  {macro_auc:.4f}")
+    if summary["chd_auc"] is not None:
+        print(f"CHD/Coronary AUC:     {summary['chd_auc']:.4f}")
+    if undefined_labels:
+        print(f"Undefined AUC labels: {undefined_labels}")
+    print(f"Predictions saved ->  {prediction_path}")
+    print(f"Summary saved ->      {summary_path}")
+    return macro_auc
+
+
 # ── Main Pipeline ───────────────────────────────────────────────
 
 def tune_multilabel_thresholds(labels: np.ndarray, probs: np.ndarray,
@@ -2081,6 +2297,7 @@ def train_downstream(
     evaluate_checkpoint: Optional[str] = None,
     encoder_init: str = "pretrained",
     experiment_id: Optional[str] = None,
+    external_data_dir: Optional[str] = None,
 ):
     """
     Downstream fine-tuning pipeline.
@@ -2094,6 +2311,11 @@ def train_downstream(
     encoder_init = str(encoder_init).lower()
     if encoder_init not in {"pretrained", "random"}:
         raise ValueError("encoder_init must be pretrained or random")
+    if external_data_dir is not None and evaluate_checkpoint is None:
+        raise ValueError(
+            "--external_data_dir requires --evaluate_checkpoint; external "
+            "cohorts are inference-only"
+        )
     if encoder_init == "pretrained":
         if not checkpoint_path:
             raise ValueError(
@@ -2615,6 +2837,30 @@ def train_downstream(
                 use_shared_private_head,
                 encoder_init=encoder_init,
             )
+        if external_data_dir is not None:
+            if not multilabel:
+                raise ValueError(
+                    "External multicenter evaluation requires --dataset multidisease"
+                )
+            external_loader, _, external_provenance = (
+                build_external_multidisease_loader(external_data_dir, config)
+            )
+            result = evaluate_external_multidisease_checkpoint(
+                model=model,
+                saved_state=saved_state,
+                external_loader=external_loader,
+                criterion=criterion,
+                device=device,
+                config=config,
+                use_amp=use_amp,
+                provenance=external_provenance,
+            )
+            log_fh.write(
+                "\nEXTERNAL VALIDATION COMPLETE | frozen_model=true | "
+                "threshold_tuning_on_external=false\n"
+            )
+            log_fh.close()
+            return result
         saved_state["source_checkpoint"] = os.path.abspath(evaluate_checkpoint)
         result = finalize_downstream_model(
             model=model,
@@ -3037,6 +3283,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--external_data_dir",
+        type=str,
+        default=None,
+        help=(
+            "Inference-only PPG multicenter model_input directory. Requires "
+            "--evaluate_checkpoint and uses thresholds saved from internal validation."
+        ),
+    )
+    parser.add_argument(
         "--shared_private_head",
         choices=["auto", "on", "off"],
         default="auto",
@@ -3171,4 +3426,5 @@ if __name__ == "__main__":
         evaluate_checkpoint=args.evaluate_checkpoint,
         encoder_init=args.encoder_init,
         experiment_id=args.experiment_id,
+        external_data_dir=args.external_data_dir,
     )

@@ -596,7 +596,10 @@ MULTIDISEASE_LABEL_SOURCES = {
 
 def multidisease_label_value(label_dict: dict, label_name: str) -> float:
     """Resolve one downstream target, including explicitly merged labels."""
-    source_names = MULTIDISEASE_LABEL_SOURCES.get(label_name, (label_name,))
+    legacy_sources = MULTIDISEASE_LABEL_SOURCES.get(label_name, ())
+    # New exports may already contain the merged label, while historical raw
+    # files contain its two source diagnoses. Accept both representations.
+    source_names = (label_name, *legacy_sources)
     return float(any(bool(label_dict.get(name, 0)) for name in source_names))
 
 
@@ -690,7 +693,9 @@ class MultiDiseaseDataset(Dataset):
         with open(filepath, "rb") as f:
             sample = pickle.load(f)
 
-        data = sample["data"].astype(np.float32)
+        # np.asarray also accepts the version-neutral nested lists used by
+        # external cohorts, while preserving compatibility with NumPy arrays.
+        data = np.asarray(sample["data"], dtype=np.float32)
         data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
         if data.ndim == 1:
             data = data[None, :]
