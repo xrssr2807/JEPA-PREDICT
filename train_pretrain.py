@@ -266,6 +266,28 @@ def build_model(model_config: ModelConfig) -> JEPA:
         phase2_variance_weight=model_config.phase2_variance_weight,
         phase2_covariance_weight=model_config.phase2_covariance_weight,
         phase2_target_std=model_config.phase2_target_std,
+        phase2_v2_transport_dim=model_config.phase2_v2_transport_dim,
+        phase2_v2_content_weight=model_config.phase2_v2_content_weight,
+        phase2_v2_global_delay_weight=(
+            model_config.phase2_v2_global_delay_weight
+        ),
+        phase2_v2_local_delay_weight=(
+            model_config.phase2_v2_local_delay_weight
+        ),
+        phase2_v2_sinkhorn_epsilon=(
+            model_config.phase2_v2_sinkhorn_epsilon
+        ),
+        phase2_v2_sinkhorn_mass_reg=(
+            model_config.phase2_v2_sinkhorn_mass_reg
+        ),
+        phase2_v2_sinkhorn_iters=model_config.phase2_v2_sinkhorn_iters,
+        phase2_counterfactual_weight=(
+            model_config.phase2_counterfactual_weight
+        ),
+        phase2_counterfactual_margin=(
+            model_config.phase2_counterfactual_margin
+        ),
+        phase2_pat_weak_weight=model_config.phase2_pat_weak_weight,
         phase2_shared_private_enabled=(
             model_config.phase2_shared_private_enabled
         ),
@@ -459,6 +481,36 @@ def _phase_checkpoint_metadata(model, config: Config) -> dict:
             "variance_weight": float(config.model.phase2_variance_weight),
             "covariance_weight": float(config.model.phase2_covariance_weight),
             "target_std": float(config.model.phase2_target_std),
+            "v2_transport_dim": int(
+                config.model.phase2_v2_transport_dim
+            ),
+            "v2_content_weight": float(
+                config.model.phase2_v2_content_weight
+            ),
+            "v2_global_delay_weight": float(
+                config.model.phase2_v2_global_delay_weight
+            ),
+            "v2_local_delay_weight": float(
+                config.model.phase2_v2_local_delay_weight
+            ),
+            "v2_sinkhorn_epsilon": float(
+                config.model.phase2_v2_sinkhorn_epsilon
+            ),
+            "v2_sinkhorn_mass_reg": float(
+                config.model.phase2_v2_sinkhorn_mass_reg
+            ),
+            "v2_sinkhorn_iters": int(
+                config.model.phase2_v2_sinkhorn_iters
+            ),
+            "counterfactual_weight": float(
+                config.model.phase2_counterfactual_weight
+            ),
+            "counterfactual_margin": float(
+                config.model.phase2_counterfactual_margin
+            ),
+            "pat_weak_weight": float(
+                config.model.phase2_pat_weak_weight
+            ),
             "shared_private_enabled": bool(
                 config.model.phase2_shared_private_enabled
             ),
@@ -515,6 +567,8 @@ _SHARED_PRIVATE_PREFIXES = (
     "ppg_private_predictor.",
 )
 
+_PHYSIO_V2_PREFIXES = ("phase2_physio_transport.",)
+
 
 def _checkpoint_uses_shared_private(checkpoint: dict) -> bool:
     phase2_config = checkpoint.get("phase2_config", {})
@@ -527,10 +581,15 @@ def _checkpoint_uses_shared_private(checkpoint: dict) -> bool:
 
 
 def _initialize_shared_private_from_phase2(model, checkpoint: dict) -> list:
-    """Load a legacy Phase 2 model and leave only new P2 modules initialized."""
-    if model.pretrain_phase != 2 or not model.phase2_shared_private_enabled:
+    """Initialize new Phase 2 modules from a compatible legacy checkpoint."""
+    target_shared_private = bool(model.phase2_shared_private_enabled)
+    target_physio_v2 = model.phase2_transport_mode == "physio_v2"
+    if model.pretrain_phase != 2 or not (
+        target_shared_private or target_physio_v2
+    ):
         raise ValueError(
-            "--init_checkpoint requires Phase 2 with --shared_private"
+            "--init_checkpoint requires Phase 2 with --shared_private or "
+            "--transport_mode physio_v2"
         )
     if int(checkpoint.get("pretrain_phase", 0)) != 2:
         raise ValueError("Shared-private initialization requires a Phase 2 checkpoint")
@@ -550,9 +609,14 @@ def _initialize_shared_private_from_phase2(model, checkpoint: dict) -> list:
     checkpoint_mode = str(
         checkpoint_phase2.get("transport_mode", "full")
     )
+    mode_upgrade = (
+        checkpoint_mode == "full"
+        and model.phase2_transport_mode == "physio_v2"
+    )
     if (
         model.phase2_transport_enabled
         and checkpoint_mode != model.phase2_transport_mode
+        and not mode_upgrade
     ):
         raise ValueError(
             "Initialization checkpoint Transport constraint mode "
@@ -563,9 +627,14 @@ def _initialize_shared_private_from_phase2(model, checkpoint: dict) -> list:
     result = model.load_state_dict(
         checkpoint["model_state_dict"], strict=False
     )
+    allowed_prefixes = tuple()
+    if target_shared_private and not _checkpoint_uses_shared_private(checkpoint):
+        allowed_prefixes += _SHARED_PRIVATE_PREFIXES
+    if target_physio_v2 and checkpoint_mode != "physio_v2":
+        allowed_prefixes += _PHYSIO_V2_PREFIXES
     unexpected_missing = [
         key for key in result.missing_keys
-        if not key.startswith(_SHARED_PRIVATE_PREFIXES)
+        if not key.startswith(allowed_prefixes)
     ]
     if unexpected_missing or result.unexpected_keys:
         raise RuntimeError(
@@ -575,7 +644,7 @@ def _initialize_shared_private_from_phase2(model, checkpoint: dict) -> list:
         )
     if not result.missing_keys:
         print(
-            "[Init] Source already contains shared-private modules; "
+            "[Init] Source already contains all requested Phase 2 modules; "
             "optimizer and validation state will still restart"
         )
     model._enforce_teacher_eval()
@@ -676,6 +745,16 @@ def train(
                 f"start={config.train.phase2_shared_private_start_epoch} | "
                 f"ramp={config.train.phase2_shared_private_ramp_epochs}"
             )
+        if config.model.phase2_transport_mode == "physio_v2":
+            print(
+                "[PhysioV2] paired ECG/PPG content + global/local delay + "
+                "unbalanced Sinkhorn | "
+                f"dim={config.model.phase2_v2_transport_dim} | "
+                f"iters={config.model.phase2_v2_sinkhorn_iters} | "
+                f"counterfactual_weight="
+                f"{config.model.phase2_counterfactual_weight:.3f} | "
+                f"margin={config.model.phase2_counterfactual_margin:.3f}"
+            )
 
     if init_from is not None:
         print(f"[Init] Loading Phase 2 initialization checkpoint: {init_from}")
@@ -687,7 +766,7 @@ def train(
         )
         print(
             "[Init] Loaded existing Phase 2 weights; initialized "
-            f"{len(initialized_keys)} new shared-private tensors"
+            f"{len(initialized_keys)} new Phase 2 tensors"
         )
 
     # Optimizer
@@ -1475,8 +1554,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--init_checkpoint", type=str, default=None,
         help=(
-            "Initialize new Shared-Private modules from an existing Phase 2 "
-            "checkpoint while restarting optimizer and validation state"
+            "Initialize new Shared-Private or physio_v2 modules from an "
+            "existing Phase 2 checkpoint while restarting optimizer and "
+            "validation state"
         ),
     )
     parser.add_argument("--start_epoch", type=int, default=0,
@@ -1552,6 +1632,7 @@ if __name__ == "__main__":
             "zero_delay",
             "no_monotonic",
             "token_shuffled",
+            "physio_v2",
         ),
         default=None,
         help=(
@@ -1562,6 +1643,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--transport_ramp_epochs", type=int, default=None,
         help="Phase 2 epochs used to ramp transport from 0 to 1",
+    )
+    parser.add_argument(
+        "--counterfactual_weight", type=float, default=None,
+        help="Weight of paired-vs-mismatched ranking in physio_v2",
+    )
+    parser.add_argument(
+        "--counterfactual_margin", type=float, default=None,
+        help="Margin of paired-vs-mismatched ranking in physio_v2",
+    )
+    parser.add_argument(
+        "--sinkhorn_iters", type=int, default=None,
+        help="Unbalanced Sinkhorn iterations in physio_v2",
     )
     parser.add_argument(
         "--early_stop_patience", type=int, default=None,
@@ -1611,6 +1704,16 @@ if __name__ == "__main__":
         config.model.phase2_transport_enabled = False
     if args.transport_mode is not None:
         config.model.phase2_transport_mode = args.transport_mode
+    if args.counterfactual_weight is not None:
+        config.model.phase2_counterfactual_weight = (
+            args.counterfactual_weight
+        )
+    if args.counterfactual_margin is not None:
+        config.model.phase2_counterfactual_margin = (
+            args.counterfactual_margin
+        )
+    if args.sinkhorn_iters is not None:
+        config.model.phase2_v2_sinkhorn_iters = args.sinkhorn_iters
     if args.private_dim is not None:
         config.model.phase2_private_dim = args.private_dim
     if args.private_loss_weight is not None:
@@ -1717,8 +1820,15 @@ if __name__ == "__main__":
             "--disable_transport cannot be combined with a non-full "
             "--transport_mode"
         )
-    if args.init_checkpoint is not None and not args.shared_private:
-        parser.error("--init_checkpoint requires --shared_private")
+    if (
+        args.init_checkpoint is not None
+        and not args.shared_private
+        and config.model.phase2_transport_mode != "physio_v2"
+    ):
+        parser.error(
+            "--init_checkpoint requires --shared_private or "
+            "--transport_mode physio_v2"
+        )
     if args.init_checkpoint is not None and args.resume is not None:
         parser.error("--init_checkpoint cannot be combined with --resume")
     if args.init_checkpoint is not None and args.start_epoch != 0:

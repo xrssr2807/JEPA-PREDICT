@@ -105,6 +105,22 @@ class ModelConfig:
     phase2_target_std: float = 0.10
     phase2_use_stats_loss: bool = False
 
+    # Transport v2: paired-content conditional, dustbin-aware unbalanced OT.
+    # It is opt-in through phase2_transport_mode="physio_v2" so historical
+    # Phase 2 checkpoints and ablations remain exactly reproducible.
+    phase2_v2_transport_dim: int = 128
+    phase2_v2_content_weight: float = 1.0
+    phase2_v2_global_delay_weight: float = 1.0
+    phase2_v2_local_delay_weight: float = 1.0
+    phase2_v2_sinkhorn_epsilon: float = 1.0
+    phase2_v2_sinkhorn_mass_reg: float = 1.0
+    phase2_v2_sinkhorn_iters: int = 20
+    phase2_counterfactual_weight: float = 0.10
+    phase2_counterfactual_margin: float = 0.10
+    # Optional weak PAT supervision. It has no effect unless PAT targets are
+    # supplied to JEPA.compute_loss and this weight is greater than zero.
+    phase2_pat_weak_weight: float = 0.0
+
     # Priority 2: preserve modality-private morphology while causal transport
     # acts only on a shared ECG/PPG representation.
     phase2_shared_private_enabled: bool = False
