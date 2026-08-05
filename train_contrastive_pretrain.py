@@ -140,6 +140,12 @@ def parse_args():
     parser.add_argument("--warmup_epochs", type=int, default=3)
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--data_split_seed",
+        type=int,
+        default=42,
+        help="Fixed patient-grouped pre-training split seed",
+    )
     return parser.parse_args()
 
 
@@ -161,7 +167,7 @@ def main():
         config.train,
         return_stats=False,
         use_processed=True,
-        seed=args.seed,
+        seed=args.data_split_seed,
         batch_size=args.batch_size,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -173,6 +179,12 @@ def main():
     model = CrossModalContrastiveModel(
         config.model, projection_dim=args.projection_dim
     ).to(device)
+    encoder_parameters = sum(
+        parameter.numel()
+        for encoder in (model.ecg_encoder, model.ppg_encoder)
+        for parameter in encoder.parameters()
+    )
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -197,11 +209,15 @@ def main():
     manifest = {
         "experiment": "P3_cross_modal_infonce",
         "seed": args.seed,
+        "data_split_seed": args.data_split_seed,
         "train_segments": len(train_loader.dataset),
         "val_segments": len(val_loader.dataset),
         "temperature": args.temperature,
         "batch_size": args.batch_size,
         "accum_steps": args.accum_steps,
+        "optimizer_steps_budget": total_steps,
+        "encoder_parameters": encoder_parameters,
+        "total_pretrain_parameters": total_parameters,
         "test_set_used": False,
     }
     with open(
@@ -275,12 +291,12 @@ def main():
                 "epoch": epoch,
                 "context_encoder": model.ecg_encoder.state_dict(),
                 "target_encoder": model.ppg_encoder.state_dict(),
-                "ppg_encoder": model.ppg_encoder.state_dict(),
                 "ecg_projection": model.ecg_projection.state_dict(),
                 "ppg_projection": model.ppg_projection.state_dict(),
                 "val_loss": float(val_loss),
                 "val_retrieval_accuracy": float(val_accuracy),
                 "pretraining_objective": "symmetric_cross_modal_infonce",
+                "pretraining_manifest": manifest,
                 "seed": args.seed,
                 "test_evaluated": False,
             }
