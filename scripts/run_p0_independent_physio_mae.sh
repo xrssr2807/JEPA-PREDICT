@@ -389,12 +389,14 @@ actual_split_sha="$(sha256sum "$SPLIT" | awk '{print $1}')"
     "Preprocessed pretraining data missing: /root/autodl-tmp/split_processed"
 [[ "$DATA_SPLIT_SEED" == "42" ]] || die \
     "This study requires frozen pretraining data split seed 42"
+pretrain_help="$(python train_pretrain.py --help 2>&1)"
 for option in transport_mode shared_private data_split_seed checkpoint_interval; do
-    python train_pretrain.py --help 2>&1 | grep -q -- "--${option}" || die \
+    [[ "$pretrain_help" == *"--${option}"* ]] || die \
         "train_pretrain.py lacks --${option}"
 done
+downstream_help="$(python train_downstream.py --help 2>&1)"
 for option in encoder_init encoder_arch seal_test experiment_id; do
-    python train_downstream.py --help 2>&1 | grep -q -- "--${option}" || die \
+    [[ "$downstream_help" == *"--${option}"* ]] || die \
         "train_downstream.py lacks --${option}"
 done
 require_free_space
