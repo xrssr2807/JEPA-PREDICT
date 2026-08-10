@@ -21,6 +21,7 @@ WORKERS="${WORKERS:-8}"
 MIL_BATCH_SIZE="${MIL_BATCH_SIZE:-32}"
 MIL_CHUNK_SIZE="${MIL_CHUNK_SIZE:-64}"
 KEEP_LAST="${KEEP_LAST:-0}"
+SLIM_CHECKPOINTS="${SLIM_CHECKPOINTS:-1}"
 SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
@@ -138,6 +139,14 @@ for alpha in "${alpha_values[@]}"; do
             "Sealed completion marker missing: $downstream_dir"
     fi
 
+    if [[ "$tag" != "a100" && "$SLIM_CHECKPOINTS" == "1" ]]; then
+        checkpoint_format="$(python -c "import torch; c=torch.load('$pretrain_checkpoint', map_location='cpu', weights_only=False); print(c.get('checkpoint_format', 'full'))")"
+        if [[ "$checkpoint_format" != "encoder_eval_slim_v1" ]]; then
+            python scripts/slim_pretrain_checkpoint.py \
+                --input "$pretrain_checkpoint"
+        fi
+    fi
+
     run_dir="${PAPER_DIR}/${tag}"
     mkdir -p "$run_dir"
     {
@@ -153,6 +162,7 @@ for alpha in "${alpha_values[@]}"; do
         echo "init_sha256=$(sha256sum "$INIT_CHECKPOINT" | awk '{print $1}')"
         echo "pretrain_checkpoint=$pretrain_checkpoint"
         echo "pretrain_sha256=$(sha256sum "$pretrain_checkpoint" | awk '{print $1}')"
+        echo "pretrain_checkpoint_format=$(python -c "import torch; c=torch.load('$pretrain_checkpoint', map_location='cpu', weights_only=False); print(c.get('checkpoint_format', 'full'))")"
         echo "downstream_checkpoint=$downstream_checkpoint"
         echo "test_status=sealed"
     } > "${run_dir}/run_manifest.txt"
