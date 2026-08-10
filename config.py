@@ -95,6 +95,10 @@ class ModelConfig:
     phase2_transport_temperature: float = 0.20
     phase2_unmatched_bias: float = -2.0
     phase2_transport_loss_weight: float = 1.0
+    # ECG -> PPG is the physiology-directed primary task. PPG -> ECG remains
+    # an auxiliary representation-prediction task weighted by alpha in [0, 1].
+    # alpha=1 reproduces the historical symmetric bidirectional objective.
+    phase2_reverse_loss_weight: float = 1.0
     phase2_delay_prior_weight: float = 0.02
     phase2_monotonic_weight: float = 0.05
     phase2_delay_smoothness_weight: float = 0.01

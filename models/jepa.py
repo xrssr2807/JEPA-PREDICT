@@ -424,6 +424,7 @@ class JEPA(nn.Module):
         phase2_transport_temperature: float = 0.2,
         phase2_unmatched_bias: float = -2.0,
         phase2_transport_loss_weight: float = 1.0,
+        phase2_reverse_loss_weight: float = 1.0,
         phase2_delay_prior_weight: float = 0.02,
         phase2_monotonic_weight: float = 0.05,
         phase2_delay_smoothness_weight: float = 0.01,
@@ -559,6 +560,10 @@ class JEPA(nn.Module):
                     )
                 if phase2_transport_temperature <= 0:
                     raise ValueError("phase2_transport_temperature must be positive")
+                if not 0.0 <= phase2_reverse_loss_weight <= 1.0:
+                    raise ValueError(
+                        "phase2_reverse_loss_weight must be in [0, 1]"
+                    )
                 if not 0.0 < phase2_target_match_mass <= 1.0:
                     raise ValueError(
                         "phase2_target_match_mass must be in the interval (0, 1]"
@@ -597,6 +602,9 @@ class JEPA(nn.Module):
                 self.phase2_transport_mode = phase2_transport_mode
                 self.phase2_transport_loss_weight = float(
                     phase2_transport_loss_weight
+                )
+                self.phase2_reverse_loss_weight = float(
+                    phase2_reverse_loss_weight
                 )
                 self.phase2_delay_prior_weight = float(phase2_delay_prior_weight)
                 self.phase2_monotonic_weight = float(phase2_monotonic_weight)
@@ -1140,6 +1148,15 @@ class JEPA(nn.Module):
         if not valid.any():
             return prediction.sum() * 0.0
         return per_token[valid].mean()
+
+    def _combine_phase2_direction_losses(
+        self,
+        ecg_to_ppg_loss: torch.Tensor,
+        ppg_to_ecg_loss: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keep ECG->PPG primary while using PPG->ECG as an auxiliary task."""
+        alpha = self.phase2_reverse_loss_weight
+        return (ecg_to_ppg_loss + alpha * ppg_to_ecg_loss) / (1.0 + alpha)
 
     def set_phase2_progress(self, progress: float) -> None:
         """Set the transport blend in [0, 1] for the current epoch."""
@@ -1860,7 +1877,9 @@ class JEPA(nn.Module):
         direct_ppg_to_ecg = self._masked_token_regression(
             ecg_prediction, ecg_teacher_shared, token_mask
         )
-        direct_jepa = 0.5 * (direct_ecg_to_ppg + direct_ppg_to_ecg)
+        direct_jepa = self._combine_phase2_direction_losses(
+            direct_ecg_to_ppg, direct_ppg_to_ecg
+        )
 
         zero = direct_jepa.new_zeros(())
         if self.phase2_transport_enabled:
@@ -1892,8 +1911,8 @@ class JEPA(nn.Module):
                 token_mask,
                 transport_state["valid_columns"],
             )
-            transport_jepa = 0.5 * (
-                transport_ecg_to_ppg + transport_ppg_to_ecg
+            transport_jepa = self._combine_phase2_direction_losses(
+                transport_ecg_to_ppg, transport_ppg_to_ecg
             )
             regularizers = self._phase2_transport_regularizers(
                 transport_state
@@ -2074,8 +2093,11 @@ class JEPA(nn.Module):
             "jepa": token_jepa.item(),
             "direct_token_jepa": direct_jepa.item(),
             "transport_token_jepa": transport_jepa.item(),
+            "direct_ecg_to_ppg_token": direct_ecg_to_ppg.item(),
+            "direct_ppg_to_ecg_token": direct_ppg_to_ecg.item(),
             "ecg_to_ppg_token": transport_ecg_to_ppg.item(),
             "ppg_to_ecg_token": transport_ppg_to_ecg.item(),
+            "reverse_loss_weight": self.phase2_reverse_loss_weight,
             "masked_fraction": token_mask.float().mean().item(),
             "prediction_std": prediction_std.item(),
             "phase2_progress": progress,
@@ -2154,6 +2176,10 @@ class JEPA(nn.Module):
         components = {
             "direct_token_jepa": direct_jepa,
             "transport_token_jepa": transport_jepa,
+            "direct_ecg_to_ppg_token": direct_ecg_to_ppg,
+            "direct_ppg_to_ecg_token": direct_ppg_to_ecg,
+            "transport_ecg_to_ppg_token": transport_ecg_to_ppg,
+            "transport_ppg_to_ecg_token": transport_ppg_to_ecg,
             "token_jepa": token_jepa,
             "delay_prior": regularizers["delay_prior_loss"],
             "monotonic": regularizers["monotonic_loss"],

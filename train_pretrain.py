@@ -256,6 +256,7 @@ def build_model(model_config: ModelConfig) -> JEPA:
         phase2_transport_temperature=model_config.phase2_transport_temperature,
         phase2_unmatched_bias=model_config.phase2_unmatched_bias,
         phase2_transport_loss_weight=model_config.phase2_transport_loss_weight,
+        phase2_reverse_loss_weight=model_config.phase2_reverse_loss_weight,
         phase2_delay_prior_weight=model_config.phase2_delay_prior_weight,
         phase2_monotonic_weight=model_config.phase2_monotonic_weight,
         phase2_delay_smoothness_weight=(
@@ -469,6 +470,9 @@ def _phase_checkpoint_metadata(model, config: Config) -> dict:
                 config.model.phase2_transport_enabled
             ),
             "transport_mode": str(config.model.phase2_transport_mode),
+            "reverse_loss_weight": float(
+                config.model.phase2_reverse_loss_weight
+            ),
             "effective_constraint_weights": (
                 model._phase2_effective_regularizer_weights()
             ),
@@ -732,6 +736,11 @@ def train(
             f"ramp={config.train.phase2_transport_ramp_epochs} epochs"
         )
         print(
+            "[Phase2] direction objective: ECG->PPG=1.000 | "
+            f"PPG->ECG={config.model.phase2_reverse_loss_weight:.3f} | "
+            "normalized=True"
+        )
+        print(
             "[Phase2] effective constraint weights="
             f"{model._phase2_effective_regularizer_weights()}"
         )
@@ -834,6 +843,25 @@ def train(
                 "Resume checkpoint Transport constraint mode does not match "
                 f"the model ({checkpoint_transport_mode!r} != "
                 f"{config.model.phase2_transport_mode!r})."
+            )
+        checkpoint_reverse_weight = float(
+            (ckpt.get("phase2_config") or {}).get(
+                "reverse_loss_weight", 1.0
+            )
+        )
+        if (
+            phase == 2
+            and abs(
+                checkpoint_reverse_weight
+                - config.model.phase2_reverse_loss_weight
+            )
+            > 1e-12
+        ):
+            raise ValueError(
+                "Resume checkpoint reverse task weight does not match the "
+                "model "
+                f"({checkpoint_reverse_weight} != "
+                f"{config.model.phase2_reverse_loss_weight})."
             )
         # Load encoder weights
         if "context_encoder" in ckpt:
@@ -1645,6 +1673,13 @@ if __name__ == "__main__":
         help="Phase 2 epochs used to ramp transport from 0 to 1",
     )
     parser.add_argument(
+        "--reverse_loss_weight", type=float, default=None,
+        help=(
+            "Phase 2 auxiliary PPG->ECG loss weight alpha in [0, 1]. "
+            "ECG->PPG remains fixed at 1; alpha=1 reproduces symmetric training."
+        ),
+    )
+    parser.add_argument(
         "--counterfactual_weight", type=float, default=None,
         help="Weight of paired-vs-mismatched ranking in physio_v2",
     )
@@ -1714,6 +1749,8 @@ if __name__ == "__main__":
         )
     if args.sinkhorn_iters is not None:
         config.model.phase2_v2_sinkhorn_iters = args.sinkhorn_iters
+    if args.reverse_loss_weight is not None:
+        config.model.phase2_reverse_loss_weight = args.reverse_loss_weight
     if args.private_dim is not None:
         config.model.phase2_private_dim = args.private_dim
     if args.private_loss_weight is not None:
@@ -1794,6 +1831,8 @@ if __name__ == "__main__":
             parser.error("--private_loss_weight must be >= 0")
         if config.model.phase2_orthogonality_weight < 0:
             parser.error("--orthogonality_weight must be >= 0")
+        if not 0.0 <= config.model.phase2_reverse_loss_weight <= 1.0:
+            parser.error("--reverse_loss_weight must be in [0, 1]")
     elif config.model.pretrain_phase == 1:
         if args.batch_size is not None:
             config.train.phase1_batch_size = args.batch_size
@@ -1815,6 +1854,8 @@ if __name__ == "__main__":
         parser.error("--disable_transport requires --phase 2")
     if args.transport_mode is not None and config.model.pretrain_phase != 2:
         parser.error("--transport_mode requires --phase 2")
+    if args.reverse_loss_weight is not None and config.model.pretrain_phase != 2:
+        parser.error("--reverse_loss_weight requires --phase 2")
     if args.disable_transport and args.transport_mode not in (None, "full"):
         parser.error(
             "--disable_transport cannot be combined with a non-full "
