@@ -44,7 +44,13 @@ mkdir -p \
     "$WORKTREE/splits" \
     "$WORKTREE/outputs_phase2_physio_v2_seed42" \
     "$WORKTREE/logs"
-cp -f "$SOURCE_SPLIT" "$WORKTREE/splits/multidisease_taskaware_downstream.json"
+target_split="$WORKTREE/splits/multidisease_taskaware_downstream.json"
+if [[ -e "$target_split" ]] \
+    && [[ "$(readlink -f "$SOURCE_SPLIT")" == "$(readlink -f "$target_split")" ]]; then
+    echo "[Setup] reusing existing patient split link: $target_split"
+else
+    cp -f "$SOURCE_SPLIT" "$target_split"
+fi
 
 checkpoint="$WORKTREE/outputs_phase2_physio_v2_seed42/jepa_best.pt"
 if [[ ! -s "$checkpoint" ]]; then
