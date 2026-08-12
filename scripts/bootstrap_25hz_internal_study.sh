@@ -30,6 +30,14 @@ git -C "$SOURCE_REPO" worktree prune
 if [[ ! -e "$WORKTREE/.git" ]]; then
     echo "[Setup] creating isolated worktree: $WORKTREE"
     git -C "$SOURCE_REPO" worktree add --detach "$WORKTREE" "origin/$BRANCH"
+else
+    if [[ -n "$(git -C "$WORKTREE" status --porcelain --untracked-files=no)" ]]; then
+        echo "[Error] tracked files are modified in existing worktree: $WORKTREE" >&2
+        echo "Commit or preserve those changes before updating the worktree." >&2
+        exit 1
+    fi
+    echo "[Setup] updating existing worktree to origin/$BRANCH"
+    git -C "$WORKTREE" switch --detach "origin/$BRANCH"
 fi
 
 mkdir -p \
