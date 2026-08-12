@@ -53,7 +53,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diagnosis-xlsx", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--windows-per-patient", type=int, default=8)
-    parser.add_argument("--window-samples", type=int, default=1000)
+    parser.add_argument(
+        "--window-seconds",
+        type=float,
+        default=10.0,
+        help="Physical duration of each exported model window",
+    )
+    parser.add_argument(
+        "--window-samples",
+        type=int,
+        default=None,
+        help=(
+            "Deprecated compatibility option: fixed samples per window. "
+            "Prefer --window-seconds so duration is correct across rates"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -152,16 +166,33 @@ def match_patients(
     return matched, unresolved
 
 
+def _payload_rate(payload: dict[str, Any]) -> float:
+    value = payload.get("fs", payload.get("sampling_rate", 25.0))
+    rate = float(np.asarray(value).reshape(-1)[0])
+    if not np.isfinite(rate) or rate <= 0:
+        raise ValueError(f"Invalid processed sampling rate: {value!r}")
+    return rate
+
+
 def select_patient_windows(
-    paths: list[Path], count: int, window_samples: int
-) -> list[tuple[Path, int]]:
-    descriptors: list[tuple[Path, int]] = []
+    paths: list[Path],
+    count: int,
+    window_seconds: float,
+    window_samples_override: int | None = None,
+) -> list[tuple[Path, int, int, float]]:
+    descriptors: list[tuple[Path, int, int, float]] = []
     for path in sorted(paths):
         with path.open("rb") as handle:
             payload = pickle.load(handle)
         length = int(np.asarray(payload["data"]).shape[-1])
+        rate = _payload_rate(payload)
+        window_samples = (
+            max(1, int(window_samples_override))
+            if window_samples_override is not None
+            else max(1, int(round(window_seconds * rate)))
+        )
         for start in range(0, length - window_samples + 1, window_samples):
-            descriptors.append((path, start))
+            descriptors.append((path, start, window_samples, rate))
     if len(descriptors) <= count:
         return descriptors
     chosen = np.linspace(0, len(descriptors) - 1, count).round().astype(int)
@@ -210,7 +241,12 @@ def main() -> None:
         if not has_diagnosis:
             patients_without_diagnosis += 1
         selected = (
-            select_patient_windows(paths, args.windows_per_patient, args.window_samples)
+            select_patient_windows(
+                paths,
+                args.windows_per_patient,
+                args.window_seconds,
+                args.window_samples,
+            )
             if paths and has_diagnosis
             else []
         )
@@ -245,13 +281,13 @@ def main() -> None:
         )
 
         cache: dict[Path, dict[str, Any]] = {}
-        for segment_index, (path, start) in enumerate(selected):
+        for segment_index, (path, start, window_samples, source_rate) in enumerate(selected):
             if path not in cache:
                 with path.open("rb") as handle:
                     cache[path] = pickle.load(handle)
             source_payload = cache[path]
             data = np.asarray(source_payload["data"], dtype=np.float32)[
-                :, start : start + args.window_samples
+                :, start : start + window_samples
             ]
             filename = f"test_{external_uid}_seg{segment_index:03d}.pkl"
             payload = {
@@ -260,7 +296,10 @@ def main() -> None:
                 # version used to create it. The downstream Dataset converts
                 # this standard nested list back to float32 with np.asarray.
                 "data": data.tolist(),
-                "sampling_rate": 100.0,
+                "sampling_rate": source_rate,
+                "device_origin_rate_hz": 25.0,
+                "source_record_uid": source_payload.get("record_uid"),
+                "source_start_sample": start,
                 "label": item["labels"],
                 "label_valid": item["label_valid"],
                 "external_validation": True,
@@ -273,7 +312,9 @@ def main() -> None:
                     "filename": filename,
                     "source_processed_file": str(path.relative_to(processed)),
                     "source_start_sample": start,
-                    "samples": args.window_samples,
+                    "samples": window_samples,
+                    "sampling_rate_hz": source_rate,
+                    "duration_seconds": window_samples / source_rate,
                 }
             )
 
@@ -291,7 +332,10 @@ def main() -> None:
     write_csv(
         output / "window_manifest.csv",
         window_rows,
-        ["uid", "filename", "source_processed_file", "source_start_sample", "samples"],
+        [
+            "uid", "filename", "source_processed_file", "source_start_sample",
+            "samples", "sampling_rate_hz", "duration_seconds",
+        ],
     )
     write_csv(
         private_dir / "unresolved_diagnosis_ids.csv",
@@ -308,7 +352,12 @@ def main() -> None:
         "matched_without_diagnosis_text": patients_without_diagnosis,
         "patients_with_model_windows": patients_with_windows,
         "model_windows": len(window_rows),
-        "window_samples": args.window_samples,
+        "window_seconds": args.window_seconds,
+        "legacy_window_samples": args.window_samples,
+        "processed_sampling_rate_note": (
+            "ALM exports are interpolated to their payload fs; source wearable "
+            "acquisition is 25 Hz and is matched during retrospective training"
+        ),
         "windows_per_patient_max": args.windows_per_patient,
         "positive_patient_counts": dict(positive_counts),
         "valid_patient_counts": dict(valid_counts),

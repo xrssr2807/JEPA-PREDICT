@@ -367,6 +367,9 @@ def build_downstream_dataloaders(
         canonical_rate = float(
             getattr(data_config, "multidisease_canonical_sample_rate_hz", 100.0)
         )
+        source_rate = float(
+            getattr(data_config, "multidisease_source_sample_rate_hz", 100.0)
+        )
         fixed_device_rate = float(
             getattr(data_config, "multidisease_fixed_device_rate_hz", 0.0)
         ) or None
@@ -384,6 +387,7 @@ def build_downstream_dataloaders(
             normalize_clip=data_config.normalize_clip,
             channel=data_channel,
             target_length=target_len,
+            default_source_sample_rate_hz=source_rate,
             canonical_sample_rate_hz=canonical_rate,
             fixed_device_rate_hz=fixed_device_rate,
             train_device_rate_choices=train_device_rates,
@@ -397,6 +401,7 @@ def build_downstream_dataloaders(
             normalize_clip=data_config.normalize_clip,
             channel=data_channel,
             target_length=target_len,
+            default_source_sample_rate_hz=source_rate,
             canonical_sample_rate_hz=canonical_rate,
             fixed_device_rate_hz=fixed_device_rate,
         )
@@ -450,10 +455,14 @@ def build_downstream_dataloaders(
                 max_segments=data_config.multidisease_mil_segments,
                 files=train_dataset.files,
                 train=True,
+                default_source_sample_rate_hz=source_rate,
                 canonical_sample_rate_hz=canonical_rate,
                 fixed_device_rate_hz=fixed_device_rate,
                 train_device_rate_choices=train_device_rates,
                 device_rate_probability=device_rate_probability,
+                segment_token_seconds=(
+                    data_config.multidisease_segment_token_seconds
+                ),
             )
             if val_dataset is not None:
                 val_dataset = MultiDiseasePatientMILDataset(
@@ -467,8 +476,12 @@ def build_downstream_dataloaders(
                     max_segments=data_config.multidisease_mil_segments,
                     files=val_dataset.files,
                     train=False,
+                    default_source_sample_rate_hz=source_rate,
                     canonical_sample_rate_hz=canonical_rate,
                     fixed_device_rate_hz=fixed_device_rate,
+                    segment_token_seconds=(
+                        data_config.multidisease_segment_token_seconds
+                    ),
                 )
             test_dataset = MultiDiseasePatientMILDataset(
                 data_dir=data_config.multidisease_dir,
@@ -481,14 +494,18 @@ def build_downstream_dataloaders(
                 max_segments=data_config.multidisease_mil_segments,
                 files=test_dataset.files,
                 train=False,
+                default_source_sample_rate_hz=source_rate,
                 canonical_sample_rate_hz=canonical_rate,
                 fixed_device_rate_hz=fixed_device_rate,
+                segment_token_seconds=(
+                    data_config.multidisease_segment_token_seconds
+                ),
             )
 
         if fixed_device_rate is not None or train_device_rates:
             print(
                 "[PhysicalTimeBridge] "
-                f"canonical={canonical_rate:g}Hz "
+                f"source_default={source_rate:g}Hz canonical={canonical_rate:g}Hz "
                 f"fixed_device={fixed_device_rate} "
                 f"train_choices={train_device_rates} "
                 f"probability={device_rate_probability:g}"
@@ -500,6 +517,8 @@ def build_downstream_dataloaders(
             print(
                 f"[Data] Patient-MIL batch_size={batch_size} "
                 f"segments={data_config.multidisease_mil_segments} "
+                f"token_seconds="
+                f"{data_config.multidisease_segment_token_seconds:g} "
                 f"(effective segments/step={batch_size * data_config.multidisease_mil_segments})"
             )
 
@@ -1554,12 +1573,23 @@ def build_external_multidisease_loader(
 
     labels_by_uid: Dict[str, np.ndarray] = {}
     label_valid_by_uid: Dict[str, np.ndarray] = {}
+    sampling_rates = []
+    durations = []
     for name in files:
         path = os.path.join(data_dir, name)
         with open(path, "rb") as handle:
             sample = pickle.load(handle)
         uid = str(sample.get("uid", uid_from_filename(name)))
         label_dict = sample.get("label", {})
+        data = np.asarray(sample["data"])
+        rate = float(np.asarray(sample.get(
+            "sampling_rate",
+            config.data.multidisease_canonical_sample_rate_hz,
+        )).reshape(-1)[0])
+        if not np.isfinite(rate) or rate <= 0:
+            raise ValueError(f"Invalid external sampling rate in {name}: {rate}")
+        sampling_rates.append(rate)
+        durations.append(float(data.shape[-1]) / rate)
         labels = np.asarray([
             multidisease_label_value(label_dict, label_name)
             for label_name in config.data.multidisease_labels
@@ -1607,8 +1637,17 @@ def build_external_multidisease_loader(
         max_segments=config.data.multidisease_mil_segments,
         files=files,
         train=False,
+        default_source_sample_rate_hz=float(
+            getattr(config.data, "multidisease_source_sample_rate_hz", 100.0)
+        ),
         canonical_sample_rate_hz=float(
             getattr(config.data, "multidisease_canonical_sample_rate_hz", 100.0)
+        ),
+        fixed_device_rate_hz=(
+            float(config.data.multidisease_fixed_device_rate_hz) or None
+        ),
+        segment_token_seconds=(
+            config.data.multidisease_segment_token_seconds
         ),
     )
     loader_kwargs = dataloader_performance_kwargs(config.train)
@@ -1628,6 +1667,22 @@ def build_external_multidisease_loader(
             for index, label_name in enumerate(config.data.multidisease_labels)
         },
         "label_validity": "complete",
+        "sampling_rates_hz": sorted({float(value) for value in sampling_rates}),
+        "window_duration_seconds": {
+            "min": float(min(durations)),
+            "max": float(max(durations)),
+        },
+        "sampling_protocol": {
+            "canonical_rate_hz": float(
+                config.data.multidisease_canonical_sample_rate_hz
+            ),
+            "fixed_device_rate_hz": float(
+                config.data.multidisease_fixed_device_rate_hz
+            ),
+            "segment_token_seconds": float(
+                config.data.multidisease_segment_token_seconds
+            ),
+        },
         "threshold_source": "internal_validation_checkpoint",
     }
     return loader, dataset, provenance
@@ -2002,6 +2057,29 @@ def validate_downstream_checkpoint_context(
             raise ValueError(
                 f"Saved downstream checkpoint {key} mismatch: "
                 f"checkpoint={bool(saved)}, current={expected}"
+            )
+
+    saved_sampling = checkpoint.get("sampling_protocol") or {}
+    current_sampling = {
+        "source_rate_hz": float(
+            config.data.multidisease_source_sample_rate_hz
+        ),
+        "canonical_rate_hz": float(
+            config.data.multidisease_canonical_sample_rate_hz
+        ),
+        "fixed_device_rate_hz": float(
+            config.data.multidisease_fixed_device_rate_hz
+        ),
+        "segment_token_seconds": float(
+            config.data.multidisease_segment_token_seconds
+        ),
+    }
+    for key, current in current_sampling.items():
+        saved = saved_sampling.get(key)
+        if saved is not None and not np.isclose(float(saved), current):
+            raise ValueError(
+                f"Saved downstream checkpoint sampling protocol mismatch "
+                f"for {key}: checkpoint={saved}, current={current}"
             )
 
     saved_split = checkpoint.get("data_split") or {}
@@ -2417,6 +2495,18 @@ def train_downstream(
         ),
         "channel": (
             str(config.data.multidisease_channel) if multilabel else None
+        ),
+        "fixed_device_rate_hz": (
+            float(config.data.multidisease_fixed_device_rate_hz)
+            if multilabel else None
+        ),
+        "canonical_rate_hz": (
+            float(config.data.multidisease_canonical_sample_rate_hz)
+            if multilabel else None
+        ),
+        "segment_token_seconds": (
+            float(config.data.multidisease_segment_token_seconds)
+            if multilabel else None
         ),
     }
     ablation_line = (
@@ -3135,6 +3225,26 @@ def train_downstream(
                     "temperature": config.train.multidisease_distill_temperature,
                 } if use_multidisease_teacher else None),
                 "data_split": split_provenance,
+                "sampling_protocol": ({
+                    "source_rate_hz": float(
+                        config.data.multidisease_source_sample_rate_hz
+                    ),
+                    "canonical_rate_hz": float(
+                        config.data.multidisease_canonical_sample_rate_hz
+                    ),
+                    "fixed_device_rate_hz": float(
+                        config.data.multidisease_fixed_device_rate_hz
+                    ),
+                    "train_device_rates_hz": list(
+                        config.data.multidisease_train_device_rates_hz
+                    ),
+                    "device_rate_probability": float(
+                        config.data.multidisease_device_rate_probability
+                    ),
+                    "segment_token_seconds": float(
+                        config.data.multidisease_segment_token_seconds
+                    ),
+                } if multilabel else None),
             }
             no_improve = 0
         else:
@@ -3311,6 +3421,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--canonical_rate_hz",
+        type=float,
+        default=None,
+        help=(
+            "Actual sampling rate presented to the downstream encoder. "
+            "Use 25 for native 25 Hz fine-tuning; default is 100"
+        ),
+    )
+    parser.add_argument(
         "--multirate_train_hz",
         type=str,
         default=None,
@@ -3321,6 +3440,16 @@ if __name__ == "__main__":
         type=float,
         default=None,
         help="Probability of applying one simulated training device rate",
+    )
+    parser.add_argument(
+        "--segment_token_seconds",
+        type=float,
+        default=None,
+        help=(
+            "Hierarchical long-context mode: concatenate consecutive windows "
+            "to this duration, encode each duration as one MIL token; 30 is "
+            "recommended for the prospective 25 Hz study"
+        ),
     )
     parser.add_argument(
         "--dual_teacher_checkpoint", type=str, default=None,
@@ -3372,6 +3501,12 @@ if __name__ == "__main__":
         if args.device_rate_hz <= 0:
             parser.error("--device_rate_hz must be > 0")
         config.data.multidisease_fixed_device_rate_hz = args.device_rate_hz
+    if args.canonical_rate_hz is not None:
+        if args.canonical_rate_hz <= 0:
+            parser.error("--canonical_rate_hz must be > 0")
+        config.data.multidisease_canonical_sample_rate_hz = (
+            args.canonical_rate_hz
+        )
     if args.multirate_train_hz is not None:
         try:
             rates = [
@@ -3389,6 +3524,12 @@ if __name__ == "__main__":
             parser.error("--multirate_probability must be within [0, 1]")
         config.data.multidisease_device_rate_probability = (
             args.multirate_probability
+        )
+    if args.segment_token_seconds is not None:
+        if args.segment_token_seconds < 0:
+            parser.error("--segment_token_seconds must be >= 0")
+        config.data.multidisease_segment_token_seconds = (
+            args.segment_token_seconds
         )
     if args.batch_size is not None:
         config.train.downstream_batch_size = args.batch_size

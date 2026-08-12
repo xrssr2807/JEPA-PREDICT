@@ -56,6 +56,30 @@ def test_external_loader_is_patient_level_and_deterministic(tmp_path):
     assert int(targets[0, config.train.chd_label_index]) == 1
 
 
+def test_external_loader_respects_native_25hz_clock(tmp_path):
+    config = _external_config()
+    labels = {name: 0 for name in config.data.multidisease_labels}
+    path = tmp_path / "test_mc25_seg000.pkl"
+    payload = {
+        "uid": "mc25",
+        "data": np.linspace(-1.0, 1.0, 250, dtype=np.float32)[None, :],
+        "sampling_rate": 25,
+        "label": labels,
+        "label_valid": {name: 1 for name in labels},
+    }
+    with path.open("wb") as handle:
+        pickle.dump(payload, handle)
+
+    loader, _, provenance = build_external_multidisease_loader(
+        str(tmp_path), config
+    )
+    segments, _, _, mask = next(iter(loader))
+    assert tuple(segments.shape) == (1, 8, 1, 1000)
+    assert int(mask.sum()) == 1
+    assert provenance["sampling_rates_hz"] == [25.0]
+    assert provenance["window_duration_seconds"] == {"min": 10.0, "max": 10.0}
+
+
 def test_external_loader_rejects_incomplete_labels(tmp_path):
     config = _external_config()
     labels = {name: 0 for name in config.data.multidisease_labels}

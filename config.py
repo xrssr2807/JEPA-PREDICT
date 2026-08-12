@@ -45,12 +45,17 @@ class DataConfig:
     multidisease_patient_mil: bool = True
     multidisease_mil_segments: int = 8
     multidisease_mil_encoder_chunk_size: int = 128
+    multidisease_source_sample_rate_hz: float = 100.0
     multidisease_canonical_sample_rate_hz: float = 100.0
     multidisease_fixed_device_rate_hz: float = 0.0
     multidisease_train_device_rates_hz: List[float] = field(
         default_factory=list
     )
     multidisease_device_rate_probability: float = 0.0
+    # Optional hierarchical long-context mode. Consecutive short windows are
+    # concatenated to this physical duration and encoded into one MIL token.
+    # Zero preserves the historical one-file-per-token behavior.
+    multidisease_segment_token_seconds: float = 0.0
 
     # Augmentation (PhysioAugment — applied to ECG context signal)
     use_augment: bool = False

@@ -628,6 +628,7 @@ class MultiDiseaseDataset(Dataset):
         channel: Optional[int] = 0,
         target_length: int = None,
         files: Optional[List[str]] = None,
+        default_source_sample_rate_hz: float = 100.0,
         canonical_sample_rate_hz: float = 100.0,
         fixed_device_rate_hz: Optional[float] = None,
         train_device_rate_choices: Optional[List[float]] = None,
@@ -642,6 +643,9 @@ class MultiDiseaseDataset(Dataset):
         else:
             self.channel = channel
         self.target_length = target_length
+        self.default_source_sample_rate_hz = float(
+            default_source_sample_rate_hz
+        )
         self.canonical_sample_rate_hz = float(canonical_sample_rate_hz)
         self.fixed_device_rate_hz = fixed_device_rate_hz
         self.train_device_rate_choices = [
@@ -709,11 +713,17 @@ class MultiDiseaseDataset(Dataset):
             and np.random.random() < self.device_rate_probability
         ):
             device_rate_hz = float(np.random.choice(self.train_device_rate_choices))
-        if device_rate_hz is not None:
+        source_hz = float(np.asarray(sample.get(
+            "sampling_rate", self.default_source_sample_rate_hz
+        )).reshape(-1)[0])
+        # Always respect the sample's physical clock.  Previously a native
+        # 25 Hz external window was only resampled when an explicit simulated
+        # device rate was requested, so it could be interpreted as 100 Hz.
+        if (
+            device_rate_hz is not None
+            or not np.isclose(source_hz, self.canonical_sample_rate_hz)
+        ):
             from dataset.sampling import bridge_device_sampling_rate
-            source_hz = sample.get(
-                "sampling_rate", self.canonical_sample_rate_hz
-            )
             data, _ = bridge_device_sampling_rate(
                 data,
                 source_hz=source_hz,
@@ -779,10 +789,12 @@ class MultiDiseasePatientMILDataset(Dataset):
         max_segments: int = 8,
         files: Optional[List[str]] = None,
         train: bool = True,
+        default_source_sample_rate_hz: float = 100.0,
         canonical_sample_rate_hz: float = 100.0,
         fixed_device_rate_hz: Optional[float] = None,
         train_device_rate_choices: Optional[List[float]] = None,
         device_rate_probability: float = 0.0,
+        segment_token_seconds: float = 0.0,
     ):
         self.segment_dataset = MultiDiseaseDataset(
             data_dir=data_dir,
@@ -793,6 +805,7 @@ class MultiDiseasePatientMILDataset(Dataset):
             channel=channel,
             target_length=target_length,
             files=files,
+            default_source_sample_rate_hz=default_source_sample_rate_hz,
             canonical_sample_rate_hz=canonical_sample_rate_hz,
             fixed_device_rate_hz=fixed_device_rate_hz,
             train_device_rate_choices=train_device_rate_choices,
@@ -800,6 +813,8 @@ class MultiDiseasePatientMILDataset(Dataset):
         )
         self.max_segments = max_segments
         self.train = train
+        self.segment_token_seconds = max(0.0, float(segment_token_seconds))
+        self.canonical_sample_rate_hz = float(canonical_sample_rate_hz)
         self.uid_to_indices = {}
         for idx, fname in enumerate(self.segment_dataset.files):
             uid = self._uid_from_file(fname)
@@ -813,7 +828,8 @@ class MultiDiseasePatientMILDataset(Dataset):
         self.disease_labels = self.segment_dataset.disease_labels
         print(
             f"[MultiDiseasePatientMILDataset] {split}: {len(self.uids)} patients, "
-            f"max_segments={max_segments}"
+            f"max_segments={max_segments} token_seconds="
+            f"{self.segment_token_seconds:g}"
         )
 
     @staticmethod
@@ -826,29 +842,91 @@ class MultiDiseasePatientMILDataset(Dataset):
     def __len__(self) -> int:
         return len(self.uids)
 
+    def _base_segment_duration_seconds(self, index: int) -> float:
+        path = os.path.join(
+            self.segment_dataset.data_dir,
+            self.segment_dataset.files[int(index)],
+        )
+        with open(path, "rb") as handle:
+            sample = pickle.load(handle)
+        data = np.asarray(sample["data"])
+        rate = float(np.asarray(sample.get(
+            "sampling_rate",
+            self.segment_dataset.default_source_sample_rate_hz,
+        )).reshape(-1)[0])
+        if not np.isfinite(rate) or rate <= 0:
+            rate = self.canonical_sample_rate_hz
+        return float(data.shape[-1]) / rate
+
+    def _token_groups(self, indices: List[int]) -> Tuple[List[List[int]], int]:
+        """Group consecutive short windows into physical-time segment tokens."""
+        token_seconds = float(getattr(self, "segment_token_seconds", 0.0))
+        if token_seconds <= 0:
+            return [[int(index)] for index in indices], 0
+        base_seconds = self._base_segment_duration_seconds(indices[0])
+        windows_per_token = max(
+            1, int(round(token_seconds / base_seconds))
+        )
+        groups = [
+            [int(index) for index in indices[start:start + windows_per_token]]
+            for start in range(0, len(indices), windows_per_token)
+        ]
+        target_samples = max(
+            1,
+            int(round(
+                token_seconds * self.canonical_sample_rate_hz
+            )),
+        )
+        return groups, target_samples
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str, torch.Tensor]:
         uid = self.uids[idx]
         indices = self.uid_to_indices[uid]
-        if len(indices) >= self.max_segments:
+        groups, token_samples = self._token_groups(indices)
+        if len(groups) >= self.max_segments:
             if self.train:
-                chosen = np.random.choice(indices, self.max_segments, replace=False)
+                chosen_positions = np.random.choice(
+                    len(groups), self.max_segments, replace=False
+                )
+                chosen = [groups[int(position)] for position in chosen_positions]
             else:
-                chosen = np.linspace(0, len(indices) - 1, self.max_segments).round().astype(int)
-                chosen = [indices[i] for i in chosen]
+                chosen_positions = np.linspace(
+                    0, len(groups) - 1, self.max_segments
+                ).round().astype(int)
+                chosen = [groups[int(position)] for position in chosen_positions]
             valid_count = self.max_segments
         else:
             # Repeating a short patient's segments makes MIL attention treat
             # duplicated evidence as independent observations. Keep each real
             # segment once and pad the rest; the returned mask excludes padding.
-            chosen = list(indices)
+            chosen = list(groups)
             if self.train:
-                chosen = list(np.random.permutation(chosen))
+                order = np.random.permutation(len(chosen))
+                chosen = [chosen[int(position)] for position in order]
             valid_count = len(chosen)
 
         segments = []
         label = None
-        for segment_idx in chosen:
-            x, y, _ = self.segment_dataset[int(segment_idx)]
+        for group in chosen:
+            pieces = []
+            y = None
+            for segment_idx in group:
+                piece, current_y, _ = self.segment_dataset[int(segment_idx)]
+                pieces.append(piece)
+                if y is None:
+                    y = current_y
+                elif not torch.equal(y, current_y):
+                    raise ValueError(
+                        f"Labels disagree across segment-token windows for UID {uid}"
+                    )
+            x = torch.cat(pieces, dim=-1)
+            if token_samples > 0:
+                if x.shape[-1] > token_samples:
+                    x = x[..., :token_samples]
+                elif x.shape[-1] < token_samples:
+                    x = torch.nn.functional.pad(
+                        x, (0, token_samples - x.shape[-1])
+                    )
             segments.append(x)
             if label is None:
                 label = y
