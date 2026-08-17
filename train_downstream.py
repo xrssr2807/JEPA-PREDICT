@@ -345,8 +345,9 @@ def build_downstream_dataloaders(
     dataset: str = "chd",
     use_dual: bool = False,
     multidisease_data_channel=None,
+    seal_test: bool = False,
 ) -> tuple:
-    """Build train and test dataloaders for downstream fine-tuning."""
+    """Build downstream loaders without touching test data when sealed."""
     binary_abnormal = (dataset == "arrhythmia_binary")
 
     if dataset == "arrhythmia" or dataset == "arrhythmia_binary":
@@ -379,33 +380,6 @@ def build_downstream_dataloaders(
         device_rate_probability = float(
             getattr(data_config, "multidisease_device_rate_probability", 0.0)
         )
-        train_dataset = MultiDiseaseDataset(
-            data_dir=data_config.multidisease_dir,
-            split="train",
-            disease_labels=data_config.multidisease_labels,
-            normalize=data_config.normalize,
-            normalize_clip=data_config.normalize_clip,
-            channel=data_channel,
-            target_length=target_len,
-            default_source_sample_rate_hz=source_rate,
-            canonical_sample_rate_hz=canonical_rate,
-            fixed_device_rate_hz=fixed_device_rate,
-            train_device_rate_choices=train_device_rates,
-            device_rate_probability=device_rate_probability,
-        )
-        test_dataset = MultiDiseaseDataset(
-            data_dir=data_config.multidisease_dir,
-            split="test",
-            disease_labels=data_config.multidisease_labels,
-            normalize=data_config.normalize,
-            normalize_clip=data_config.normalize_clip,
-            channel=data_channel,
-            target_length=target_len,
-            default_source_sample_rate_hz=source_rate,
-            canonical_sample_rate_hz=canonical_rate,
-            fixed_device_rate_hz=fixed_device_rate,
-        )
-        val_dataset = None
         split_manifest = getattr(
             data_config,
             "multidisease_split_file",
@@ -413,21 +387,92 @@ def build_downstream_dataloaders(
         )
         if split_manifest:
             available_files = sorted(
-                set(train_dataset.files) | set(test_dataset.files)
+                filename for filename in os.listdir(data_config.multidisease_dir)
+                if filename.endswith(".pkl")
             )
-            train_files, val_files, test_files, _ = load_multidisease_split_manifest(
+            requested_splits = ("train", "val") if seal_test else (
+                "train", "val", "test"
+            )
+            split_files, _ = load_multidisease_named_split_manifest(
                 split_manifest,
                 data_config.multidisease_dir,
                 available_files,
+                requested_splits,
                 expected_disease_labels=data_config.multidisease_labels,
             )
-            val_dataset = copy.deepcopy(train_dataset)
-            train_dataset.files = train_files
-            val_dataset.files = val_files
-            val_dataset.train_device_rate_choices = []
-            val_dataset.device_rate_probability = 0.0
-            test_dataset.files = test_files
-        elif data_config.val_split > 0:
+            train_dataset = MultiDiseaseDataset(
+                data_dir=data_config.multidisease_dir,
+                split="train",
+                disease_labels=data_config.multidisease_labels,
+                normalize=data_config.normalize,
+                normalize_clip=data_config.normalize_clip,
+                channel=data_channel,
+                target_length=target_len,
+                files=split_files["train"],
+                default_source_sample_rate_hz=source_rate,
+                canonical_sample_rate_hz=canonical_rate,
+                fixed_device_rate_hz=fixed_device_rate,
+                train_device_rate_choices=train_device_rates,
+                device_rate_probability=device_rate_probability,
+            )
+            val_dataset = MultiDiseaseDataset(
+                data_dir=data_config.multidisease_dir,
+                split="val",
+                disease_labels=data_config.multidisease_labels,
+                normalize=data_config.normalize,
+                normalize_clip=data_config.normalize_clip,
+                channel=data_channel,
+                target_length=target_len,
+                files=split_files["val"],
+                default_source_sample_rate_hz=source_rate,
+                canonical_sample_rate_hz=canonical_rate,
+                fixed_device_rate_hz=fixed_device_rate,
+            )
+            test_dataset = None
+            if not seal_test:
+                test_dataset = MultiDiseaseDataset(
+                    data_dir=data_config.multidisease_dir,
+                    split="test",
+                    disease_labels=data_config.multidisease_labels,
+                    normalize=data_config.normalize,
+                    normalize_clip=data_config.normalize_clip,
+                    channel=data_channel,
+                    target_length=target_len,
+                    files=split_files["test"],
+                    default_source_sample_rate_hz=source_rate,
+                    canonical_sample_rate_hz=canonical_rate,
+                    fixed_device_rate_hz=fixed_device_rate,
+                )
+        else:
+            train_dataset = MultiDiseaseDataset(
+                data_dir=data_config.multidisease_dir,
+                split="train",
+                disease_labels=data_config.multidisease_labels,
+                normalize=data_config.normalize,
+                normalize_clip=data_config.normalize_clip,
+                channel=data_channel,
+                target_length=target_len,
+                default_source_sample_rate_hz=source_rate,
+                canonical_sample_rate_hz=canonical_rate,
+                fixed_device_rate_hz=fixed_device_rate,
+                train_device_rate_choices=train_device_rates,
+                device_rate_probability=device_rate_probability,
+            )
+            test_dataset = None if seal_test else MultiDiseaseDataset(
+                data_dir=data_config.multidisease_dir,
+                split="test",
+                disease_labels=data_config.multidisease_labels,
+                normalize=data_config.normalize,
+                normalize_clip=data_config.normalize_clip,
+                channel=data_channel,
+                target_length=target_len,
+                default_source_sample_rate_hz=source_rate,
+                canonical_sample_rate_hz=canonical_rate,
+                fixed_device_rate_hz=fixed_device_rate,
+            )
+            val_dataset = None
+
+        if not split_manifest and data_config.val_split > 0:
             labels_for_split = []
             for fname in train_dataset.files:
                 with open(os.path.join(data_config.multidisease_dir, fname), "rb") as f:
@@ -442,6 +487,11 @@ def build_downstream_dataloaders(
             val_dataset.train_device_rate_choices = []
             val_dataset.device_rate_probability = 0.0
             print(f"[Data] UID-group train/val split: {len(train_files)} train + {len(val_files)} val")
+        elif not split_manifest and seal_test:
+            raise ValueError(
+                "--seal_test requires a validation split or a fixed "
+                "multidisease split manifest"
+            )
 
         if data_config.multidisease_patient_mil:
             train_dataset = MultiDiseasePatientMILDataset(
@@ -483,24 +533,25 @@ def build_downstream_dataloaders(
                         data_config.multidisease_segment_token_seconds
                     ),
                 )
-            test_dataset = MultiDiseasePatientMILDataset(
-                data_dir=data_config.multidisease_dir,
-                split="test",
-                disease_labels=data_config.multidisease_labels,
-                normalize=data_config.normalize,
-                normalize_clip=data_config.normalize_clip,
-                channel=data_channel,
-                target_length=target_len,
-                max_segments=data_config.multidisease_mil_segments,
-                files=test_dataset.files,
-                train=False,
-                default_source_sample_rate_hz=source_rate,
-                canonical_sample_rate_hz=canonical_rate,
-                fixed_device_rate_hz=fixed_device_rate,
-                segment_token_seconds=(
-                    data_config.multidisease_segment_token_seconds
-                ),
-            )
+            if test_dataset is not None:
+                test_dataset = MultiDiseasePatientMILDataset(
+                    data_dir=data_config.multidisease_dir,
+                    split="test",
+                    disease_labels=data_config.multidisease_labels,
+                    normalize=data_config.normalize,
+                    normalize_clip=data_config.normalize_clip,
+                    channel=data_channel,
+                    target_length=target_len,
+                    max_segments=data_config.multidisease_mil_segments,
+                    files=test_dataset.files,
+                    train=False,
+                    default_source_sample_rate_hz=source_rate,
+                    canonical_sample_rate_hz=canonical_rate,
+                    fixed_device_rate_hz=fixed_device_rate,
+                    segment_token_seconds=(
+                        data_config.multidisease_segment_token_seconds
+                    ),
+                )
 
         if fixed_device_rate is not None or train_device_rates:
             print(
@@ -539,12 +590,20 @@ def build_downstream_dataloaders(
                 val_dataset, batch_size=batch_size,
                 shuffle=False, **loader_kwargs,
             )
-        test_loader = DataLoader(
-            test_dataset, batch_size=batch_size,
-            shuffle=False, **loader_kwargs,
-        )
+        test_loader = None
+        if test_dataset is not None:
+            test_loader = DataLoader(
+                test_dataset, batch_size=batch_size,
+                shuffle=False, **loader_kwargs,
+            )
         vlen = len(val_dataset) if val_dataset is not None else 0
-        print(f"[Data] train={len(train_dataset)} val={vlen} test={len(test_dataset)}")
+        test_len = len(test_dataset) if test_dataset is not None else "SEALED"
+        print(f"[Data] train={len(train_dataset)} val={vlen} test={test_len}")
+        if seal_test:
+            print(
+                "[Protocol] strict_validation_only=true "
+                "test_dataset_constructed=false"
+            )
         return train_loader, val_loader, test_loader, train_dataset, test_dataset
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
@@ -558,13 +617,15 @@ def build_downstream_dataloaders(
         signal_quality_gate=data_config.signal_quality_gate,
         target_length=target_len,
     )
-    ppg_test = DownstreamDataset(
-        data_dir=ppg_dir, split_file=split_file, split="test",
-        normalize=data_config.normalize, normalize_clip=data_config.normalize_clip,
-        binary_abnormal=binary_abnormal,
-        signal_quality_gate=data_config.signal_quality_gate,
-        target_length=target_len,
-    )
+    ppg_test = None
+    if not seal_test:
+        ppg_test = DownstreamDataset(
+            data_dir=ppg_dir, split_file=split_file, split="test",
+            normalize=data_config.normalize, normalize_clip=data_config.normalize_clip,
+            binary_abnormal=binary_abnormal,
+            signal_quality_gate=data_config.signal_quality_gate,
+            target_length=target_len,
+        )
 
     if use_dual and ecg_dir is not None:
         ecg_train = DownstreamDataset(
@@ -574,15 +635,20 @@ def build_downstream_dataloaders(
             signal_quality_gate=data_config.signal_quality_gate,
             target_length=target_len,
         )
-        ecg_test = DownstreamDataset(
-            data_dir=ecg_dir, split_file=split_file, split="test",
-            normalize=data_config.normalize, normalize_clip=data_config.normalize_clip,
-            binary_abnormal=binary_abnormal,
-            signal_quality_gate=data_config.signal_quality_gate,
-            target_length=target_len,
-        )
+        ecg_test = None
+        if not seal_test:
+            ecg_test = DownstreamDataset(
+                data_dir=ecg_dir, split_file=split_file, split="test",
+                normalize=data_config.normalize, normalize_clip=data_config.normalize_clip,
+                binary_abnormal=binary_abnormal,
+                signal_quality_gate=data_config.signal_quality_gate,
+                target_length=target_len,
+            )
         train_dataset = DualDownstreamDataset(ppg_train, ecg_train)
-        test_dataset = DualDownstreamDataset(ppg_test, ecg_test)
+        test_dataset = (
+            DualDownstreamDataset(ppg_test, ecg_test)
+            if not seal_test else None
+        )
     else:
         train_dataset, test_dataset = ppg_train, ppg_test
 
@@ -634,12 +700,22 @@ def build_downstream_dataloaders(
         train_dataset, batch_size=train_config.downstream_batch_size,
         shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
     )
-    test_loader = DataLoader(
-        test_dataset, batch_size=train_config.downstream_batch_size,
-        shuffle=False, num_workers=4, pin_memory=True,
-    )
+    if seal_test and val_loader is None:
+        raise ValueError("--seal_test requires a validation split")
+    test_loader = None
+    if test_dataset is not None:
+        test_loader = DataLoader(
+            test_dataset, batch_size=train_config.downstream_batch_size,
+            shuffle=False, num_workers=4, pin_memory=True,
+        )
     vlen = len(val_dataset) if val_dataset is not None else 0
-    print(f"[Data] train={len(train_dataset)} val={vlen} test={len(test_dataset)}")
+    test_len = len(test_dataset) if test_dataset is not None else "SEALED"
+    print(f"[Data] train={len(train_dataset)} val={vlen} test={test_len}")
+    if seal_test:
+        print(
+            "[Protocol] strict_validation_only=true "
+            "test_dataset_constructed=false"
+        )
     return train_loader, val_loader, test_loader, train_dataset, test_dataset
 
 
@@ -2604,6 +2680,7 @@ def train_downstream(
     train_loader, val_loader, test_loader, train_ds, test_ds = build_downstream_dataloaders(
         config.data, config.train, dataset, use_dual=use_dual,
         multidisease_data_channel=("both" if use_multidisease_teacher else None),
+        seal_test=seal_test,
     )
     split_provenance = None
     if multilabel:

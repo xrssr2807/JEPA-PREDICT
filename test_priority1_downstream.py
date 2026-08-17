@@ -20,6 +20,7 @@ from models.classifier import (
 from models.jepa import SharedPrivateTokenProjector, TokenProjectionHead
 from config import Config
 from train_downstream import (
+    build_downstream_dataloaders,
     compute_multilabel_pos_weight,
     finalize_downstream_model,
     load_pretrained_encoder,
@@ -324,6 +325,65 @@ class PriorityOneDownstreamTests(unittest.TestCase):
         checkpoint = save_mock.call_args.args[0]
         self.assertFalse(checkpoint["test_evaluated"])
         self.assertEqual(checkpoint["test_status"], "sealed")
+
+    def test_sealed_dataloader_never_constructs_test_dataset(self):
+        config = Config()
+        config.data.multidisease_patient_mil = False
+        config.train.downstream_batch_size = 1
+        config.train.dataloader_workers = 0
+
+        filenames = ["train_u1_0.pkl", "test_u2_0.pkl", "test_u3_0.pkl"]
+        config.data.multidisease_dir = "mock_data"
+        config.data.multidisease_split_file = "mock_split.json"
+
+        class SealedDataset:
+            def __init__(self, **kwargs):
+                self.files = list(kwargs.get("files") or [])
+                self.split = kwargs["split"]
+
+            def __len__(self):
+                return len(self.files)
+
+            def __getitem__(self, index):
+                return torch.zeros(1, 8), torch.zeros(8), "uid"
+
+        split_files = {
+            "train": [filenames[0]],
+            "val": [filenames[1]],
+        }
+        with mock.patch(
+            "train_downstream.os.listdir", return_value=filenames,
+        ), mock.patch(
+            "train_downstream.load_multidisease_named_split_manifest",
+            return_value=(split_files, "mock_split.json"),
+        ) as manifest_mock, mock.patch(
+            "train_downstream.MultiDiseaseDataset", side_effect=SealedDataset,
+        ) as dataset_mock, mock.patch("sys.stdout", new=io.StringIO()) as stdout:
+            train_loader, val_loader, test_loader, train_ds, test_ds = (
+                build_downstream_dataloaders(
+                    config.data,
+                    config.train,
+                    dataset="multidisease",
+                    seal_test=True,
+                )
+            )
+
+        self.assertIsNotNone(train_loader)
+        self.assertIsNotNone(val_loader)
+        self.assertIsNone(test_loader)
+        self.assertIsNone(test_ds)
+        self.assertEqual(len(train_ds), 1)
+        self.assertEqual(
+            manifest_mock.call_args.args[3], ("train", "val")
+        )
+        constructed_splits = [
+            call.kwargs.get("split") for call in dataset_mock.call_args_list
+        ]
+        self.assertEqual(constructed_splits, ["train", "val"])
+        self.assertIn(
+            "strict_validation_only=true test_dataset_constructed=false",
+            stdout.getvalue(),
+        )
 
     def test_final_evaluation_rejects_split_hash_mismatch(self):
         config = Config()

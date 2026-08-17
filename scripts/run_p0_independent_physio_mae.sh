@@ -24,6 +24,8 @@ BASE_BATCH_SIZE="${BASE_BATCH_SIZE:-192}"
 BASE_ACCUM_STEPS="${BASE_ACCUM_STEPS:-2}"
 PHYSIO_BATCH_SIZE="${PHYSIO_BATCH_SIZE:-128}"
 PHYSIO_ACCUM_STEPS="${PHYSIO_ACCUM_STEPS:-3}"
+MAE_BATCH_SIZE="${MAE_BATCH_SIZE:-128}"
+MAE_ACCUM_STEPS="${MAE_ACCUM_STEPS:-3}"
 BASE_LR="${BASE_LR:-2e-4}"
 SP_LR="${SP_LR:-1e-4}"
 PHYSIO_LR="${PHYSIO_LR:-5e-5}"
@@ -35,6 +37,8 @@ MIL_CHUNK_SIZE="${MIL_CHUNK_SIZE:-64}"
 SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
 PRUNE_INTERMEDIATE="${PRUNE_INTERMEDIATE:-1}"
 MIN_FREE_GB="${MIN_FREE_GB:-12}"
+REUSE_LEGACY_SEED42="${REUSE_LEGACY_SEED42:-0}"
+PHYSIO_CHECKPOINT_TEMPLATE="${PHYSIO_CHECKPOINT_TEMPLATE:-}"
 
 PHYSIO_SEED42_CHECKPOINT="${PHYSIO_SEED42_CHECKPOINT:-outputs_phase2_physio_v2_seed42/jepa_best.pt}"
 MAE_SEED42_CHECKPOINT="${MAE_SEED42_CHECKPOINT:-outputs_p0_pretrain_multimodal_mae_seed42/multimodal_mae_best.pt}"
@@ -91,6 +95,9 @@ is_downstream_complete() {
     local directory="$1"
     [[ -s "${directory}/downstream_multidisease_best.pt" ]] \
         && [[ -s "${directory}/validation_patient_predictions.csv" ]] \
+        && grep -Fq \
+            "strict_validation_only=true test_dataset_constructed=false" \
+            "${directory}/downstream_console.log" 2>/dev/null \
         && grep -Fq "DEVELOPMENT COMPLETE (TEST SET SEALED)" \
             "${directory}/downstream_console.log" 2>/dev/null
 }
@@ -228,7 +235,16 @@ resolve_or_build_parent() {
 
 run_physio_pretrain() {
     local seed="$1"
-    if [[ "$seed" == "42" ]]; then
+    if [[ -n "$PHYSIO_CHECKPOINT_TEMPLATE" ]]; then
+        local selected_checkpoint
+        selected_checkpoint="${PHYSIO_CHECKPOINT_TEMPLATE//\{seed\}/$seed}"
+        [[ -s "$selected_checkpoint" ]] || die \
+            "Selected PhysioV2 checkpoint missing: $selected_checkpoint"
+        echo "[Reuse] selected PhysioV2 seed=$seed: $selected_checkpoint"
+        RESULT_CHECKPOINT="$selected_checkpoint"
+        return
+    fi
+    if [[ "$seed" == "42" && "$REUSE_LEGACY_SEED42" == "1" ]]; then
         [[ -s "$PHYSIO_SEED42_CHECKPOINT" ]] || die \
             "PhysioV2 seed42 checkpoint missing: $PHYSIO_SEED42_CHECKPOINT"
         RESULT_CHECKPOINT="$PHYSIO_SEED42_CHECKPOINT"
@@ -250,7 +266,7 @@ run_physio_pretrain() {
 
 run_mae_pretrain() {
     local seed="$1"
-    if [[ "$seed" == "42" ]]; then
+    if [[ "$seed" == "42" && "$REUSE_LEGACY_SEED42" == "1" ]]; then
         [[ -s "$MAE_SEED42_CHECKPOINT" ]] || die \
             "MAE seed42 checkpoint missing: $MAE_SEED42_CHECKPOINT"
         RESULT_CHECKPOINT="$MAE_SEED42_CHECKPOINT"
@@ -270,8 +286,8 @@ run_mae_pretrain() {
         --objective multimodal_mae \
         --output_dir "$output_dir" \
         --epochs "$MAE_EPOCHS" \
-        --batch_size 128 \
-        --accum_steps 3 \
+        --batch_size "$MAE_BATCH_SIZE" \
+        --accum_steps "$MAE_ACCUM_STEPS" \
         --workers "$WORKERS" \
         --learning_rate "$MAE_LR" \
         --warmup_epochs 10 \
@@ -286,7 +302,7 @@ run_mae_pretrain() {
 downstream_dir_for() {
     local method="$1"
     local seed="$2"
-    if [[ "$seed" == "42" ]]; then
+    if [[ "$seed" == "42" && "$REUSE_LEGACY_SEED42" == "1" ]]; then
         if [[ "$method" == "physio_v2" ]]; then
             echo "$PHYSIO_SEED42_DOWNSTREAM"
         else
@@ -343,6 +359,12 @@ archive_seed() {
         echo "pretrain_seed=$seed"
         echo "data_split_seed=$DATA_SPLIT_SEED"
         echo "downstream_seed=$DOWNSTREAM_SEED"
+        echo "physio_checkpoint_template=$PHYSIO_CHECKPOINT_TEMPLATE"
+        echo "reuse_legacy_seed42=$REUSE_LEGACY_SEED42"
+        echo "physio_stage_effective_batch=$((PHYSIO_BATCH_SIZE * PHYSIO_ACCUM_STEPS))"
+        echo "mae_effective_batch=$((MAE_BATCH_SIZE * MAE_ACCUM_STEPS))"
+        echo "physio_stage_epochs=$PHYSIO_EPOCHS"
+        echo "mae_epochs=$MAE_EPOCHS"
         echo "physio_checkpoint=$physio_checkpoint"
         echo "physio_sha256=$(sha256sum "$physio_checkpoint" | awk '{print $1}')"
         echo "mae_checkpoint=$mae_checkpoint"
@@ -422,8 +444,8 @@ python scripts/summarize_p0_independent_physio_mae.py \
     --pretrain_seeds "${seeds[@]}" \
     --downstream_seed "$DOWNSTREAM_SEED" \
     --downstream_prefix "$DOWNSTREAM_PREFIX" \
-    --physio_seed42_dir "$PHYSIO_SEED42_DOWNSTREAM" \
-    --mae_seed42_dir "$MAE_SEED42_DOWNSTREAM" \
+    --physio_seed42_dir "$(downstream_dir_for physio_v2 42)" \
+    --mae_seed42_dir "$(downstream_dir_for multimodal_mae 42)" \
     --paper_dir "$PAPER_DIR"
 
 cp "$SPLIT" "${PAPER_DIR}/multidisease_taskaware_downstream.json"
