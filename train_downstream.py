@@ -856,6 +856,38 @@ def _checkpoint_shared_private_config(checkpoint: dict) -> Optional[dict]:
     return phase2_config
 
 
+def _resolve_downstream_shared_private_config(
+    checkpoint: dict,
+    mode: str,
+) -> Optional[dict]:
+    """Resolve Shared/Private use without rejecting encoder-only checkpoints."""
+    mode = str(mode).lower()
+    if mode not in {"auto", "on", "off"}:
+        raise ValueError(
+            "downstream_shared_private_head must be auto, on, or off"
+        )
+    if mode == "off":
+        return None
+    try:
+        config = _checkpoint_shared_private_config(checkpoint)
+    except RuntimeError as exc:
+        if mode == "on":
+            raise ValueError(
+                "--shared_private_head on requires projector tensors in the "
+                "pretrained checkpoint"
+            ) from exc
+        print(
+            "[SharedPrivate] checkpoint is encoder-only; auto mode falls "
+            "back to the base encoder"
+        )
+        return None
+    if mode == "on" and config is None:
+        raise ValueError(
+            "--shared_private_head on requires a Shared-Private checkpoint"
+        )
+    return config
+
+
 def _extract_checkpoint_module_state(
     checkpoint: dict, module_prefix: str
 ) -> dict:
@@ -2608,20 +2640,13 @@ def train_downstream(
         pretrained_checkpoint = torch.load(
             checkpoint_path, map_location="cpu", weights_only=True
         )
-        shared_private_config = _checkpoint_shared_private_config(
-            pretrained_checkpoint
-        )
         shared_private_mode = str(
             getattr(config.model, "downstream_shared_private_head", "auto")
         ).lower()
-        if shared_private_mode not in {"auto", "on", "off"}:
-            raise ValueError(
-                "downstream_shared_private_head must be auto, on, or off"
-            )
-        if shared_private_mode == "on" and shared_private_config is None:
-            raise ValueError(
-                "--shared_private_head on requires a Shared-Private checkpoint"
-            )
+        shared_private_config = _resolve_downstream_shared_private_config(
+            pretrained_checkpoint,
+            shared_private_mode,
+        )
         use_shared_private_head = (
             shared_private_mode != "off"
             and shared_private_config is not None

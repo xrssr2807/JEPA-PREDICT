@@ -20,6 +20,7 @@ from models.classifier import (
 from models.jepa import SharedPrivateTokenProjector, TokenProjectionHead
 from config import Config
 from train_downstream import (
+    _resolve_downstream_shared_private_config,
     build_downstream_dataloaders,
     compute_multilabel_pos_weight,
     finalize_downstream_model,
@@ -384,6 +385,25 @@ class PriorityOneDownstreamTests(unittest.TestCase):
             "strict_validation_only=true test_dataset_constructed=false",
             stdout.getvalue(),
         )
+
+    def test_encoder_only_checkpoint_supports_disabled_shared_private_head(self):
+        checkpoint = {
+            "phase2_config": {"shared_private_enabled": True},
+            "model_state_dict": {
+                "context_encoder.scale": torch.ones(()),
+                "target_encoder.scale": torch.ones(()),
+            },
+        }
+        self.assertIsNone(
+            _resolve_downstream_shared_private_config(checkpoint, "off")
+        )
+        with mock.patch("sys.stdout", new=io.StringIO()) as stdout:
+            self.assertIsNone(
+                _resolve_downstream_shared_private_config(checkpoint, "auto")
+            )
+        self.assertIn("encoder-only", stdout.getvalue())
+        with self.assertRaisesRegex(ValueError, "requires projector tensors"):
+            _resolve_downstream_shared_private_config(checkpoint, "on")
 
     def test_final_evaluation_rejects_split_hash_mismatch(self):
         config = Config()
