@@ -3,6 +3,7 @@ import json
 import os
 import pickle
 import random
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Sequence
@@ -28,6 +29,27 @@ MERGED_LABELS = {
 EXPECTED_SPLIT_SHA256 = (
     "e3d458a8e88c75bf0b144be9bca5c7ecc87173f75425fe5cf0e2d77822cb9716"
 )
+
+
+def install_numpy_pickle_compatibility() -> None:
+    """Allow NumPy 1.x to read trusted arrays pickled by NumPy 2.x.
+
+    Some official model packages pin NumPy 1.25, while the downstream files
+    were exported with NumPy 2.x and reference its ``numpy._core`` module
+    path. The underlying ndarray representation is compatible; registering
+    the historical module aliases avoids rewriting any clinical data files.
+    """
+    core = getattr(np, "core", None)
+    if core is None:
+        return
+    sys.modules.setdefault("numpy._core", core)
+    for module_name in ("multiarray", "numeric", "umath"):
+        module = getattr(core, module_name, None)
+        if module is not None:
+            sys.modules.setdefault(f"numpy._core.{module_name}", module)
+
+
+install_numpy_pickle_compatibility()
 
 
 def seed_everything(seed: int) -> None:
@@ -232,4 +254,3 @@ def ensure_patient_counts(cache: EmbeddingCache, expected: int, split_name: str)
         raise RuntimeError(
             f"{split_name} patient count mismatch: expected={expected}, actual={actual}"
         )
-
