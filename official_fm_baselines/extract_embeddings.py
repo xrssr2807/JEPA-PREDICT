@@ -22,6 +22,12 @@ from official_fm_baselines.common import (
 
 
 OFFICIAL_MODELS = {
+    "physiov2_ppg": {
+        "checkpoint": "PhysioV2 Phase-2 jepa_best.pt",
+        "source": "JEPA-PREDICT",
+        "modality": "PPG",
+        "feature_protocol": "frozen target encoder pooled representation",
+    },
     "moment_small": {
         "checkpoint": "AutonLab/MOMENT-1-small",
         "source": "https://github.com/moment-timeseries-foundation-model/moment",
@@ -78,6 +84,31 @@ class MomentSmallAdapter:
         if embeddings.ndim != 2:
             embeddings = embeddings.flatten(start_dim=1)
         return embeddings.float()
+
+
+class PhysioV2PPGAdapter:
+    def __init__(self, device: torch.device, checkpoint: str):
+        if not checkpoint or not os.path.isfile(checkpoint):
+            raise FileNotFoundError(f"PhysioV2 checkpoint not found: {checkpoint}")
+        from config import Config
+        from train_downstream import load_pretrained_encoder
+
+        config = Config()
+        self.model = load_pretrained_encoder(
+            checkpoint,
+            config.model,
+            encoder_type="target",
+            device=device,
+            in_channels=1,
+        )
+        self.model.eval()
+        self.device = device
+
+    @torch.inference_mode()
+    def __call__(self, signal: torch.Tensor, sampling_rate: torch.Tensor):
+        del sampling_rate
+        pooled, _ = self.model(signal.to(self.device, non_blocking=True))
+        return pooled.float()
 
 
 def _resample_batch(
@@ -295,6 +326,8 @@ def build_adapter(
     official_repo: str = "",
     checkpoint: str = "",
 ):
+    if name == "physiov2_ppg":
+        return PhysioV2PPGAdapter(device, checkpoint)
     if name == "moment_small":
         return MomentSmallAdapter(device)
     if name == "papagei_s":

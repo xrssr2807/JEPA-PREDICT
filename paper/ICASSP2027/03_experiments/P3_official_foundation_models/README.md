@@ -20,6 +20,7 @@
 
 | 模型 | 官方输入处理 | 使用表征 | 说明 |
 |---|---|---|---|
+| PhysioV2 PPG | 100 Hz 原始 PPG | 512 维 target encoder 池化输出 | 项目内部的同协议主模型对照 |
 | MOMENT-small | 原始序列归一化 | 512 维 embedding | 官方 `momentfm` 管线 |
 | PaPaGei-S | polyphase 重采样到 125 Hz | 512 维 backbone 输出 | 严格加载官方权重 |
 | NormWear | 重采样到 64 Hz 后官方 CWT | 768 维块/通道均值 | 使用官方 `NormWearModel` |
