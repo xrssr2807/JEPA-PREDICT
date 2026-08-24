@@ -1,0 +1,29 @@
+{
+  "model": "normwear",
+  "official_checkpoint": "normwear_pretrain_ckpt.pth",
+  "official_source": "https://github.com/Mobile-Sensing-and-UbiComp-Laboratory/NormWear",
+  "checkpoint_path": "/root/autodl-tmp/official_models/weights/normwear_pretrain_ckpt.pth",
+  "checkpoint_sha256": "36d0bca18356ccfc8e8916058bf838f26f1212a646f5780b487ad78581a92561",
+  "split_sha256": "e3d458a8e88c75bf0b144be9bca5c7ecc87173f75425fe5cf0e2d77822cb9716",
+  "test_set_used": false,
+  "splits": {
+    "train": {
+      "split": "train",
+      "segments": 64614,
+      "patients": 5387,
+      "embedding_dim": 768,
+      "dtype": "float16",
+      "elapsed_seconds": 535.3463900089264,
+      "test_set_used": false
+    },
+    "val": {
+      "split": "val",
+      "segments": 14118,
+      "patients": 1155,
+      "embedding_dim": 768,
+      "dtype": "float16",
+      "elapsed_seconds": 117.05227208137512,
+      "test_set_used": false
+    }
+  }
+}

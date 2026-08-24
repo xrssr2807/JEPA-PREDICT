@@ -1,0 +1,29 @@
+{
+  "model": "physiov2_ppg",
+  "official_checkpoint": "PhysioV2 Phase-2 jepa_best.pt",
+  "official_source": "JEPA-PREDICT",
+  "checkpoint_path": "/root/autodl-tmp/JEPA-PREDICT/outputs_phase2_physio_v2_seed42/jepa_best.pt",
+  "checkpoint_sha256": "6a80dad30446d73348501eb2d9ca50b1afbfc9d55cc925ce7759da0fe5989714",
+  "split_sha256": "e3d458a8e88c75bf0b144be9bca5c7ecc87173f75425fe5cf0e2d77822cb9716",
+  "test_set_used": false,
+  "splits": {
+    "train": {
+      "split": "train",
+      "segments": 64614,
+      "patients": 5387,
+      "embedding_dim": 512,
+      "dtype": "float16",
+      "elapsed_seconds": 11.304989576339722,
+      "test_set_used": false
+    },
+    "val": {
+      "split": "val",
+      "segments": 14118,
+      "patients": 1155,
+      "embedding_dim": 512,
+      "dtype": "float16",
+      "elapsed_seconds": 2.639538049697876,
+      "test_set_used": false
+    }
+  }
+}

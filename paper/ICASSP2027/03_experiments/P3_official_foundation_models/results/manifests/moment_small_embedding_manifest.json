@@ -1,0 +1,27 @@
+{
+  "model": "moment_small",
+  "official_checkpoint": "AutonLab/MOMENT-1-small",
+  "official_source": "https://github.com/moment-timeseries-foundation-model/moment",
+  "split_sha256": "e3d458a8e88c75bf0b144be9bca5c7ecc87173f75425fe5cf0e2d77822cb9716",
+  "test_set_used": false,
+  "splits": {
+    "train": {
+      "split": "train",
+      "segments": 64614,
+      "patients": 5387,
+      "embedding_dim": 512,
+      "dtype": "float16",
+      "elapsed_seconds": 19.683386087417603,
+      "test_set_used": false
+    },
+    "val": {
+      "split": "val",
+      "segments": 14118,
+      "patients": 1155,
+      "embedding_dim": 512,
+      "dtype": "float16",
+      "elapsed_seconds": 4.485966682434082,
+      "test_set_used": false
+    }
+  }
+}

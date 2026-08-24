@@ -34,3 +34,12 @@
 3. 当前结果用于开发阶段模型选择；确定最终模型后，才能对封存测试集进行一次性评估。
 
 汇总见 `results/official_fm_validation_table.md`。
+
+## 当前结果（2026-08-24）
+
+- PhysioV2 PPG 的三种子 CHD AUROC 为 `0.7695 +/- 0.0012`，CHD AUPRC 为 `0.3370 +/- 0.0048`。
+- 最强公开基线的 CHD AUROC 为 MOMENT-small `0.7217 +/- 0.0005`。
+- 三种子患者概率集成后，PhysioV2 相对 MOMENT-small 的 CHD AUROC 差值为 `+0.0487`，患者级配对 Bootstrap 95% CI 为 `[+0.0070, +0.0919]`。
+- PhysioV2 在该协议下的 Macro AUROC 为 `0.7290 +/- 0.0024`，同样高于五个公开基线。
+
+这些结果支持“PhysioV2 的 PPG 表征在本开发队列上具有 CHD 特异转移优势”，但不应扩展为外部队列或所有任务的全面优越性声明。学术曲线见 `results/official_fm_chd_roc_pr.png`，统计比较见 `results/official_fm_chd_statistical_comparison.md`。

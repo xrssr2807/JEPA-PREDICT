@@ -1,0 +1,29 @@
+{
+  "model": "pulse_ppg",
+  "official_checkpoint": "Pulse-PPG official checkpoint_best.pkl",
+  "official_source": "https://github.com/eth-siplab/PulsePPG",
+  "checkpoint_path": "/root/autodl-tmp/official_models/weights/pulseppg/checkpoint_best.pkl",
+  "checkpoint_sha256": "485ade5033b3baa9b82e252fc131042dda897d7bdfc0d1a030d9746a1e98857c",
+  "split_sha256": "e3d458a8e88c75bf0b144be9bca5c7ecc87173f75425fe5cf0e2d77822cb9716",
+  "test_set_used": false,
+  "splits": {
+    "train": {
+      "split": "train",
+      "segments": 64614,
+      "patients": 5387,
+      "embedding_dim": 512,
+      "dtype": "float16",
+      "elapsed_seconds": 14.457618713378906,
+      "test_set_used": false
+    },
+    "val": {
+      "split": "val",
+      "segments": 14118,
+      "patients": 1155,
+      "embedding_dim": 512,
+      "dtype": "float16",
+      "elapsed_seconds": 3.4690475463867188,
+      "test_set_used": false
+    }
+  }
+}
