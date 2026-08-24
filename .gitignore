@@ -8,6 +8,8 @@ __pycache__/
 .vscode/
 .ipynb_checkpoints/
 .official_weights/
+paper/ICASSP2027/03_experiments/P3_official_foundation_models/results/predictions/
+paper/ICASSP2027/03_experiments/P3_official_foundation_models/results/*.tar.gz
 autodl-tmp/JEPA-PREDICT/outputs/
 autodl-tmp/JEPA-PREDICT/outputs/
 autodl-tmp/JEPA-PREDICT/outputs/
