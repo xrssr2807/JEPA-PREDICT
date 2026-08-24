@@ -39,6 +39,12 @@ OFFICIAL_MODELS = {
         "modality": "PPG",
         "target_rate_hz": 64.0,
     },
+    "units_x128": {
+        "checkpoint": "units_x128_pretrain_checkpoint.pth",
+        "source": "https://github.com/mims-harvard/UniTS",
+        "modality": "generic univariate time series",
+        "feature_protocol": "shared backbone only; no dataset-specific prompt",
+    },
 }
 
 
@@ -170,6 +176,67 @@ class NormWearAdapter:
         return output.mean(dim=(1, 2)).float()
 
 
+class UniTSX128Adapter:
+    def __init__(self, device: torch.device, official_repo: str, checkpoint: str):
+        if not official_repo or not os.path.isdir(official_repo):
+            raise FileNotFoundError(f"UniTS official repository not found: {official_repo}")
+        if not checkpoint or not os.path.isfile(checkpoint):
+            raise FileNotFoundError(f"UniTS checkpoint not found: {checkpoint}")
+        if os.path.getsize(checkpoint) < 90_000_000:
+            raise RuntimeError(
+                f"UniTS checkpoint appears incomplete: {os.path.getsize(checkpoint)} bytes"
+            )
+        sys.path.insert(0, os.path.abspath(official_repo))
+        module = importlib.import_module("models.UniTS")
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        args = payload["args"]
+        config = [
+            (
+                "PPG_external",
+                {
+                    "dataset": "PPG_external",
+                    "enc_in": 1,
+                    "task_name": "classification",
+                    "num_class": 1,
+                },
+            )
+        ]
+        self.model = module.Model(args, config, pretrain=False)
+        state = payload.get("student", payload)
+        state = {
+            (key[7:] if key.startswith("module.") else key): value
+            for key, value in state.items()
+        }
+        shared_prefixes = (
+            "patch_embeddings.",
+            "position_embedding.",
+            "prompt2forecat.",
+            "blocks.",
+            "cls_head.",
+            "forecast_head.",
+        )
+        shared_state = {
+            key: value for key, value in state.items() if key.startswith(shared_prefixes)
+        }
+        incompatible = self.model.load_state_dict(shared_state, strict=False)
+        unexpected = list(incompatible.unexpected_keys)
+        if unexpected:
+            raise RuntimeError(f"Unexpected UniTS checkpoint keys: {unexpected[:10]}")
+        self.model.to(device).eval()
+        self.device = device
+
+    @torch.inference_mode()
+    def __call__(self, signal: torch.Tensor, sampling_rate: torch.Tensor):
+        del sampling_rate  # UniTS has no physical-rate input.
+        x = signal.to(self.device, non_blocking=True).transpose(1, 2)
+        x, _, _, n_vars, _ = self.model.tokenize(x)
+        x = x.reshape(-1, n_vars, x.shape[-2], x.shape[-1])
+        x = x + self.model.position_embedding(x)
+        seq_len = x.shape[-2]
+        x = self.model.backbone(x, prefix_len=0, seq_len=seq_len)
+        return x.mean(dim=(1, 2)).float()
+
+
 def build_adapter(
     name: str,
     device: torch.device,
@@ -182,6 +249,8 @@ def build_adapter(
         return PaPaGeiSmallAdapter(device, official_repo, checkpoint)
     if name == "normwear":
         return NormWearAdapter(device, official_repo, checkpoint)
+    if name == "units_x128":
+        return UniTSX128Adapter(device, official_repo, checkpoint)
     raise ValueError(f"Unsupported official model: {name}")
 
 
