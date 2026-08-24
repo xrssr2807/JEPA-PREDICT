@@ -65,3 +65,11 @@ def test_polyphase_resampling_preserves_ten_second_duration():
     output = _resample_batch(signal, rates, target_rate_hz=125.0)
     assert output.shape == (2, 1, 1250)
     assert torch.isfinite(output).all()
+
+
+def test_pulseppg_resampling_preserves_ten_second_duration():
+    signal = torch.randn(2, 1, 1000)
+    rates = torch.tensor([100.0, 100.0])
+    output = _resample_batch(signal, rates, target_rate_hz=50.0)
+    assert output.shape == (2, 1, 500)
+    assert torch.isfinite(output).all()

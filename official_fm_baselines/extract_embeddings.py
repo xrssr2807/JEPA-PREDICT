@@ -45,6 +45,12 @@ OFFICIAL_MODELS = {
         "modality": "generic univariate time series",
         "feature_protocol": "shared backbone only; no dataset-specific prompt",
     },
+    "pulse_ppg": {
+        "checkpoint": "Pulse-PPG official checkpoint_best.pkl",
+        "source": "https://github.com/eth-siplab/PulsePPG",
+        "modality": "PPG",
+        "target_rate_hz": 50.0,
+    },
 }
 
 
@@ -237,6 +243,52 @@ class UniTSX128Adapter:
         return x.mean(dim=(1, 2)).float()
 
 
+class PulsePPGAdapter:
+    def __init__(self, device: torch.device, official_repo: str, checkpoint: str):
+        if not official_repo or not os.path.isdir(official_repo):
+            raise FileNotFoundError(f"Pulse-PPG official repository not found: {official_repo}")
+        if not checkpoint or not os.path.isfile(checkpoint):
+            raise FileNotFoundError(f"Pulse-PPG checkpoint not found: {checkpoint}")
+        if os.path.getsize(checkpoint) < 1_000_000:
+            raise RuntimeError(
+                f"Pulse-PPG checkpoint appears incomplete: {os.path.getsize(checkpoint)} bytes"
+            )
+        sys.path.insert(0, os.path.abspath(official_repo))
+        module = importlib.import_module("pulseppg.nets.ResNet1D.ResNet1D_Net")
+        self.model = module.Net(
+            in_channels=1,
+            base_filters=128,
+            kernel_size=11,
+            stride=2,
+            groups=1,
+            n_block=12,
+            finalpool="max",
+        )
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict) or "net" not in payload:
+            keys = list(payload)[:20] if isinstance(payload, dict) else type(payload)
+            raise RuntimeError(
+                f"Pulse-PPG pretraining checkpoint must contain 'net'; found: {keys}"
+            )
+        state = {
+            (key[7:] if key.startswith("module.") else key): value
+            for key, value in payload["net"].items()
+        }
+        self.model.load_state_dict(state, strict=True)
+        self.model.to(device).eval()
+        self.device = device
+        self.target_rate_hz = OFFICIAL_MODELS["pulse_ppg"]["target_rate_hz"]
+
+    @torch.inference_mode()
+    def __call__(self, signal: torch.Tensor, sampling_rate: torch.Tensor):
+        signal = _resample_batch(signal, sampling_rate, self.target_rate_hz)
+        signal = signal.to(self.device, non_blocking=True)
+        embeddings = self.model(signal)
+        if embeddings.ndim != 2:
+            embeddings = embeddings.flatten(start_dim=1)
+        return embeddings.float()
+
+
 def build_adapter(
     name: str,
     device: torch.device,
@@ -251,6 +303,8 @@ def build_adapter(
         return NormWearAdapter(device, official_repo, checkpoint)
     if name == "units_x128":
         return UniTSX128Adapter(device, official_repo, checkpoint)
+    if name == "pulse_ppg":
+        return PulsePPGAdapter(device, official_repo, checkpoint)
     raise ValueError(f"Unsupported official model: {name}")
 
 
