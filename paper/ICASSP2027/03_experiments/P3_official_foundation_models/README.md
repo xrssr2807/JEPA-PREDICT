@@ -43,3 +43,16 @@
 - PhysioV2 在该协议下的 Macro AUROC 为 `0.7290 +/- 0.0024`，同样高于五个公开基线。
 
 这些结果支持“PhysioV2 的 PPG 表征在本开发队列上具有 CHD 特异转移优势”，但不应扩展为外部队列或所有任务的全面优越性声明。学术曲线见 `results/official_fm_chd_roc_pr.png`，统计比较见 `results/official_fm_chd_statistical_comparison.md`。
+
+## 最终测试协议
+
+完成全部开发集模型选择后，使用 `scripts/run_official_fm_sealed_test.sh` 一次性解封固定测试集。脚本在解封前记录患者划分、官方预训练权重、18 个验证集最佳下游头及其选择摘要的 SHA256；测试阶段禁止训练、阈值搜索和模型选择。最终报告使用三下游种子均值与标准差，并以三种子患者概率均值绘制 CHD ROC/PR 曲线和执行患者级配对 Bootstrap。
+
+测试授权命令仅在模型完全冻结后执行：
+
+```bash
+UNSEAL_TEST=FINAL_ICASSP_2027 \
+  bash scripts/run_official_fm_sealed_test.sh
+```
+
+患者级测试预测属于受限实验产物，只保存在服务器结果目录，不提交到 GitHub；仓库只归档去标识化汇总表、统计结果、图和冻结协议清单。

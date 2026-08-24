@@ -354,17 +354,28 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_files", type=int, default=0)
     parser.add_argument("--expected_split_sha256", default=EXPECTED_SPLIT_SHA256)
+    parser.add_argument(
+        "--unseal_test",
+        action="store_true",
+        help="Extract the frozen test split. Requires the explicit authorization token.",
+    )
+    parser.add_argument("--test_authorization", default="")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.unseal_test and args.test_authorization != "FINAL_ICASSP_2027":
+        raise RuntimeError(
+            "Test extraction requires --test_authorization FINAL_ICASSP_2027"
+        )
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    split_names = ("test",) if args.unseal_test else ("train", "val")
     split_lists = load_split_manifest(
         args.split,
         args.data_dir,
-        split_names=("train", "val"),
+        split_names=split_names,
         expected_sha256=args.expected_split_sha256,
     )
     output_dir = os.path.abspath(args.output_dir)
@@ -384,10 +395,10 @@ def main():
         "checkpoint_path": os.path.abspath(args.checkpoint) if args.checkpoint else "",
         "checkpoint_sha256": file_sha256(args.checkpoint) if args.checkpoint else "",
         "split_sha256": file_sha256(args.split),
-        "test_set_used": False,
+        "test_set_used": bool(args.unseal_test),
         "splits": {},
     }
-    for split_name in ("train", "val"):
+    for split_name in split_names:
         output_path = os.path.join(output_dir, f"{split_name}_embeddings.pt")
         if os.path.isfile(output_path):
             cache = EmbeddingCache.load(output_path)
@@ -434,7 +445,7 @@ def main():
             "embedding_dim": int(embedding_chunks[0].shape[-1]),
             "dtype": "float16",
             "elapsed_seconds": time.time() - started,
-            "test_set_used": False,
+            "test_set_used": split_name == "test",
         }
         cache = EmbeddingCache(
             embeddings=torch.cat(embedding_chunks, dim=0),
@@ -450,7 +461,7 @@ def main():
     with open(os.path.join(output_dir, "embedding_manifest.json"), "w", encoding="utf-8") as handle:
         json.dump(summary, handle, ensure_ascii=False, indent=2)
     with open(os.path.join(output_dir, "EMBEDDINGS_COMPLETE"), "w", encoding="ascii") as handle:
-        handle.write("test_set_used=false\n")
+        handle.write(f"test_set_used={str(bool(args.unseal_test)).lower()}\n")
     print(f"[Complete] official embeddings: {output_dir}")
 
 

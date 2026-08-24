@@ -32,6 +32,8 @@ def parse_args():
     parser.add_argument("--reference", default="physiov2_ppg")
     parser.add_argument("--bootstrap", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--cohort_label", default="development patients")
+    parser.add_argument("--analysis_scope", choices=("development", "final_test"), default="development")
     return parser.parse_args()
 
 
@@ -135,7 +137,7 @@ def main():
         axes[1].plot(recall, precision, color=colors(index), lw=linewidth, label=f"{label} ({item['auprc']:.3f})")
     axes[0].plot([0, 1], [0, 1], "--", color="0.6", lw=1)
     axes[1].axhline(y.mean(), ls="--", color="0.6", lw=1, label=f"Prevalence ({y.mean():.3f})")
-    axes[0].set(title="CHD ROC on development patients", xlabel="False positive rate", ylabel="True positive rate")
+    axes[0].set(title=f"CHD ROC on {args.cohort_label}", xlabel="False positive rate", ylabel="True positive rate")
     axes[1].set(title="CHD precision-recall", xlabel="Recall", ylabel="Precision")
     for axis in axes:
         axis.set(xlim=(0, 1), ylim=(0, 1))
@@ -174,7 +176,10 @@ def main():
     with open(markdown_path, "w", encoding="utf-8") as handle:
         handle.write("# Frozen PPG representation comparison\n\n")
         handle.write("Curves use the mean patient probability across three downstream seeds. ")
-        handle.write("Confidence intervals use paired patient-level bootstrap on the development set; the test set remains sealed.\n\n")
+        if args.analysis_scope == "final_test":
+            handle.write("Confidence intervals use paired patient-level bootstrap on the one-time sealed test set.\n\n")
+        else:
+            handle.write("Confidence intervals use paired patient-level bootstrap on the development set; the test set remains sealed.\n\n")
         handle.write("Two-sided p-values are exploratory and uncorrected for five comparisons.\n\n")
         handle.write("| Comparator | PhysioV2 AUC | Comparator AUC | Delta | 95% CI | p (two-sided) |\n")
         handle.write("|---|---:|---:|---:|---:|---:|\n")
