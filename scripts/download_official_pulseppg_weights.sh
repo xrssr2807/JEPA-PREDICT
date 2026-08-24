@@ -88,7 +88,11 @@ for item in "${pids[@]}"; do
   }
 done
 
-cat "$WORK"/part_* > "${DEST}.tmp"
+: > "${DEST}.tmp"
+for ((i=0; i<PARTS; i++)); do
+  part=$(printf "%s/part_%02d" "$WORK" "$i")
+  cat "$part" >> "${DEST}.tmp"
+done
 actual_size=$(stat -c %s "${DEST}.tmp")
 actual_md5=$(md5sum "${DEST}.tmp" | awk '{print $1}')
 [[ "$actual_size" -eq "$EXPECTED_SIZE" ]] || {
