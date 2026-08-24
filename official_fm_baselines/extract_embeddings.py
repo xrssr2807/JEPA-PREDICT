@@ -1,4 +1,5 @@
 import argparse
+import importlib
 import json
 import os
 import sys
@@ -31,6 +32,12 @@ OFFICIAL_MODELS = {
         "source": "https://github.com/Nokia-Bell-Labs/papagei-foundation-model",
         "modality": "PPG",
         "target_rate_hz": 125.0,
+    },
+    "normwear": {
+        "checkpoint": "normwear_pretrain_ckpt.pth",
+        "source": "https://github.com/Mobile-Sensing-and-UbiComp-Laboratory/NormWear",
+        "modality": "PPG",
+        "target_rate_hz": 64.0,
     },
 }
 
@@ -127,6 +134,42 @@ class PaPaGeiSmallAdapter:
         return embeddings.float()
 
 
+class NormWearAdapter:
+    def __init__(self, device: torch.device, official_repo: str, checkpoint: str):
+        if not official_repo or not os.path.isdir(official_repo):
+            raise FileNotFoundError(f"NormWear official repository not found: {official_repo}")
+        if not checkpoint or not os.path.isfile(checkpoint):
+            raise FileNotFoundError(f"NormWear checkpoint not found: {checkpoint}")
+        if os.path.getsize(checkpoint) < 500_000_000:
+            raise RuntimeError(
+                f"NormWear checkpoint appears incomplete: {os.path.getsize(checkpoint)} bytes"
+            )
+        repo = os.path.abspath(official_repo)
+        package_parent = os.path.dirname(repo)
+        package_name = os.path.basename(repo)
+        sys.path.insert(0, package_parent)
+        module = importlib.import_module(f"{package_name}.main_model")
+        self.model = module.NormWearModel(
+            weight_path=checkpoint,
+            optimized_cwt=True,
+        )
+        self.model.to(device).eval()
+        self.device = device
+        self.target_rate_hz = OFFICIAL_MODELS["normwear"]["target_rate_hz"]
+
+    @torch.inference_mode()
+    def __call__(self, signal: torch.Tensor, sampling_rate: torch.Tensor):
+        signal = _resample_batch(signal, sampling_rate, self.target_rate_hz)
+        output = self.model.get_embedding(
+            signal,
+            sampling_rate=int(self.target_rate_hz),
+            device=self.device,
+        )
+        if output.ndim != 4:
+            raise RuntimeError(f"Unexpected NormWear embedding shape: {tuple(output.shape)}")
+        return output.mean(dim=(1, 2)).float()
+
+
 def build_adapter(
     name: str,
     device: torch.device,
@@ -137,6 +180,8 @@ def build_adapter(
         return MomentSmallAdapter(device)
     if name == "papagei_s":
         return PaPaGeiSmallAdapter(device, official_repo, checkpoint)
+    if name == "normwear":
+        return NormWearAdapter(device, official_repo, checkpoint)
     raise ValueError(f"Unsupported official model: {name}")
 
 
