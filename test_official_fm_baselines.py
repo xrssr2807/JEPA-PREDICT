@@ -12,6 +12,7 @@ from official_fm_baselines.common import (
     label_vector,
     load_split_manifest,
 )
+from official_fm_baselines.extract_embeddings import _resample_batch
 
 
 def test_merged_other_disease_label():
@@ -57,3 +58,10 @@ def test_patient_embedding_padding_and_mask():
     assert labels.shape == (8,)
     assert mask.tolist() == [True, True, False]
 
+
+def test_polyphase_resampling_preserves_ten_second_duration():
+    signal = torch.randn(2, 1, 1000)
+    rates = torch.tensor([100.0, 100.0])
+    output = _resample_batch(signal, rates, target_rate_hz=125.0)
+    assert output.shape == (2, 1, 1250)
+    assert torch.isfinite(output).all()
