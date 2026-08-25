@@ -304,7 +304,13 @@ class TrainConfig:
     multidisease_dual_teacher_checkpoint: str = ""
     multidisease_distill_logit_weight: float = 0.3
     multidisease_distill_embedding_weight: float = 0.1
+    multidisease_distill_relation_weight: float = 0.0
     multidisease_distill_temperature: float = 2.0
+    multidisease_distill_gate: str = "none"  # "none" | "confidence" | "target_agreement"
+    multidisease_distill_confidence_threshold: float = 0.6
+    multidisease_distill_chd_weight: float = 1.0
+    multidisease_distill_balance_targets: bool = False
+    multidisease_distill_ramp_epochs: int = 0
 
     # ★ Token 对齐续训练 (冻结 target, 训练 context 对齐到 target)
     token_align_epochs: int = 50       # 续训练epoch

@@ -25,6 +25,9 @@ from train_downstream import (
     compute_multilabel_pos_weight,
     finalize_downstream_model,
     load_pretrained_encoder,
+    patient_relation_distillation_loss,
+    selective_embedding_distillation_loss,
+    selective_multilabel_logit_distillation,
     train_epoch,
     validate_downstream_checkpoint_context,
 )
@@ -265,6 +268,109 @@ class PriorityOneDownstreamTests(unittest.TestCase):
             torch.device("cpu"), multilabel=True,
             teacher_model=teacher, teacher_logit_weight=0.3,
             teacher_embedding_weight=0.1, teacher_temperature=2.0,
+        )
+        self.assertTrue(np.isfinite(loss))
+
+    def test_target_agreement_gate_rejects_wrong_teacher_decisions(self):
+        student_logits = torch.zeros(2, 2, requires_grad=True)
+        teacher_logits = torch.tensor([
+            [4.0, -4.0],
+            [-4.0, 4.0],
+        ])
+        targets = torch.tensor([
+            [1.0, 1.0],
+            [0.0, 0.0],
+        ])
+        loss, reliability, metrics = selective_multilabel_logit_distillation(
+            student_logits,
+            teacher_logits,
+            targets,
+            temperature=2.0,
+            gate_mode="target_agreement",
+            confidence_threshold=0.6,
+            focus_label_index=0,
+            focus_weight=2.0,
+            balance_targets=True,
+        )
+
+        self.assertGreater(float(reliability[:, 0].min()), 0.9)
+        self.assertTrue(torch.equal(
+            reliability[:, 1], torch.zeros_like(reliability[:, 1])
+        ))
+        self.assertAlmostEqual(
+            float(metrics["selected_fraction"]), 0.5, places=6
+        )
+        loss.backward()
+        self.assertTrue(torch.isfinite(student_logits.grad).all())
+
+    def test_selective_embedding_loss_ignores_rejected_patients(self):
+        student = torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0]], requires_grad=True
+        )
+        teacher = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+        reliability = torch.tensor([[1.0, 1.0], [0.0, 0.0]])
+        loss = selective_embedding_distillation_loss(
+            student, teacher, reliability
+        )
+        self.assertAlmostEqual(float(loss), 0.0, places=6)
+        loss.backward()
+        self.assertTrue(torch.isfinite(student.grad).all())
+
+    def test_patient_relation_distillation_matches_teacher_geometry(self):
+        teacher = torch.tensor([
+            [1.0, 0.0], [0.0, 1.0], [1.0, 1.0],
+        ])
+        reliability = torch.ones(3, 2)
+        identical = teacher.clone().requires_grad_(True)
+        identical_loss = patient_relation_distillation_loss(
+            identical, teacher, reliability
+        )
+        changed = torch.tensor([
+            [1.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+        ], requires_grad=True)
+        changed_loss = patient_relation_distillation_loss(
+            changed, teacher, reliability
+        )
+
+        self.assertAlmostEqual(float(identical_loss), 0.0, places=6)
+        self.assertGreater(float(changed_loss), 0.0)
+        changed_loss.backward()
+        self.assertTrue(torch.isfinite(changed.grad).all())
+
+    def test_selective_relation_teacher_training_step_is_finite(self):
+        student = PatientMILClassifier(
+            DummyEncoder(), encoder_dim=8, num_classes=3,
+            use_multiscale=False, dropout=0.0, input_channel=0,
+        )
+        teacher = DualStreamPatientMILClassifier(
+            DummyEncoder(), DummyEncoder(), encoder_dim=8, num_classes=3,
+            use_multiscale=False, dropout=0.0,
+            disease_conditioned_fusion=True,
+        )
+        optimizer = torch.optim.Adam(student.parameters(), lr=1e-3)
+        batch = (
+            torch.randn(4, 4, 2, 16),
+            torch.tensor([
+                [1.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ]),
+            ["u1", "u2", "u3", "u4"],
+            torch.ones(4, 4, dtype=torch.bool),
+        )
+        loss, _ = train_epoch(
+            student, [batch], optimizer, nn.BCEWithLogitsLoss(),
+            torch.device("cpu"), multilabel=True,
+            teacher_model=teacher,
+            teacher_logit_weight=0.3,
+            teacher_embedding_weight=0.1,
+            teacher_relation_weight=0.1,
+            teacher_temperature=2.0,
+            teacher_gate_mode="target_agreement",
+            teacher_confidence_threshold=0.5,
+            teacher_focus_weight=2.0,
+            teacher_balance_targets=True,
         )
         self.assertTrue(np.isfinite(loss))
 

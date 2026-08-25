@@ -975,6 +975,7 @@ def load_multidisease_dual_teacher(
     config: Config,
     num_classes: int,
     device: torch.device,
+    expected_split_sha: Optional[str] = None,
 ):
     """Load a frozen dual-stream downstream teacher, including legacy heads."""
     payload = torch.load(teacher_checkpoint, map_location="cpu", weights_only=False)
@@ -982,6 +983,30 @@ def load_multidisease_dual_teacher(
     if not isinstance(state_dict, dict):
         raise ValueError(
             f"Teacher checkpoint {teacher_checkpoint} does not contain a model state dict"
+        )
+    saved_labels = payload.get("disease_labels")
+    if saved_labels is not None and list(saved_labels) != list(
+        config.data.multidisease_labels
+    ):
+        raise ValueError(
+            "Dual teacher label schema mismatch: "
+            f"checkpoint={list(saved_labels)} current="
+            f"{list(config.data.multidisease_labels)}"
+        )
+    saved_split_sha = (payload.get("data_split") or {}).get("sha256")
+    if (
+        expected_split_sha
+        and saved_split_sha
+        and saved_split_sha != expected_split_sha
+    ):
+        raise ValueError(
+            "Dual teacher patient split mismatch: "
+            f"checkpoint={saved_split_sha} current={expected_split_sha}"
+        )
+    if expected_split_sha and not saved_split_sha:
+        print(
+            "[Teacher][Warning] checkpoint has no split hash; provenance "
+            "cannot be verified"
         )
     if any(key.startswith("module.") for key in state_dict):
         state_dict = {
@@ -1127,6 +1152,175 @@ def pairwise_auc_margin_loss(logits: torch.Tensor, targets: torch.Tensor,
     return F.softplus(float(margin) - score_diff).mean()
 
 
+def selective_multilabel_logit_distillation(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    targets: torch.Tensor,
+    temperature: float = 2.0,
+    gate_mode: str = "none",
+    confidence_threshold: float = 0.6,
+    focus_label_index: int = 4,
+    focus_weight: float = 1.0,
+    balance_targets: bool = False,
+):
+    """Distil only trustworthy teacher decisions, with optional CHD emphasis.
+
+    ``target_agreement`` uses the probability assigned by the teacher to the
+    observed training target. This prevents a confident but incorrect
+    cross-modal teacher decision from being copied into the PPG-only student.
+    The returned reliability matrix is also reused by representation losses.
+    """
+    if student_logits.shape != teacher_logits.shape or student_logits.shape != targets.shape:
+        raise ValueError(
+            "student_logits, teacher_logits, and targets must share shape"
+        )
+    mode = str(gate_mode).lower()
+    if mode not in {"none", "confidence", "target_agreement"}:
+        raise ValueError(
+            "gate_mode must be none, confidence, or target_agreement"
+        )
+    threshold = float(confidence_threshold)
+    if not 0.5 <= threshold < 1.0:
+        raise ValueError("confidence_threshold must be within [0.5, 1.0)")
+
+    temperature = max(float(temperature), 1e-6)
+    teacher_soft = torch.sigmoid(teacher_logits.float() / temperature)
+    elementwise = F.binary_cross_entropy_with_logits(
+        student_logits.float() / temperature,
+        teacher_soft,
+        reduction="none",
+    ) * (temperature ** 2)
+
+    with torch.no_grad():
+        teacher_prob = torch.sigmoid(teacher_logits.float())
+        target_prob = targets.float() * teacher_prob + (
+            1.0 - targets.float()
+        ) * (1.0 - teacher_prob)
+        if mode == "none":
+            reliability = torch.ones_like(elementwise)
+        else:
+            gate_score = (
+                torch.maximum(teacher_prob, 1.0 - teacher_prob)
+                if mode == "confidence" else target_prob
+            )
+            reliability = (
+                (gate_score - threshold) / max(1.0 - threshold, 1e-6)
+            ).clamp_(0.0, 1.0)
+
+    class_weights = torch.ones(
+        student_logits.size(1), device=student_logits.device,
+        dtype=elementwise.dtype,
+    )
+    if 0 <= int(focus_label_index) < class_weights.numel():
+        class_weights[int(focus_label_index)] = max(float(focus_weight), 0.0)
+
+    class_losses = []
+    active_class_weights = []
+    for label_index in range(student_logits.size(1)):
+        label_loss = elementwise[:, label_index]
+        label_reliability = reliability[:, label_index]
+        if balance_targets:
+            group_losses = []
+            for group_mask in (
+                targets[:, label_index] > 0.5,
+                targets[:, label_index] <= 0.5,
+            ):
+                group_weight = label_reliability * group_mask.to(
+                    label_reliability.dtype
+                )
+                if float(group_weight.sum().detach()) > 0.0:
+                    group_losses.append(
+                        (label_loss * group_weight).sum()
+                        / group_weight.sum().clamp_min(1e-6)
+                    )
+            if not group_losses:
+                continue
+            class_loss = torch.stack(group_losses).mean()
+        else:
+            weight_sum = label_reliability.sum()
+            if float(weight_sum.detach()) <= 0.0:
+                continue
+            class_loss = (
+                label_loss * label_reliability
+            ).sum() / weight_sum.clamp_min(1e-6)
+        class_losses.append(class_loss)
+        active_class_weights.append(class_weights[label_index])
+
+    if class_losses:
+        stacked_losses = torch.stack(class_losses)
+        stacked_weights = torch.stack(active_class_weights)
+        loss = (
+            stacked_losses * stacked_weights
+        ).sum() / stacked_weights.sum().clamp_min(1e-6)
+    else:
+        loss = student_logits.sum() * 0.0
+
+    with torch.no_grad():
+        teacher_correct = (
+            (teacher_prob >= 0.5) == (targets >= 0.5)
+        ).float().mean()
+        selected = (reliability > 0).float().mean()
+        mean_reliability = reliability.mean()
+        if 0 <= int(focus_label_index) < reliability.size(1):
+            focus_selected = (
+                reliability[:, int(focus_label_index)] > 0
+            ).float().mean()
+        else:
+            focus_selected = selected
+    return loss, reliability, {
+        "selected_fraction": selected,
+        "mean_reliability": mean_reliability,
+        "teacher_target_accuracy": teacher_correct,
+        "focus_selected_fraction": focus_selected,
+    }
+
+
+def selective_embedding_distillation_loss(
+    student_embedding: torch.Tensor,
+    teacher_embedding: torch.Tensor,
+    reliability: torch.Tensor,
+) -> torch.Tensor:
+    """Reliability-weighted patient representation alignment."""
+    if student_embedding.shape != teacher_embedding.shape:
+        raise ValueError("student and teacher embeddings must share shape")
+    sample_weight = reliability.float().mean(dim=1)
+    cosine_loss = 1.0 - F.cosine_similarity(
+        student_embedding.float(), teacher_embedding.float(), dim=-1,
+    )
+    if float(sample_weight.sum().detach()) <= 0.0:
+        return student_embedding.sum() * 0.0
+    return (
+        cosine_loss * sample_weight
+    ).sum() / sample_weight.sum().clamp_min(1e-6)
+
+
+def patient_relation_distillation_loss(
+    student_embedding: torch.Tensor,
+    teacher_embedding: torch.Tensor,
+    reliability: torch.Tensor,
+) -> torch.Tensor:
+    """Match teacher pairwise patient geometry without copying ECG features."""
+    if student_embedding.shape != teacher_embedding.shape:
+        raise ValueError("student and teacher embeddings must share shape")
+    if student_embedding.size(0) < 2:
+        return student_embedding.sum() * 0.0
+    student_norm = F.normalize(student_embedding.float(), dim=-1)
+    teacher_norm = F.normalize(teacher_embedding.float(), dim=-1)
+    student_relation = student_norm @ student_norm.transpose(0, 1)
+    teacher_relation = teacher_norm @ teacher_norm.transpose(0, 1)
+    sample_weight = reliability.float().mean(dim=1)
+    pair_weight = sample_weight[:, None] * sample_weight[None, :]
+    pair_weight.fill_diagonal_(0.0)
+    if float(pair_weight.sum().detach()) <= 0.0:
+        return student_embedding.sum() * 0.0
+    elementwise = F.smooth_l1_loss(
+        student_relation, teacher_relation.detach(), reduction="none",
+    )
+    return (
+        elementwise * pair_weight
+    ).sum() / pair_weight.sum().clamp_min(1e-6)
+
+
 def compute_multidisease_objective(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -1213,7 +1407,13 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                 teacher_model=None,
                 teacher_logit_weight: float = 0.0,
                 teacher_embedding_weight: float = 0.0,
-                teacher_temperature: float = 2.0):
+                teacher_relation_weight: float = 0.0,
+                teacher_temperature: float = 2.0,
+                teacher_gate_mode: str = "none",
+                teacher_confidence_threshold: float = 0.6,
+                teacher_focus_weight: float = 1.0,
+                teacher_balance_targets: bool = False,
+                teacher_weight_scale: float = 1.0):
     """Single training epoch with optional ECG distillation."""
     model.train()
     if teacher_model is not None:
@@ -1224,6 +1424,15 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
     correct = 0
     total = 0
     valid_steps = 0
+    kd_running = {
+        "logit": 0.0,
+        "embedding": 0.0,
+        "relation": 0.0,
+        "selected": 0.0,
+        "focus_selected": 0.0,
+        "teacher_accuracy": 0.0,
+    }
+    kd_steps = 0
 
     ecg_iter = iter(ecg_loader) if (distill_mode or cotrain_mode) else None
 
@@ -1298,7 +1507,6 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                     labels.float() if multilabel else labels,
                 )
                 if teacher_model is not None:
-                    temperature = max(float(teacher_temperature), 1e-6)
                     with torch.no_grad(), torch.autocast(
                         device_type=device.type,
                         dtype=torch.float16,
@@ -1308,22 +1516,49 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                             teacher_model, x, segment_mask=segment_mask,
                             return_embedding=True,
                         )
-                    soft_targets = torch.sigmoid(teacher_logits.float() / temperature)
-                    logit_distill = F.binary_cross_entropy_with_logits(
-                        logits.float() / temperature, soft_targets,
-                    ) * (temperature ** 2)
-                    embedding_distill = (
-                        1.0 - F.cosine_similarity(
-                            student_embedding.float(),
-                            teacher_embedding.float(),
-                            dim=-1,
+                    logit_distill, reliability, kd_metrics = (
+                        selective_multilabel_logit_distillation(
+                            logits,
+                            teacher_logits,
+                            labels,
+                            temperature=teacher_temperature,
+                            gate_mode=teacher_gate_mode,
+                            confidence_threshold=teacher_confidence_threshold,
+                            focus_label_index=focus_label_index,
+                            focus_weight=teacher_focus_weight,
+                            balance_targets=teacher_balance_targets,
                         )
-                    ).mean()
+                    )
+                    embedding_distill = selective_embedding_distillation_loss(
+                        student_embedding, teacher_embedding, reliability,
+                    )
+                    relation_distill = patient_relation_distillation_loss(
+                        student_embedding, teacher_embedding, reliability,
+                    )
+                    kd_scale = max(float(teacher_weight_scale), 0.0)
                     loss = (
                         loss
-                        + float(teacher_logit_weight) * logit_distill
-                        + float(teacher_embedding_weight) * embedding_distill
+                        + kd_scale * float(teacher_logit_weight) * logit_distill
+                        + kd_scale * float(teacher_embedding_weight)
+                        * embedding_distill
+                        + kd_scale * float(teacher_relation_weight)
+                        * relation_distill
                     )
+                    kd_running["logit"] += float(logit_distill.detach())
+                    kd_running["embedding"] += float(
+                        embedding_distill.detach()
+                    )
+                    kd_running["relation"] += float(relation_distill.detach())
+                    kd_running["selected"] += float(
+                        kd_metrics["selected_fraction"]
+                    )
+                    kd_running["focus_selected"] += float(
+                        kd_metrics["focus_selected_fraction"]
+                    )
+                    kd_running["teacher_accuracy"] += float(
+                        kd_metrics["teacher_target_accuracy"]
+                    )
+                    kd_steps += 1
 
         if multilabel:
             loss = compute_multidisease_objective(
@@ -1375,6 +1610,17 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
 
     if valid_steps == 0 or total == 0:
         return float("nan"), 0.0
+    if kd_steps:
+        print(
+            "[KD] "
+            f"logit={kd_running['logit'] / kd_steps:.4f} "
+            f"embedding={kd_running['embedding'] / kd_steps:.4f} "
+            f"relation={kd_running['relation'] / kd_steps:.4f} "
+            f"selected={kd_running['selected'] / kd_steps:.3f} "
+            f"CHD_selected={kd_running['focus_selected'] / kd_steps:.3f} "
+            f"teacher_target_acc={kd_running['teacher_accuracy'] / kd_steps:.3f} "
+            f"scale={max(float(teacher_weight_scale), 0.0):.3f}"
+        )
     return running_loss / valid_steps, 100.0 * correct / total
 
 
@@ -2966,12 +3212,21 @@ def train_downstream(
             config,
             num_classes,
             device,
+            expected_split_sha=(
+                split_provenance["sha256"] if split_provenance else None
+            ),
         )
         print(
             "[Distill] weights: "
             f"logit={config.train.multidisease_distill_logit_weight:.3f} "
             f"embedding={config.train.multidisease_distill_embedding_weight:.3f} "
-            f"temperature={config.train.multidisease_distill_temperature:.2f}"
+            f"relation={config.train.multidisease_distill_relation_weight:.3f} "
+            f"temperature={config.train.multidisease_distill_temperature:.2f} "
+            f"gate={config.train.multidisease_distill_gate} "
+            f"threshold={config.train.multidisease_distill_confidence_threshold:.2f} "
+            f"CHD_weight={config.train.multidisease_distill_chd_weight:.2f} "
+            f"balance_targets={config.train.multidisease_distill_balance_targets} "
+            f"ramp_epochs={config.train.multidisease_distill_ramp_epochs}"
         )
 
     # ── Auto pos_weight ──
@@ -3142,7 +3397,21 @@ def train_downstream(
                 teacher_model=teacher_model,
                 teacher_logit_weight=config.train.multidisease_distill_logit_weight,
                 teacher_embedding_weight=config.train.multidisease_distill_embedding_weight,
+                teacher_relation_weight=config.train.multidisease_distill_relation_weight,
                 teacher_temperature=config.train.multidisease_distill_temperature,
+                teacher_gate_mode=config.train.multidisease_distill_gate,
+                teacher_confidence_threshold=config.train.multidisease_distill_confidence_threshold,
+                teacher_focus_weight=config.train.multidisease_distill_chd_weight,
+                teacher_balance_targets=config.train.multidisease_distill_balance_targets,
+                teacher_weight_scale=(
+                    min(
+                        1.0,
+                        (epoch + 1)
+                        / max(config.train.multidisease_distill_ramp_epochs, 1),
+                    )
+                    if config.train.multidisease_distill_ramp_epochs > 0
+                    else 1.0
+                ),
             )
             eval_loader = val_loader if val_loader is not None else test_loader
             eval_name = "Val" if val_loader is not None else "Test"
@@ -3236,7 +3505,13 @@ def train_downstream(
             teacher_model=teacher_model,
             teacher_logit_weight=config.train.multidisease_distill_logit_weight,
             teacher_embedding_weight=config.train.multidisease_distill_embedding_weight,
+            teacher_relation_weight=config.train.multidisease_distill_relation_weight,
             teacher_temperature=config.train.multidisease_distill_temperature,
+            teacher_gate_mode=config.train.multidisease_distill_gate,
+            teacher_confidence_threshold=config.train.multidisease_distill_confidence_threshold,
+            teacher_focus_weight=config.train.multidisease_distill_chd_weight,
+            teacher_balance_targets=config.train.multidisease_distill_balance_targets,
+            teacher_weight_scale=1.0,
         )
         eval_loader = val_loader if val_loader is not None else test_loader
         eval_name = "Val" if val_loader is not None else "Test"
@@ -3324,7 +3599,13 @@ def train_downstream(
                 "distillation": ({
                     "logit_weight": config.train.multidisease_distill_logit_weight,
                     "embedding_weight": config.train.multidisease_distill_embedding_weight,
+                    "relation_weight": config.train.multidisease_distill_relation_weight,
                     "temperature": config.train.multidisease_distill_temperature,
+                    "gate": config.train.multidisease_distill_gate,
+                    "confidence_threshold": config.train.multidisease_distill_confidence_threshold,
+                    "chd_weight": config.train.multidisease_distill_chd_weight,
+                    "balance_targets": config.train.multidisease_distill_balance_targets,
+                    "ramp_epochs": config.train.multidisease_distill_ramp_epochs,
                 } if use_multidisease_teacher else None),
                 "data_split": split_provenance,
                 "sampling_protocol": ({
@@ -3569,8 +3850,37 @@ if __name__ == "__main__":
         help="Dual-teacher patient-embedding cosine loss weight",
     )
     parser.add_argument(
+        "--distill_relation_weight", type=float, default=None,
+        help="Dual-teacher pairwise patient-relation loss weight",
+    )
+    parser.add_argument(
         "--distill_temperature", type=float, default=None,
         help="Dual-teacher logit temperature",
+    )
+    parser.add_argument(
+        "--distill_gate",
+        choices=["none", "confidence", "target_agreement"],
+        default=None,
+        help=(
+            "Select teacher decisions by confidence, or by confidence in the "
+            "observed training target"
+        ),
+    )
+    parser.add_argument(
+        "--distill_confidence_threshold", type=float, default=None,
+        help="Minimum teacher probability used by selective distillation",
+    )
+    parser.add_argument(
+        "--distill_chd_weight", type=float, default=None,
+        help="Relative CHD class weight inside teacher logit distillation",
+    )
+    parser.add_argument(
+        "--distill_balance_targets", action="store_true", default=None,
+        help="Average positive and negative KD terms separately per disease",
+    )
+    parser.add_argument(
+        "--distill_ramp_epochs", type=int, default=None,
+        help="Linear selective-distillation warmup during the probe phase",
     )
     args = parser.parse_args()
 
@@ -3654,10 +3964,36 @@ if __name__ == "__main__":
         config.train.multidisease_distill_embedding_weight = max(
             0.0, args.distill_embedding_weight
         )
+    if args.distill_relation_weight is not None:
+        config.train.multidisease_distill_relation_weight = max(
+            0.0, args.distill_relation_weight
+        )
     if args.distill_temperature is not None:
         config.train.multidisease_distill_temperature = max(
             1e-6, args.distill_temperature
         )
+    if args.distill_gate is not None:
+        config.train.multidisease_distill_gate = args.distill_gate
+    if args.distill_confidence_threshold is not None:
+        if not 0.5 <= args.distill_confidence_threshold < 1.0:
+            parser.error(
+                "--distill_confidence_threshold must be within [0.5, 1.0)"
+            )
+        config.train.multidisease_distill_confidence_threshold = (
+            args.distill_confidence_threshold
+        )
+    if args.distill_chd_weight is not None:
+        config.train.multidisease_distill_chd_weight = max(
+            0.0, args.distill_chd_weight
+        )
+    if args.distill_balance_targets is not None:
+        config.train.multidisease_distill_balance_targets = (
+            args.distill_balance_targets
+        )
+    if args.distill_ramp_epochs is not None:
+        if args.distill_ramp_epochs < 0:
+            parser.error("--distill_ramp_epochs must be >= 0")
+        config.train.multidisease_distill_ramp_epochs = args.distill_ramp_epochs
     config.output_dir = args.output_dir
     os.makedirs(config.output_dir, exist_ok=True)
 
