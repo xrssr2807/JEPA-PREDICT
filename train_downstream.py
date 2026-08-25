@@ -42,7 +42,7 @@ from config import Config, DataConfig, ModelConfig, TrainConfig
 from dataset.data import (
     DownstreamDataset, DualDownstreamDataset,
     MultiDiseaseDataset, MultiDiseasePatientMILDataset,
-    multidisease_label_value,
+    load_pickle_compat, multidisease_label_value,
 )
 from models.encoder import SignalEncoder
 from models.baselines import ResNet1DEncoder
@@ -476,7 +476,7 @@ def build_downstream_dataloaders(
             labels_for_split = []
             for fname in train_dataset.files:
                 with open(os.path.join(data_config.multidisease_dir, fname), "rb") as f:
-                    item = pickle.load(f)
+                    item = load_pickle_compat(f)
                 labels_for_split.append(int(item["label"].get("冠心病", 0)))
             train_files, val_files = split_files_by_uid(
                 train_dataset.files, labels_for_split, data_config.val_split
@@ -667,7 +667,7 @@ def build_downstream_dataloaders(
         for fname in train_files:
             # 读取标签 (临时)
             with open(os.path.join(ppg_dir, fname), 'rb') as f:
-                d = pickle.load(f)
+                d = load_pickle_compat(f)
             train_file_labels.append(d['label'][0]['class'])
         # 分层拆分: 85% train, 15% val
         train_files, val_files = split_files_by_uid(
@@ -1932,7 +1932,7 @@ def build_external_multidisease_loader(
     for name in files:
         path = os.path.join(data_dir, name)
         with open(path, "rb") as handle:
-            sample = pickle.load(handle)
+            sample = load_pickle_compat(handle)
         uid = str(sample.get("uid", uid_from_filename(name)))
         label_dict = sample.get("label", {})
         data = np.asarray(sample["data"])
@@ -2317,7 +2317,7 @@ def compute_multilabel_pos_weight(dataset, device, max_weight: float = 20.0):
     pos = np.zeros(len(dataset.disease_labels), dtype=np.float64)
     for fname in dataset.files:
         with open(os.path.join(dataset.data_dir, fname), "rb") as f:
-            item = pickle.load(f)
+            item = load_pickle_compat(f)
         label_dict = item.get("label", {})
         pos += np.array(
             [

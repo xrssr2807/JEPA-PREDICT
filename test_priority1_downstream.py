@@ -9,6 +9,7 @@ import torch.nn as nn
 from dataset.data import (
     MULTIDISEASE_LABEL_SOURCES,
     MultiDiseasePatientMILDataset,
+    _NumpyCompatUnpickler,
     multidisease_label_value,
 )
 from models.classifier import (
@@ -98,13 +99,21 @@ class PriorityOneDownstreamTests(unittest.TestCase):
             "disease_labels": config.data.multidisease_labels,
         })()
         with mock.patch("builtins.open", mock.mock_open()), mock.patch(
-            "train_downstream.pickle.load",
+            "train_downstream.load_pickle_compat",
             return_value={"label": {source_label: 1}},
         ):
             weights = compute_multilabel_pos_weight(
                 dataset, torch.device("cpu")
             )
         self.assertAlmostEqual(float(weights[3]), 0.2, places=6)
+
+    def test_numpy_two_pickle_module_is_mapped_for_numpy_one(self):
+        unpickler = _NumpyCompatUnpickler(io.BytesIO())
+        resolved = unpickler.find_class("numpy._core.numeric", "_frombuffer")
+        expected = __import__(
+            "numpy.core.numeric", fromlist=["_frombuffer"]
+        )._frombuffer
+        self.assertIs(resolved, expected)
 
     def test_short_patient_bag_is_zero_padded_and_masked(self):
         dataset = MultiDiseasePatientMILDataset.__new__(MultiDiseasePatientMILDataset)

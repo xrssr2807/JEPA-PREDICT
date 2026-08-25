@@ -14,6 +14,27 @@ import torch
 from torch.utils.data import Dataset
 
 
+class _NumpyCompatUnpickler(pickle.Unpickler):
+    """Read NumPy 2.x pickles in NumPy 1.x environments and vice versa."""
+
+    def find_class(self, module, name):
+        try:
+            return super().find_class(module, name)
+        except ModuleNotFoundError:
+            if not module.startswith("numpy._core."):
+                raise
+            legacy_module = "numpy.core." + module[len("numpy._core."):]
+            return super().find_class(legacy_module, name)
+
+
+def load_pickle_compat(file_or_path):
+    """Load a pickle while normalizing NumPy's private core module path."""
+    if hasattr(file_or_path, "read"):
+        return _NumpyCompatUnpickler(file_or_path).load()
+    with open(file_or_path, "rb") as handle:
+        return _NumpyCompatUnpickler(handle).load()
+
+
 def infer_pretrain_uid(filename: str) -> str:
     """Infer a patient/recording UID from a pre-training filename.
 
@@ -260,7 +281,7 @@ class PretrainDataset(Dataset):
         filepath = os.path.join(self.data_dir, self.files[idx])
         try:
             with open(filepath, "rb") as f:
-                sample = pickle.load(f)
+                sample = load_pickle_compat(f)
 
             data = sample["data"]  # (5, 3000)
 
@@ -425,7 +446,7 @@ class DownstreamDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         filepath = os.path.join(self.data_dir, self.files[idx])
         with open(filepath, "rb") as f:
-            sample = pickle.load(f)
+            sample = load_pickle_compat(f)
 
         data = sample["data"].astype(np.float32)  # (1000,) or (1, 1000)
 
@@ -695,7 +716,7 @@ class MultiDiseaseDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
         filepath = os.path.join(self.data_dir, self.files[idx])
         with open(filepath, "rb") as f:
-            sample = pickle.load(f)
+            sample = load_pickle_compat(f)
 
         # np.asarray also accepts the version-neutral nested lists used by
         # external cohorts, while preserving compatibility with NumPy arrays.
@@ -848,7 +869,7 @@ class MultiDiseasePatientMILDataset(Dataset):
             self.segment_dataset.files[int(index)],
         )
         with open(path, "rb") as handle:
-            sample = pickle.load(handle)
+            sample = load_pickle_compat(handle)
         data = np.asarray(sample["data"])
         rate = float(np.asarray(sample.get(
             "sampling_rate",
