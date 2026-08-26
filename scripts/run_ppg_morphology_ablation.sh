@@ -66,6 +66,18 @@ actual_sha="$(sha256sum "$SPLIT" | awk '{print $1}')"
     "Split SHA mismatch: expected=$EXPECTED_SPLIT_SHA actual=$actual_sha"
 python train_downstream.py --help 2>&1 | grep -q -- "--ppg_morphology_head" \
     || die "train_downstream.py lacks --ppg_morphology_head"
+python - <<'PY'
+import torch
+
+if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+    raise SystemExit(
+        "[Error] CUDA GPU is unavailable; refusing to run this experiment on CPU"
+    )
+print(
+    f"[CUDA] device={torch.cuda.get_device_name(0)} "
+    f"vram_gb={torch.cuda.get_device_properties(0).total_memory / 2**30:.2f}"
+)
+PY
 
 run_variant baseline off
 run_variant morphology on
