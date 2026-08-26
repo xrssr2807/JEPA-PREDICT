@@ -2391,6 +2391,19 @@ def validate_downstream_checkpoint_context(
             f"checkpoint={bool(saved_head)}, current={bool(use_shared_private_head)}"
         )
 
+    saved_morphology = checkpoint.get("ppg_morphology_head")
+    current_morphology = bool(
+        getattr(config.model, "downstream_ppg_morphology_head", False)
+    )
+    if (
+        saved_morphology is not None
+        and bool(saved_morphology) != current_morphology
+    ):
+        raise ValueError(
+            "Saved downstream checkpoint PPG morphology mode mismatch: "
+            f"checkpoint={bool(saved_morphology)}, current={current_morphology}"
+        )
+
     saved_init = checkpoint.get("encoder_init")
     if saved_init is not None and str(saved_init) != str(encoder_init):
         raise ValueError(
@@ -2813,6 +2826,19 @@ def train_downstream(
         raise ValueError(
             "Dual-to-PPG distillation requires --multidisease_channel ppg"
         )
+    use_ppg_morphology_head = bool(
+        getattr(config.model, "downstream_ppg_morphology_head", False)
+    )
+    if use_ppg_morphology_head and not (
+        multilabel
+        and config.data.multidisease_patient_mil
+        and str(config.data.multidisease_channel)
+        == str(config.data.multidisease_ppg_channel)
+    ):
+        raise ValueError(
+            "--ppg_morphology_head on requires multidisease PPG-only "
+            "Patient-MIL"
+        )
     downstream_in_channels = (
         2 if multilabel and config.data.multidisease_channel == "both"
         else config.model.in_channels
@@ -2847,6 +2873,7 @@ def train_downstream(
         "shared_private_head_mode": str(
             getattr(config.model, "downstream_shared_private_head", "auto")
         ),
+        "ppg_morphology_head": use_ppg_morphology_head,
         "channel": (
             str(config.data.multidisease_channel) if multilabel else None
         ),
@@ -3150,6 +3177,11 @@ def train_downstream(
             print("[Model] Patient-level MIL head"
                   f" (multiscale={use_multiscale_head}, "
                   f"encoder_chunk_size={config.data.multidisease_mil_encoder_chunk_size})")
+            if use_ppg_morphology_head:
+                print(
+                    "[Model] PPG morphology residual: quantiles + derivatives "
+                    "+ turning points + spectral bands"
+                )
             model = PatientMILClassifier(
                 encoder=encoder,
                 encoder_dim=config.model.transformer_dim,
@@ -3161,6 +3193,10 @@ def train_downstream(
                     if use_multidisease_teacher else None
                 ),
                 shared_private_adapter=shared_private_adapter,
+                ppg_morphology_head=use_ppg_morphology_head,
+                sample_rate_hz=(
+                    config.data.multidisease_canonical_sample_rate_hz
+                ),
             ).to(device)
         elif use_multiscale_head:
             print("[Model] MultiScale classification head")
@@ -3563,6 +3599,7 @@ def train_downstream(
                     if multilabel else None
                 ),
                 "shared_private_head": bool(use_shared_private_head),
+                "ppg_morphology_head": bool(use_ppg_morphology_head),
                 "patient_mil": (
                     bool(config.data.multidisease_patient_mil)
                     if multilabel else None
@@ -3589,6 +3626,10 @@ def train_downstream(
                     if multilabel
                     and config.data.multidisease_patient_mil
                     and use_shared_private_head
+                    else "single_ppg_morphology_patient_mil"
+                    if multilabel
+                    and config.data.multidisease_patient_mil
+                    and use_ppg_morphology_head
                     else "single_patient_mil"
                     if multilabel and config.data.multidisease_patient_mil
                     else type(model).__name__
@@ -3795,6 +3836,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--ppg_morphology_head",
+        choices=["on", "off"],
+        default="off",
+        help=(
+            "Add a conservative raw-PPG morphology residual to the "
+            "single-channel Patient-MIL representation"
+        ),
+    )
+    parser.add_argument(
         "--device_rate_hz",
         type=float,
         default=None,
@@ -3954,6 +4004,9 @@ if __name__ == "__main__":
     if args.no_amp:
         config.train.downstream_use_amp = False
     config.model.downstream_shared_private_head = args.shared_private_head
+    config.model.downstream_ppg_morphology_head = (
+        args.ppg_morphology_head == "on"
+    )
     if args.dual_teacher_checkpoint is not None:
         config.train.multidisease_dual_teacher_checkpoint = args.dual_teacher_checkpoint
     if args.distill_logit_weight is not None:

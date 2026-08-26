@@ -140,6 +140,8 @@ class ModelConfig:
     # "auto" uses pretrained shared/private projectors when present.
     # "off" keeps the historical encoder-only downstream head.
     downstream_shared_private_head: str = "auto"
+    # Optional PPG-only raw morphology residual for wearable deployment.
+    downstream_ppg_morphology_head: bool = False
     # Paper baseline architecture. Pretrained JEPA checkpoints require
     # "jepa_transformer"; "resnet1d" is supervised random initialization.
     downstream_encoder_arch: str = "jepa_transformer"

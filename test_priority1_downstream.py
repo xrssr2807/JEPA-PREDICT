@@ -15,6 +15,7 @@ from dataset.data import (
 from models.classifier import (
     DiseaseConditionedMILHead,
     DualStreamPatientMILClassifier,
+    PPGMorphologyResidual,
     PatientMILClassifier,
     SharedPrivateSegmentAdapter,
 )
@@ -114,6 +115,36 @@ class PriorityOneDownstreamTests(unittest.TestCase):
             "numpy.core.numeric", fromlist=["_frombuffer"]
         )._frombuffer
         self.assertIs(resolved, expected)
+
+    def test_ppg_morphology_features_ignore_offset_and_positive_scale(self):
+        torch.manual_seed(13)
+        branch = PPGMorphologyResidual(output_dim=8, dropout=0.0).eval()
+        signal = torch.randn(4, 1, 256)
+        first = branch.extract_features(signal)
+        second = branch.extract_features(signal * 3.5 + 7.0)
+        self.assertEqual(tuple(first.shape), (4, branch.feature_dim))
+        self.assertTrue(torch.isfinite(first).all())
+        self.assertTrue(torch.allclose(first, second, atol=2e-4, rtol=2e-4))
+
+    def test_ppg_morphology_patient_mil_respects_segment_mask(self):
+        torch.manual_seed(17)
+        model = PatientMILClassifier(
+            DummyEncoder(dim=8),
+            encoder_dim=8,
+            num_classes=2,
+            use_multiscale=False,
+            dropout=0.0,
+            ppg_morphology_head=True,
+        ).eval()
+        signal = torch.randn(2, 3, 1, 64)
+        mask = torch.tensor([[1, 1, 0], [1, 1, 1]], dtype=torch.bool)
+        changed = signal.clone()
+        changed[0, 2] = 1e4
+        first = model(signal, segment_mask=mask)
+        second = model(changed, segment_mask=mask)
+        self.assertEqual(tuple(first.shape), (2, 2))
+        self.assertTrue(torch.isfinite(first).all())
+        self.assertTrue(torch.allclose(first, second, atol=1e-5, rtol=1e-5))
 
     def test_short_patient_bag_is_zero_padded_and_masked(self):
         dataset = MultiDiseasePatientMILDataset.__new__(MultiDiseasePatientMILDataset)

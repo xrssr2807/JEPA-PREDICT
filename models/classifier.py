@@ -723,6 +723,108 @@ class SharedPrivateSegmentAdapter(nn.Module):
         return self.dropout(self.norm(shared + gate * private))
 
 
+class PPGMorphologyResidual(nn.Module):
+    """Encode differentiable pulse morphology as a conservative residual.
+
+    The pretrained encoder remains the main representation. This branch
+    summarizes standardized waveform shape, derivatives, turning points, and
+    physiologically relevant spectral bands, then injects the result through
+    a small gate initialized close to zero.
+    """
+
+    feature_dim = 19
+
+    def __init__(
+        self,
+        output_dim: int,
+        sample_rate_hz: float = 100.0,
+        hidden_dim: int = 128,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+        if sample_rate_hz <= 0:
+            raise ValueError("sample_rate_hz must be positive")
+        self.sample_rate_hz = float(sample_rate_hz)
+        self.projector = nn.Sequential(
+            nn.LayerNorm(self.feature_dim),
+            nn.Linear(self.feature_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        self.residual_logit = nn.Parameter(torch.full((output_dim,), -2.0))
+        self.output_norm = nn.LayerNorm(output_dim)
+
+    def extract_features(self, signal: torch.Tensor) -> torch.Tensor:
+        if signal.dim() != 3:
+            raise ValueError(
+                "PPGMorphologyResidual expects segment tensors shaped (B,C,L)"
+            )
+        if signal.size(-1) < 8:
+            raise ValueError("PPG morphology requires at least 8 samples")
+
+        x = torch.nan_to_num(signal.float()).mean(dim=1)
+        centered = x - x.mean(dim=-1, keepdim=True)
+        scale = centered.square().mean(dim=-1, keepdim=True).sqrt().clamp_min(1e-4)
+        z = (centered / scale).clamp(-10.0, 10.0)
+        d1 = z[:, 1:] - z[:, :-1]
+        d2 = d1[:, 1:] - d1[:, :-1]
+
+        quantiles = torch.quantile(
+            z, torch.tensor(
+                [0.10, 0.25, 0.50, 0.75, 0.90],
+                device=z.device, dtype=z.dtype,
+            ), dim=-1,
+        ).transpose(0, 1)
+        turning_rate = (
+            d1[:, 1:] * d1[:, :-1] < 0
+        ).float().mean(dim=-1, keepdim=True)
+
+        spectrum = torch.fft.rfft(z, dim=-1)
+        power = spectrum.real.square() + spectrum.imag.square()
+        power[:, 0] = 0.0
+        power = power / power.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        frequencies = torch.fft.rfftfreq(
+            z.size(-1), d=1.0 / self.sample_rate_hz,
+            device=z.device,
+        )
+        band_features = []
+        for low, high in ((0.5, 2.0), (2.0, 4.0), (4.0, 8.0), (8.0, 15.0)):
+            mask = (frequencies >= low) & (frequencies < high)
+            if bool(mask.any()):
+                band_features.append(power[:, mask].sum(dim=-1, keepdim=True))
+            else:
+                band_features.append(torch.zeros_like(turning_rate))
+        spectral_centroid = (
+            power * frequencies.unsqueeze(0)
+        ).sum(dim=-1, keepdim=True) / max(self.sample_rate_hz / 2.0, 1e-6)
+
+        features = torch.cat([
+            quantiles,
+            z.pow(3).mean(dim=-1, keepdim=True),
+            z.pow(4).mean(dim=-1, keepdim=True),
+            d1.abs().mean(dim=-1, keepdim=True),
+            d1.std(dim=-1, keepdim=True, unbiased=False),
+            d1.amax(dim=-1, keepdim=True),
+            (-d1).amax(dim=-1, keepdim=True),
+            d2.abs().mean(dim=-1, keepdim=True),
+            d2.std(dim=-1, keepdim=True, unbiased=False),
+            turning_rate,
+            *band_features,
+            spectral_centroid,
+        ], dim=-1)
+        return torch.nan_to_num(features, nan=0.0, posinf=10.0, neginf=-10.0)
+
+    def forward(
+        self, signal: torch.Tensor, encoder_repr: torch.Tensor,
+    ) -> torch.Tensor:
+        morphology = self.projector(self.extract_features(signal)).to(
+            dtype=encoder_repr.dtype
+        )
+        gate = torch.sigmoid(self.residual_logit).to(dtype=encoder_repr.dtype)
+        return self.output_norm(encoder_repr + gate * morphology)
+
+
 class PatientMILClassifier(nn.Module):
     """
     Patient-level multi-instance classifier.
@@ -742,6 +844,8 @@ class PatientMILClassifier(nn.Module):
         encoder_chunk_size: int = 0,
         input_channel: int = None,
         shared_private_adapter: Optional[SharedPrivateSegmentAdapter] = None,
+        ppg_morphology_head: bool = False,
+        sample_rate_hz: float = 100.0,
     ):
         super().__init__()
         self.encoder = encoder
@@ -749,6 +853,7 @@ class PatientMILClassifier(nn.Module):
         self.encoder_chunk_size = int(encoder_chunk_size or 0)
         self.input_channel = None if input_channel is None else int(input_channel)
         self.shared_private_adapter = shared_private_adapter
+        self.ppg_morphology_head = bool(ppg_morphology_head)
 
         if self.shared_private_adapter is not None:
             rep_dim = encoder_dim
@@ -763,6 +868,14 @@ class PatientMILClassifier(nn.Module):
             nn.BatchNorm1d(encoder_dim),
             nn.GELU(),
             nn.Dropout(dropout),
+        )
+        self.morphology_residual = (
+            PPGMorphologyResidual(
+                output_dim=encoder_dim,
+                sample_rate_hz=sample_rate_hz,
+                dropout=min(dropout, 0.2),
+            )
+            if self.ppg_morphology_head else None
         )
         self.mil_head = DiseaseConditionedMILHead(encoder_dim, num_classes, dropout)
 
@@ -823,7 +936,10 @@ class PatientMILClassifier(nn.Module):
         flat = x.reshape(B * S, C, L)
         segment_repr = self._encode_flat(flat)
 
-        segment_repr = self.segment_proj(segment_repr).reshape(B, S, -1)
+        segment_repr = self.segment_proj(segment_repr)
+        if self.morphology_residual is not None:
+            segment_repr = self.morphology_residual(flat, segment_repr)
+        segment_repr = segment_repr.reshape(B, S, -1)
         logits, patient_repr, _ = self.mil_head(segment_repr, segment_mask=segment_mask)
 
         if return_embedding:
