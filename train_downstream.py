@@ -29,7 +29,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
@@ -186,7 +186,7 @@ def load_multidisease_named_split_manifest(
             name for name in files
             if "/" in name or "\\" in name
             or not name.endswith(".pkl")
-            or not name.startswith(("train_", "test_"))
+            or not name.startswith(("train_", "val_", "test_"))
         ]
         if invalid:
             raise ValueError(
@@ -303,12 +303,71 @@ def dataloader_performance_kwargs(train_config: TrainConfig) -> dict:
 def rebuild_train_loader(dataloader: DataLoader, batch_size: int,
                          train_config: TrainConfig) -> DataLoader:
     """Rebuild a training loader for a phase-specific batch size."""
+    sampler = build_multilabel_patient_sampler(dataloader.dataset, train_config)
     return DataLoader(
         dataloader.dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         drop_last=True,
         **dataloader_performance_kwargs(train_config),
+    )
+
+
+def build_multilabel_patient_sampler(dataset, train_config: TrainConfig):
+    """Balance rare labels at patient level without manufacturing examples."""
+    mode = str(getattr(
+        train_config, "multidisease_sampler_mode", "random"
+    )).lower()
+    if mode == "random":
+        return None
+    if mode != "multilabel_balanced":
+        raise ValueError(f"Unknown multidisease sampler mode: {mode}")
+    if not all(hasattr(dataset, attr) for attr in (
+        "files", "data_dir", "disease_labels"
+    )):
+        raise ValueError("Balanced sampling requires a patient-level dataset")
+
+    rows = []
+    for filename in dataset.files:
+        with open(os.path.join(dataset.data_dir, filename), "rb") as handle:
+            item = load_pickle_compat(handle)
+        label_dict = item.get("label", {})
+        rows.append([
+            multidisease_label_value(label_dict, name)
+            for name in dataset.disease_labels
+        ])
+    labels = np.asarray(rows, dtype=np.float64)
+    if labels.shape != (len(dataset), len(dataset.disease_labels)):
+        raise ValueError(
+            "Patient sampler label shape mismatch: "
+            f"{labels.shape} vs ({len(dataset)}, {len(dataset.disease_labels)})"
+        )
+
+    prevalence = np.maximum(labels.mean(axis=0), 1.0 / max(len(labels), 1))
+    exponent = max(0.0, float(getattr(
+        train_config, "multidisease_sampler_exponent", 0.5
+    )))
+    cap = max(1.0, float(getattr(
+        train_config, "multidisease_sampler_weight_cap", 4.0
+    )))
+    rarity = np.power(1.0 / prevalence, exponent)
+    patient_weights = np.ones(len(labels), dtype=np.float64)
+    for index, row in enumerate(labels):
+        positive = rarity[row > 0.5]
+        if positive.size:
+            patient_weights[index] = float(positive.mean())
+    patient_weights /= max(float(patient_weights.mean()), 1e-12)
+    patient_weights = np.clip(patient_weights, 1.0 / cap, cap)
+    print(
+        "[Sampler] mode=multilabel_balanced "
+        f"prevalence={[round(float(x), 4) for x in prevalence]} "
+        f"weight_range=({patient_weights.min():.3f}, {patient_weights.max():.3f})"
+    )
+    return WeightedRandomSampler(
+        torch.as_tensor(patient_weights, dtype=torch.double),
+        num_samples=len(patient_weights),
+        replacement=True,
     )
 
 
@@ -386,13 +445,44 @@ def build_downstream_dataloaders(
             getattr(data_config, "multidisease_development_split", ""),
         )
         if split_manifest:
-            available_files = sorted(
-                filename for filename in os.listdir(data_config.multidisease_dir)
-                if filename.endswith(".pkl")
-            )
             requested_splits = ("train", "val") if seal_test else (
                 "train", "val", "test"
             )
+            if bool(getattr(
+                data_config, "multidisease_manifest_only_validation", False
+            )):
+                resolved_manifest = resolve_multidisease_split_file(
+                    split_manifest, data_config.multidisease_dir
+                )
+                with open(resolved_manifest, "r", encoding="utf-8") as handle:
+                    raw_manifest = json.load(handle)
+                available_files = sorted({
+                    filename
+                    for split_name in requested_splits
+                    for filename in raw_manifest.get(split_name, [])
+                })
+                missing_files = [
+                    filename for filename in available_files
+                    if not os.path.isfile(os.path.join(
+                        data_config.multidisease_dir, filename
+                    ))
+                ]
+                if missing_files:
+                    raise FileNotFoundError(
+                        "Manifest-only validation found missing files: "
+                        f"{missing_files[:5]}"
+                    )
+                print(
+                    "[DataSplit] manifest-only file validation enabled "
+                    f"({len(available_files)} requested files)"
+                )
+            else:
+                available_files = sorted(
+                    filename for filename in os.listdir(
+                        data_config.multidisease_dir
+                    )
+                    if filename.endswith(".pkl")
+                )
             split_files, _ = load_multidisease_named_split_manifest(
                 split_manifest,
                 data_config.multidisease_dir,
@@ -580,9 +670,13 @@ def build_downstream_dataloaders(
             f"persistent={loader_kwargs.get('persistent_workers', False)} "
             f"pin_memory={loader_kwargs['pin_memory']}"
         )
+        train_sampler = build_multilabel_patient_sampler(
+            train_dataset, train_config
+        )
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size,
-            shuffle=True, drop_last=True, **loader_kwargs,
+            shuffle=train_sampler is None, sampler=train_sampler,
+            drop_last=True, **loader_kwargs,
         )
         val_loader = None
         if val_dataset is not None:
@@ -763,16 +857,30 @@ def _select_pretrained_encoder_state(ckpt: dict, encoder_type: str):
         state_dict = ckpt[key]
     else:
         msd = ckpt["model_state_dict"]
-        prefix = (
-            "ppg_encoder."
-            if encoder_type == "target"
-            and any(k.startswith("ppg_encoder.") for k in msd)
-            else f"{encoder_type}_encoder."
-        )
+        if (
+            encoder_type == "target"
+            and any(k.startswith("encoder.") for k in msd)
+        ):
+            # A saved single-stream downstream model contains a pretrained
+            # PPG encoder under ``encoder.*`` plus a dataset-specific head.
+            # Reuse only the encoder when transferring to a new label schema.
+            prefix = "encoder."
+            key = "downstream_ppg_encoder"
+        else:
+            prefix = (
+                "ppg_encoder."
+                if encoder_type == "target"
+                and any(k.startswith("ppg_encoder.") for k in msd)
+                else f"{encoder_type}_encoder."
+            )
         state_dict = {
             k[len(prefix):]: v for k, v in msd.items()
             if k.startswith(prefix)
         }
+    if not state_dict:
+        raise KeyError(
+            f"No compatible {encoder_type} encoder state was found in checkpoint"
+        )
     return state_dict, key
 
 
@@ -818,6 +926,33 @@ def load_pretrained_encoder(
         else torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     )
     state_dict, key = _select_pretrained_encoder_state(ckpt, encoder_type)
+
+    # Historical checkpoints stored the four Conv-BN-ReLU blocks in one
+    # flat Sequential named ``cnn.conv``.  The current encoder keeps the same
+    # operations in ``cnn.conv_blocks`` so optional modules can be inserted.
+    # Remap names only; tensor values and strict loading are preserved.
+    if any(name.startswith("cnn.conv.") for name in state_dict):
+        flat_to_block = {
+            0: (0, 0), 1: (0, 1),
+            3: (1, 0), 4: (1, 1),
+            6: (2, 0), 7: (2, 1),
+            9: (3, 0), 10: (3, 1),
+        }
+        remapped = {}
+        for name, value in state_dict.items():
+            if name.startswith("cnn.conv."):
+                parts = name.split(".")
+                flat_index = int(parts[2])
+                if flat_index not in flat_to_block:
+                    raise ValueError(f"Unsupported legacy CNN key: {name}")
+                block_index, layer_index = flat_to_block[flat_index]
+                suffix = ".".join(parts[3:])
+                name = (
+                    f"cnn.conv_blocks.{block_index}.{layer_index}.{suffix}"
+                )
+            remapped[name] = value
+        state_dict = remapped
+        print("[Encoder] Remapped legacy cnn.conv checkpoint keys")
 
     first_conv_key = "cnn.conv_blocks.0.0.weight"
     if first_conv_key in state_dict:
@@ -1413,7 +1548,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                 teacher_confidence_threshold: float = 0.6,
                 teacher_focus_weight: float = 1.0,
                 teacher_balance_targets: bool = False,
-                teacher_weight_scale: float = 1.0):
+                teacher_weight_scale: float = 1.0,
+                gradient_accumulation_steps: int = 1):
     """Single training epoch with optional ECG distillation."""
     model.train()
     if teacher_model is not None:
@@ -1436,7 +1572,13 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
 
     ecg_iter = iter(ecg_loader) if (distill_mode or cotrain_mode) else None
 
-    for batch in dataloader:
+    accumulation_steps = max(1, int(gradient_accumulation_steps))
+    optimizer.zero_grad(set_to_none=True)
+    all_params = list(model.parameters()) + (
+        list(proj_ppg.parameters()) if distill_mode else []
+    )
+
+    for batch_index, batch in enumerate(dataloader):
         if is_dual:
             ecg, ppg, labels, *_ = batch
             ecg = ecg.to(device, non_blocking=True)
@@ -1573,30 +1715,38 @@ def train_epoch(model, dataloader, optimizer, criterion, device,
                 base_loss=loss,
             )
 
-        optimizer.zero_grad(set_to_none=True)
         if not torch.isfinite(loss):
             print("[Warn] non-finite loss detected; skipping this batch")
+            optimizer.zero_grad(set_to_none=True)
             continue
-        all_params = list(model.parameters()) + (list(proj_ppg.parameters()) if distill_mode else [])
-        optimizer_stepped = True
+        should_step = (
+            (batch_index + 1) % accumulation_steps == 0
+            or batch_index + 1 == len(dataloader)
+        )
+        group_start = (batch_index // accumulation_steps) * accumulation_steps
+        group_size = min(accumulation_steps, len(dataloader) - group_start)
+        scaled_loss = loss / max(group_size, 1)
+        optimizer_stepped = False
         if scaler is not None and scaler.is_enabled():
             scale_before = scaler.get_scale()
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            # GradScaler skips optimizer.step() when it detects overflow.
-            # Advancing the scheduler on that batch causes PyTorch's
-            # scheduler-before-optimizer warning and shifts the LR schedule.
-            optimizer_stepped = scaler.get_scale() >= scale_before
+            scaler.scale(scaled_loss).backward()
+            if should_step:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer_stepped = scaler.get_scale() >= scale_before
         else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
-            optimizer.step()
+            scaled_loss.backward()
+            if should_step:
+                torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+                optimizer.step()
+                optimizer_stepped = True
 
-        if scheduler is not None and sched_mode == "batch" and optimizer_stepped:
-            scheduler.step()
+        if should_step:
+            if scheduler is not None and sched_mode == "batch" and optimizer_stepped:
+                scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
 
         running_loss += loss.item()
         valid_steps += 1
@@ -3406,11 +3556,20 @@ def train_downstream(
         if use_cotrain:
             trainable += list(ecg_encoder.parameters())
         trainable = [p for p in trainable if p.requires_grad]
-        probe_steps = len(train_loader)
+        accumulation_steps = max(1, int(getattr(
+            config.train, "downstream_gradient_accumulation_steps", 1
+        )))
+        probe_steps = math.ceil(len(train_loader) / accumulation_steps)
         probe_lr = config.train.downstream_lr * 4 if (use_distill or use_cotrain) else config.train.downstream_lr
         optimizer = AdamW(trainable, lr=probe_lr, weight_decay=1e-4)
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
         scheduler, sched_mode = build_scheduler(optimizer, config.train, probe_steps)
+        print(
+            f"[Optimization] micro_batch={train_loader.batch_size} "
+            f"gradient_accumulation={accumulation_steps} "
+            f"effective_patient_batch={train_loader.batch_size * accumulation_steps} "
+            f"optimizer_steps/epoch={probe_steps}"
+        )
 
         for epoch in range(n_probe):
             reset_gpu_peak_memory(device)
@@ -3448,6 +3607,7 @@ def train_downstream(
                     if config.train.multidisease_distill_ramp_epochs > 0
                     else 1.0
                 ),
+                gradient_accumulation_steps=accumulation_steps,
             )
             eval_loader = val_loader if val_loader is not None else test_loader
             eval_name = "Val" if val_loader is not None else "Test"
@@ -3498,7 +3658,10 @@ def train_downstream(
 
     ft_epochs = config.train.downstream_epochs - n_probe
     ft_lr = config.train.downstream_lr * 0.1
-    ft_steps = len(train_loader)
+    accumulation_steps = max(1, int(getattr(
+        config.train, "downstream_gradient_accumulation_steps", 1
+    )))
+    ft_steps = math.ceil(len(train_loader) / accumulation_steps)
 
     if use_dual:
         print(f"[Optimizer] Dual: uniform LR={ft_lr:.2e}")
@@ -3520,6 +3683,12 @@ def train_downstream(
 
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     scheduler, sched_mode = build_scheduler(optimizer, config.train, ft_steps)
+    print(
+        f"[Optimization] micro_batch={train_loader.batch_size} "
+        f"gradient_accumulation={accumulation_steps} "
+        f"effective_patient_batch={train_loader.batch_size * accumulation_steps} "
+        f"optimizer_steps/epoch={ft_steps}"
+    )
 
     best_score = float("-inf")
     best_state = None
@@ -3548,6 +3717,7 @@ def train_downstream(
             teacher_focus_weight=config.train.multidisease_distill_chd_weight,
             teacher_balance_targets=config.train.multidisease_distill_balance_targets,
             teacher_weight_scale=1.0,
+            gradient_accumulation_steps=accumulation_steps,
         )
         eval_loader = val_loader if val_loader is not None else test_loader
         eval_name = "Val" if val_loader is not None else "Test"

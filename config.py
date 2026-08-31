@@ -293,6 +293,10 @@ class TrainConfig:
     multidisease_mil_batch_size: int = 64
     multidisease_probe_batch_size: int = 96  # frozen encoders allow a much larger patient batch
     multidisease_probe_encoder_chunk_size: int = 128
+    downstream_gradient_accumulation_steps: int = 1
+    multidisease_sampler_mode: str = "random"  # "random" | "multilabel_balanced"
+    multidisease_sampler_exponent: float = 0.5
+    multidisease_sampler_weight_cap: float = 4.0
     dataloader_workers: int = 8
     dataloader_prefetch_factor: int = 4
     dataloader_persistent_workers: bool = True
