@@ -16,6 +16,7 @@ REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_DIR not in sys.path:
     sys.path.insert(0, REPO_DIR)
 
+from dataset import data as dataset_data
 from dataset.data import compute_ppg_sqi, load_pickle_compat, multidisease_label_value
 
 
@@ -53,6 +54,9 @@ def first_present(sample, keys):
 
 def main():
     args = parse_args()
+    dataset_data.MULTIDISEASE_LABEL_SOURCES["高血脂"] = (
+        "高脂血症（高胆固醇等）",
+    )
     os.makedirs(args.output_dir, exist_ok=True)
     with open(args.split, "r", encoding="utf-8") as handle:
         manifest = json.load(handle)
@@ -93,6 +97,14 @@ def main():
                     signal = np.asarray(item["data"], dtype=np.float32).squeeze()
                     if signal.ndim > 1:
                         signal = signal[0]
+                    finite = signal[np.isfinite(signal)]
+                    fill_value = float(np.median(finite)) if finite.size else 0.0
+                    signal = np.nan_to_num(
+                        signal,
+                        nan=fill_value,
+                        posinf=fill_value,
+                        neginf=fill_value,
+                    )
                     fs = int(round(float(np.asarray(item.get("sampling_rate", 100)).reshape(-1)[0])))
                     scores.append(compute_ppg_sqi(signal, fs=max(fs, 1)))
                 val_sqi.append({"uid": uid, "sqi": float(np.mean(scores))})
