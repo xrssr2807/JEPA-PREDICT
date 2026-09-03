@@ -9,13 +9,13 @@ REPLICATION_SEEDS="${REPLICATION_SEEDS:-3407 2026}"
 TOP_K="${TOP_K:-2}"
 SPLIT="${SPLIT:-splits/multidisease_taskaware_downstream.json}"
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-outputs_phase2_shared_private_seed42/jepa_best.pt}"
-FULL_TEMPLATE="${FULL_TEMPLATE:-outputs_phase2_physio_v2_seed{seed}/jepa_best.pt}"
+FULL_TEMPLATE="${FULL_TEMPLATE:-outputs_phase2_physio_v2_seedSEED_PLACEHOLDER/jepa_best.pt}"
 RESULT_ROOT="${RESULT_ROOT:-paper/ICASSP2027/03_experiments/P2_physio_v2_component_ablation/results}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs_physio_v2_component_ablation}"
 
 resolve_full() {
     local seed="$1"
-    local path="${FULL_TEMPLATE//\{seed\}/$seed}"
+    local path="${FULL_TEMPLATE/SEED_PLACEHOLDER/$seed}"
     [[ -s "$path" ]] || {
         echo "[Error] full reference missing for seed=$seed: $path" >&2
         exit 1
