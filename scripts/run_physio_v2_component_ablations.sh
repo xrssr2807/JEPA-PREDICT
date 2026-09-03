@@ -29,6 +29,22 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 die() { echo "[Error] $*" >&2; exit 1; }
 
+OUTPUT_ROOT_ABS="$(realpath -m "$OUTPUT_ROOT")"
+[[ "$OUTPUT_ROOT_ABS" == "$ROOT_DIR"/outputs_physio_v2_component_ablation* ]] \
+    || die "OUTPUT_ROOT must stay in the dedicated ablation namespace"
+
+delete_generated_checkpoint() {
+    local candidate="$1"
+    local resolved
+    resolved="$(realpath -m "$candidate")"
+    [[ "$resolved" == "$OUTPUT_ROOT_ABS"/* ]] || die \
+        "Refusing to delete checkpoint outside OUTPUT_ROOT: $resolved"
+    if [[ -f "$resolved" ]]; then
+        rm -f -- "$resolved"
+        echo "[Prune] generated checkpoint=$resolved"
+    fi
+}
+
 free_gb() {
     df -Pk "$ROOT_DIR" | awk 'NR==2 {printf "%d", $4/1024/1024}'
 }
@@ -178,9 +194,12 @@ for variant in "${variant_values[@]}"; do
     } > "$run_dir/run_manifest.txt"
 
     if [[ "$DELETE_LARGE_CHECKPOINTS" == "1" ]]; then
-        rm -f -- "$downstream_checkpoint" "${downstream_dir}/downstream_multidisease_last.pt"
+        delete_generated_checkpoint "$downstream_checkpoint"
+        delete_generated_checkpoint \
+            "${downstream_dir}/downstream_multidisease_last.pt"
         if [[ "$variant" != "full" ]]; then
-            rm -f -- "$pretrain_checkpoint" "${pretrain_dir}/jepa_last.pt"
+            delete_generated_checkpoint "$pretrain_checkpoint"
+            delete_generated_checkpoint "${pretrain_dir}/jepa_last.pt"
         fi
     fi
     echo "[Done] variant=$variant free_gb=$(free_gb)"

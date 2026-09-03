@@ -26,3 +26,5 @@ nohup bash scripts/run_physio_v2_evidence_pipeline.sh \
 
 Large ablation checkpoints are deleted only after metrics, hashes, logs, and
 patient-level validation predictions have been captured in the paper archive.
+Deletion is path-confined to the dedicated ablation output directory; source
+parents and the three existing full-model checkpoints are never pruned.
