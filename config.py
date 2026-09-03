@@ -124,6 +124,8 @@ class ModelConfig:
     phase2_v2_sinkhorn_epsilon: float = 1.0
     phase2_v2_sinkhorn_mass_reg: float = 1.0
     phase2_v2_sinkhorn_iters: int = 20
+    phase2_v2_delay_policy: str = "dynamic"
+    phase2_v2_use_dustbin: bool = True
     phase2_counterfactual_weight: float = 0.10
     phase2_counterfactual_margin: float = 0.10
     # Optional weak PAT supervision. It has no effect unless PAT targets are

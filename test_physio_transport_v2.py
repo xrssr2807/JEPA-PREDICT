@@ -78,6 +78,37 @@ class PhysiologicalTransportV2Tests(unittest.TestCase):
         ]
         self.assertGreater((first - second).abs().max().item(), 1e-5)
 
+    def test_fixed_prior_policy_selects_one_delay(self):
+        model = self._model(phase2_v2_delay_policy="fixed_prior")
+        state = model._build_phase2_transport(
+            torch.randn(2, 12, 8), torch.randn(2, 12, 8)
+        )
+        support = state["conditional_delay_probabilities"] > 1e-6
+        self.assertLessEqual(support.sum(dim=-1).max().item(), 1)
+
+    def test_hard_argmax_policy_selects_one_delay(self):
+        model = self._model(phase2_v2_delay_policy="hard_argmax")
+        state = model._build_phase2_transport(
+            torch.randn(2, 12, 8), torch.randn(2, 12, 8)
+        )
+        support = state["conditional_delay_probabilities"] > 1e-6
+        self.assertLessEqual(support.sum(dim=-1).max().item(), 1)
+
+    def test_all_valid_rows_match_without_dustbin(self):
+        model = self._model(phase2_v2_use_dustbin=False)
+        state = model._build_phase2_transport(
+            torch.randn(2, 12, 8), torch.randn(2, 12, 8)
+        )
+        self.assertEqual(state["unmatched_probability"].abs().max().item(), 0.0)
+        valid_mass = state["match_mass"][state["valid_rows"]]
+        self.assertTrue(torch.allclose(valid_mass, torch.ones_like(valid_mass)))
+        self.assertLess(state["sinkhorn_row_error"].item(), 1e-3)
+        self.assertLess(state["sinkhorn_column_error"].item(), 1e-3)
+
+    def test_invalid_v2_delay_policy_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "phase2_v2_delay_policy"):
+            self._model(phase2_v2_delay_policy="unknown")
+
     def test_full_loss_and_cross_modal_head_have_finite_gradients(self):
         torch.manual_seed(19)
         model = self._model()

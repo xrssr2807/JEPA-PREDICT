@@ -282,6 +282,8 @@ def build_model(model_config: ModelConfig) -> JEPA:
             model_config.phase2_v2_sinkhorn_mass_reg
         ),
         phase2_v2_sinkhorn_iters=model_config.phase2_v2_sinkhorn_iters,
+        phase2_v2_delay_policy=model_config.phase2_v2_delay_policy,
+        phase2_v2_use_dustbin=model_config.phase2_v2_use_dustbin,
         phase2_counterfactual_weight=(
             model_config.phase2_counterfactual_weight
         ),
@@ -505,6 +507,12 @@ def _phase_checkpoint_metadata(model, config: Config) -> dict:
             ),
             "v2_sinkhorn_iters": int(
                 config.model.phase2_v2_sinkhorn_iters
+            ),
+            "v2_delay_policy": str(
+                config.model.phase2_v2_delay_policy
+            ),
+            "v2_use_dustbin": bool(
+                config.model.phase2_v2_use_dustbin
             ),
             "counterfactual_weight": float(
                 config.model.phase2_counterfactual_weight
@@ -1692,6 +1700,23 @@ if __name__ == "__main__":
         help="Unbalanced Sinkhorn iterations in physio_v2",
     )
     parser.add_argument(
+        "--v2_delay_policy",
+        choices=("dynamic", "fixed_prior", "hard_argmax"),
+        default=None,
+        help="Delay policy used inside physio_v2 Transport",
+    )
+    parser.add_argument(
+        "--v2_dustbin",
+        choices=("on", "off"),
+        default=None,
+        help="Enable unmatched dustbin or force every valid row to match",
+    )
+    parser.add_argument("--v2_content_weight", type=float, default=None)
+    parser.add_argument("--v2_global_delay_weight", type=float, default=None)
+    parser.add_argument("--v2_local_delay_weight", type=float, default=None)
+    parser.add_argument("--monotonic_weight", type=float, default=None)
+    parser.add_argument("--delay_smoothness_weight", type=float, default=None)
+    parser.add_argument(
         "--early_stop_patience", type=int, default=None,
         help="Phase 2 eligible validation epochs without meaningful improvement",
     )
@@ -1749,6 +1774,24 @@ if __name__ == "__main__":
         )
     if args.sinkhorn_iters is not None:
         config.model.phase2_v2_sinkhorn_iters = args.sinkhorn_iters
+    if args.v2_delay_policy is not None:
+        config.model.phase2_v2_delay_policy = args.v2_delay_policy
+    if args.v2_dustbin is not None:
+        config.model.phase2_v2_use_dustbin = args.v2_dustbin == "on"
+    if args.v2_content_weight is not None:
+        config.model.phase2_v2_content_weight = args.v2_content_weight
+    if args.v2_global_delay_weight is not None:
+        config.model.phase2_v2_global_delay_weight = (
+            args.v2_global_delay_weight
+        )
+    if args.v2_local_delay_weight is not None:
+        config.model.phase2_v2_local_delay_weight = args.v2_local_delay_weight
+    if args.monotonic_weight is not None:
+        config.model.phase2_monotonic_weight = args.monotonic_weight
+    if args.delay_smoothness_weight is not None:
+        config.model.phase2_delay_smoothness_weight = (
+            args.delay_smoothness_weight
+        )
     if args.reverse_loss_weight is not None:
         config.model.phase2_reverse_loss_weight = args.reverse_loss_weight
     if args.private_dim is not None:

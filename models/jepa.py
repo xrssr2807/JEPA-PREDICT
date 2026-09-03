@@ -440,6 +440,8 @@ class JEPA(nn.Module):
         phase2_v2_sinkhorn_epsilon: float = 1.0,
         phase2_v2_sinkhorn_mass_reg: float = 1.0,
         phase2_v2_sinkhorn_iters: int = 20,
+        phase2_v2_delay_policy: str = "dynamic",
+        phase2_v2_use_dustbin: bool = True,
         phase2_counterfactual_weight: float = 0.10,
         phase2_counterfactual_margin: float = 0.10,
         phase2_pat_weak_weight: float = 0.0,
@@ -630,6 +632,18 @@ class JEPA(nn.Module):
                     )
                 if phase2_v2_sinkhorn_iters <= 0:
                     raise ValueError("phase2_v2_sinkhorn_iters must be positive")
+                phase2_v2_delay_policy = str(
+                    phase2_v2_delay_policy
+                ).strip().lower()
+                if phase2_v2_delay_policy not in {
+                    "dynamic",
+                    "fixed_prior",
+                    "hard_argmax",
+                }:
+                    raise ValueError(
+                        "phase2_v2_delay_policy must be one of "
+                        "dynamic, fixed_prior, hard_argmax"
+                    )
                 if phase2_counterfactual_weight < 0:
                     raise ValueError(
                         "phase2_counterfactual_weight must be non-negative"
@@ -660,6 +674,8 @@ class JEPA(nn.Module):
                 self.phase2_v2_sinkhorn_iters = int(
                     phase2_v2_sinkhorn_iters
                 )
+                self.phase2_v2_delay_policy = phase2_v2_delay_policy
+                self.phase2_v2_use_dustbin = bool(phase2_v2_use_dustbin)
                 self.phase2_counterfactual_weight = float(
                     phase2_counterfactual_weight
                 )
@@ -1208,11 +1224,33 @@ class JEPA(nn.Module):
             * head["local_delay_logits"]
         ) / temperature
         scores = scores.masked_fill(~valid_delay, -1e4)
+        if self.phase2_v2_delay_policy == "fixed_prior":
+            prior_index = int(
+                torch.argmin(
+                    (
+                        offsets.float()
+                        - float(self.phase2_delay_prior_tokens)
+                    ).abs()
+                ).item()
+            )
+            fixed = torch.full_like(scores, -1e4)
+            fixed[..., prior_index] = torch.where(
+                valid_delay[..., prior_index],
+                scores[..., prior_index],
+                torch.full_like(scores[..., prior_index], -1e4),
+            )
+            scores = fixed
+        elif self.phase2_v2_delay_policy == "hard_argmax":
+            selected = scores.argmax(dim=-1, keepdim=True)
+            selected_score = scores.gather(-1, selected)
+            hard = torch.full_like(scores, -1e4)
+            scores = hard.scatter(-1, selected, selected_score)
         row_score = torch.logsumexp(scores, dim=-1)
         valid_rows = valid_delay.any(dim=-1).expand(batch_size, -1)
-        pair_score = (
-            row_score - head["unmatched_logits"].float()
-        ).masked_fill(~valid_rows, 0.0)
+        pair_score = row_score
+        if self.phase2_v2_use_dustbin:
+            pair_score = pair_score - head["unmatched_logits"].float()
+        pair_score = pair_score.masked_fill(~valid_rows, 0.0)
         pair_score = pair_score.sum(dim=-1) / valid_rows.sum(
             dim=-1
         ).clamp_min(1)
@@ -1237,6 +1275,48 @@ class JEPA(nn.Module):
         valid_delay = score_state["valid_delay"]
         batch_size, num_tokens, num_bins = scores.shape
 
+        if not self.phase2_v2_use_dustbin:
+            conditional_delay = F.softmax(scores, dim=-1) * valid_delay
+            conditional_delay = conditional_delay / conditional_delay.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-8)
+            valid_rows = score_state["valid_rows"]
+            conditional_delay = conditional_delay * valid_rows.unsqueeze(-1)
+            target_indices = score_state["target"].clamp(
+                min=0, max=num_tokens - 1
+            ).expand(batch_size, -1, -1)
+            real_plan = scores.new_zeros(batch_size, num_tokens, num_tokens)
+            real_plan.scatter_add_(2, target_indices, conditional_delay)
+            column_mass = real_plan.sum(dim=1)
+            valid_columns = column_mass > 1e-8
+            reverse_transport = real_plan / column_mass.unsqueeze(1).clamp_min(
+                1e-8
+            )
+            reverse_transport = reverse_transport * valid_columns.unsqueeze(1)
+            offsets_float = self.phase2_delay_offsets.to(
+                dtype=conditional_delay.dtype
+            )
+            expected_delay = (
+                conditional_delay * offsets_float.view(1, 1, -1)
+            ).sum(dim=-1)
+            zeros = expected_delay.new_zeros(batch_size, num_tokens)
+            return {
+                "transport": real_plan,
+                "forward_transport": real_plan,
+                "reverse_transport": reverse_transport,
+                "delay_probabilities": conditional_delay,
+                "conditional_delay_probabilities": conditional_delay,
+                "unmatched_probability": zeros,
+                "match_mass": valid_rows.to(expected_delay.dtype),
+                "expected_delay": expected_delay,
+                "valid_delay": valid_delay.expand(batch_size, -1, -1),
+                "valid_rows": valid_rows,
+                "valid_columns": valid_columns,
+                "pair_score": score_state["pair_score"],
+                "sinkhorn_row_error": expected_delay.new_zeros(()),
+                "sinkhorn_column_error": expected_delay.new_zeros(()),
+            }
+
         dense_scores = scores.new_full(
             (batch_size, num_tokens + 1, num_tokens + 1), -1e4
         )
@@ -1253,14 +1333,13 @@ class JEPA(nn.Module):
             dense_scores[
                 :, source_index, source_index + int(offset)
             ] = scores[:, :matchable, bin_index]
+        epsilon = max(self.phase2_v2_sinkhorn_epsilon, 1e-4)
         unmatched = score_state["unmatched_logits"].float()
         dense_scores[:, :num_tokens, num_tokens] = unmatched
         dense_scores[:, num_tokens, :num_tokens] = unmatched.mean(
             dim=1, keepdim=True
         )
         dense_scores[:, num_tokens, num_tokens] = 0.0
-
-        epsilon = max(self.phase2_v2_sinkhorn_epsilon, 1e-4)
         log_kernel = dense_scores / epsilon
         log_mass = math.log(max(num_tokens, 1))
         log_a = log_kernel.new_zeros(num_tokens + 1)
@@ -1285,7 +1364,6 @@ class JEPA(nn.Module):
             )
         log_plan = log_kernel + log_u.unsqueeze(2) + log_v.unsqueeze(1)
         plan = torch.exp(log_plan.clamp(min=-40.0, max=20.0))
-
         real_support = (
             dense_scores[:, :num_tokens, :num_tokens] > -5e3
         )
@@ -1293,6 +1371,12 @@ class JEPA(nn.Module):
             plan[:, :num_tokens, :num_tokens] * real_support
         )
         row_dustbin = plan[:, :num_tokens, num_tokens]
+        sinkhorn_row_error = (
+            plan.sum(dim=-1)[:, :num_tokens] - 1.0
+        ).abs().mean()
+        sinkhorn_column_error = (
+            plan.sum(dim=1)[:, :num_tokens] - 1.0
+        ).abs().mean()
         row_total = real_plan.sum(dim=-1) + row_dustbin
         transport = real_plan / row_total.unsqueeze(-1).clamp_min(1e-8)
         unmatched_probability = row_dustbin / row_total.clamp_min(1e-8)
@@ -1335,12 +1419,8 @@ class JEPA(nn.Module):
             "valid_rows": valid_rows,
             "valid_columns": valid_columns,
             "pair_score": score_state["pair_score"],
-            "sinkhorn_row_error": (
-                plan.sum(dim=-1)[:, :num_tokens] - 1.0
-            ).abs().mean(),
-            "sinkhorn_column_error": (
-                plan.sum(dim=1)[:, :num_tokens] - 1.0
-            ).abs().mean(),
+            "sinkhorn_row_error": sinkhorn_row_error,
+            "sinkhorn_column_error": sinkhorn_column_error,
         }
 
     def _build_phase2_transport(
